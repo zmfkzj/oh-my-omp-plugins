@@ -1,4 +1,6 @@
 # Merge this role into the active OMP config.yml; do not overwrite other settings.
 # Any supported authenticated model selector may be used, independently of DEFAULT.
+# In OMP, standalone prose orchestrate requires initial-plan and phase/replan reviews.
+# Ordinary requests remain optional. Reload with /reload-plugins after plugin changes.
 modelRoles:
   orche-advisor: openai-codex/gpt-6-astra:xhigh

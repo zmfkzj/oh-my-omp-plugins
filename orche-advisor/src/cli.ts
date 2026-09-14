@@ -69,6 +69,10 @@ Then configure modelRoles.${ROLE}; examples/config.yml shows the expected role.
 Plugin installation is explicit and does not copy credentials.
 Do not load the legacy single-file extension and this package simultaneously.
 Remove the old registration before enabling the packaged extension.
+Reload OMP with /reload-plugins or start a new session after installing or updating.
+The standalone prose keyword orchestrate enables required initial-plan and phase/replan
+reviews through OMP's native orchestration notice. Ordinary requests keep reviews optional.
+The orchestrator calls the tool with a compact snapshot; hooks never invoke a model directly.
 `;
 
 interface CliOptions {

@@ -11,18 +11,34 @@ import { resolveRoleSelection } from "@oh-my-pi/pi-coding-agent/config/model-res
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { CHECKPOINTS, ROLE, TOOL, prepareReviewInput, runReview } from "./src/review.ts";
 
-const DEFAULT_GUIDANCE = `Orche-Advisor is an optional orchestration reviewer, not a worker or second orchestrator.
+const DEFAULT_GUIDANCE = `Orche-Advisor reviews orchestration, not code; it is not a worker or second orchestrator.
 You retain planning, delegation, implementation integration, verification, and termination responsibility.
-Call orche_advisor explicitly only when its expected benefit exceeds its cost at a material checkpoint:
+When OMP activates orchestrate, follow the required review checkpoints in its orchestration notice.
+Otherwise, call orche_advisor explicitly only when its expected benefit exceeds its cost at a material checkpoint:
 important initial plan; before large fan-out; at least two failures on the same problem; major replan;
 important phase boundary; expansion across subsystems; or explicit orchestration escalation.
-These checkpoints permit review; they do not require it. Never call just because a worker completed,
-for a routine/local task, or again without material new information. Combine overlapping checkpoints.
+Outside orchestrate, these checkpoints permit review; they do not require it.
+Never call just because a worker completed or for routine/local work outside orchestrate.
+Do not repeat a review without material new information. Combine overlapping checkpoints.
 Send only the seven compact snapshot fields, not conversation history, repository contents, worker logs,
 or credentials. Describe relevant constraints in Goal. Use 'None' for empty fields.
 Supply additional context only when needed; decide whether requested information merits another call.
 Weigh the short verdict and changes; retain final decisions. Do not call another reviewer merely because
 Orche-Advisor completed. Existing Advisor and Challenger retain their existing responsibilities.`;
+
+const ORCHESTRATE_GUIDANCE = `<system-notice>
+Orche-Advisor integration for this orchestrate request. These checkpoints are REQUIRED, not optional:
+1. After scoping and forming the initial plan, call orche_advisor with checkpoint "initial-plan".
+   Read its result before dispatching workers or implementing the plan, even if the work stays inline.
+2. After verifying a phase, call with checkpoint "phase-boundary" before advancing to the next phase.
+   For a changed decomposition, major replan, scope expansion, or repeated failures, review the updated
+   snapshot before dispatching or implementing the revised plan, using the corresponding checkpoint.
+3. One review covers overlapping checkpoints. Do not repeat an unchanged snapshot, review each worker
+   completion, or request another review merely because the reviewer returned. No final-only review.
+4. Send only the seven compact snapshot fields. Use actual task state and 'None' for empty fields.
+   Wait for the result, weigh it, and continue the task in the same turn; you remain the orchestrator.
+   If the tool fails, report the failure rather than claiming review succeeded; do not loop on retries.
+</system-notice>`;
 
 function primarySession(ctx: ExtensionContext) {
   const primary = AgentRegistry.global().get(MAIN_AGENT_ID)?.session;
@@ -45,12 +61,32 @@ export default function orcheAdvisor(pi: ExtensionAPI) {
       return { systemPrompt: [...event.systemPrompt, DEFAULT_GUIDANCE] };
     }
   });
+  pi.on("context", (event, ctx) => {
+    if (!primarySession(ctx) || !pi.getActiveTools().includes(TOOL)) return;
+
+    // Use OMP's own notice, not a second keyword parser: this respects prose boundaries,
+    // disabled magic keywords, synthetic prompts, and queued user messages.
+    let changed = false;
+    for (const message of event.messages) {
+      if (
+        message.role === "custom" &&
+        message.customType === "orchestrate-notice" &&
+        message.attribution === "user" &&
+        typeof message.content === "string" &&
+        !message.content.endsWith(ORCHESTRATE_GUIDANCE)
+      ) {
+        message.content += `\n\n${ORCHESTRATE_GUIDANCE}`;
+        changed = true;
+      }
+    }
+    if (changed) return { messages: event.messages };
+  });
 
   pi.registerTool({
     name: TOOL,
     label: "Orche-Advisor",
     description:
-      "Request one orchestration-only checkpoint review using @orche-advisor. DEFAULT only; never for routine worker completion. Send a compact snapshot, not conversation or repository contents. Identical snapshots reuse the prior review without a model call.",
+      "Request one orchestration-only checkpoint review using @orche-advisor. DEFAULT only. Required for orchestrate initial plans and phase/replan checkpoints; optional otherwise. Never for routine worker completion. Send a compact snapshot, not conversation or repository contents. Identical snapshots reuse the prior review without a model call.",
     loadMode: "essential",
     deferrable: false,
     parameters: z
