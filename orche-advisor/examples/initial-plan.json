@@ -1,0 +1,12 @@
+{
+  "checkpoint": "initial-plan",
+  "snapshot": {
+    "goal": "Apply a scoped configuration change while preserving worker models and existing advisors.",
+    "currentPlan": "Inspect effective configuration, make the minimal change, verify runtime resolution, then report.",
+    "completedWork": "Configuration and call paths inspected; no blockers.",
+    "agents": "No workers active or completed.",
+    "failuresOrBlockers": "None",
+    "tokenOrContextConcerns": "Avoid duplicate exploration and unnecessary fan-out.",
+    "nextProposedActions": "Apply the scoped change and run one targeted smoke verification, then stop."
+  }
+}

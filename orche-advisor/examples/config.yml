@@ -1,0 +1,4 @@
+# Merge this role into the active OMP config.yml; do not overwrite other settings.
+# Any supported authenticated model selector may be used, independently of DEFAULT.
+modelRoles:
+  orche-advisor: openai-codex/gpt-6-astra:xhigh
