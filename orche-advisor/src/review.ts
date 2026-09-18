@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { completeSimple } from "@oh-my-pi/pi-ai";
-import type { StopReason, Usage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Context, StopReason, Usage } from "@oh-my-pi/pi-ai";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { resolveRoleSelection } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 
@@ -41,6 +41,20 @@ export type ReviewSelection = Pick<
   "model" | "thinkingLevel"
 >;
 
+export type ReviewFailureKind =
+  | "output_truncated"
+  | "provider_error"
+  | "invalid_structure"
+  | "unexpected_tool_call";
+
+export interface ReviewAttemptDetails {
+  attempt: 1 | 2;
+  mode: "configured" | "no-reasoning";
+  stopReason: StopReason;
+  usage: Usage;
+  errorMessage?: string;
+}
+
 export interface ReviewResult {
   text: string;
   isError: boolean;
@@ -54,6 +68,8 @@ export interface ReviewResult {
     reused: false;
     usage: Usage;
     stopReason: StopReason;
+    attempts: ReviewAttemptDetails[];
+    failureKind?: ReviewFailureKind;
   };
 }
 
@@ -155,56 +171,147 @@ export function prepareReviewInput(value: unknown): PreparedReview {
   return { checkpoint: input.checkpoint, snapshot, snapshotHash };
 }
 
+function mergeUsage<T extends object>(previous: T, next: T): T {
+  const merged = { ...previous };
+  for (const [key, value] of Object.entries(next)) {
+    const prior = (previous as Record<string, unknown>)[key];
+    (merged as Record<string, unknown>)[key] =
+      typeof prior === "number" && typeof value === "number"
+        ? prior + value
+        : prior !== null && typeof prior === "object" && value !== null && typeof value === "object"
+          ? mergeUsage(prior, value)
+          : value;
+  }
+  return merged;
+}
+
+function sanitizeErrorMessage(value: unknown, apiKey: string | undefined): string | undefined {
+  const message = value instanceof Error ? value.message : typeof value === "string" ? value : "";
+  const redacted = apiKey ? message.replaceAll(apiKey, "[redacted]") : message;
+  const sanitized = Bun.stripANSI(redacted)
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 500);
+  return sanitized || undefined;
+}
+
+function hasReviewStructure(text: string): boolean {
+  const headings = text
+    .split(/\r?\n/)
+    .filter((line) => /^(?:VERDICT:|ISSUES:|ORCHESTRATION CHANGES:|AVOID:)/.test(line));
+  return (
+    /^VERDICT: (KEEP|ADJUST|REPLAN|ESCALATE)\b/.test(text) &&
+    headings.length === 4 &&
+    headings[1] === "ISSUES:" &&
+    headings[2] === "ORCHESTRATION CHANGES:" &&
+    headings[3] === "AVOID:"
+  );
+}
+
 export async function runReview(
   prepared: PreparedReview,
   selection: ReviewSelection,
   registry: Pick<ModelRegistry, "getApiKey">,
   signal?: AbortSignal,
+  completion: typeof completeSimple = completeSimple,
 ): Promise<ReviewResult> {
   const { model, thinkingLevel } = selection;
   const requestId = Bun.randomUUIDv7();
-  const apiKey = await registry.getApiKey(model, requestId);
+  const resolvedApiKey = await registry.getApiKey(model, requestId);
+  const apiKey = typeof resolvedApiKey === "string" ? resolvedApiKey : undefined;
   const timeout = AbortSignal.timeout(180_000);
   const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
   requestSignal.throwIfAborted();
 
-  const result = await completeSimple(
-    model,
-    {
-      systemPrompt: [ADVISOR_PROMPT],
-      messages: [
-        {
-          role: "user",
-          content: `Checkpoint: ${prepared.checkpoint}\n\n${JSON.stringify(prepared.snapshot, null, 2)}`,
-          timestamp: Date.now(),
+  const context: Context = {
+    systemPrompt: [ADVISOR_PROMPT],
+    messages: [
+      {
+        role: "user",
+        content: `Checkpoint: ${prepared.checkpoint}\n\n${JSON.stringify(prepared.snapshot, null, 2)}`,
+        timestamp: Date.now(),
+      },
+    ],
+    tools: [],
+  };
+  const attempts: ReviewAttemptDetails[] = [];
+  type AttemptResult = Pick<
+    AssistantMessage,
+    "content" | "usage" | "stopReason" | "provider" | "model" | "errorMessage"
+  >;
+  async function completeAttempt(attempt: 1 | 2): Promise<AttemptResult> {
+    requestSignal.throwIfAborted();
+    let result: AttemptResult;
+    try {
+      result = await completion(model, context, {
+        apiKey,
+        sessionId: attempt === 1 ? requestId : `${requestId}:no-reasoning`,
+        signal: requestSignal,
+        ...(attempt === 1
+          ? {
+              reasoning:
+                thinkingLevel === "auto" || thinkingLevel === "off" || thinkingLevel === "inherit"
+                  ? undefined
+                  : thinkingLevel,
+              disableReasoning: thinkingLevel === "off",
+            }
+          : { disableReasoning: true }),
+        maxTokens: 4096,
+      });
+    } catch (error) {
+      requestSignal.throwIfAborted();
+      result = {
+        content: [],
+        stopReason: "error",
+        provider: model.provider,
+        model: model.id,
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
         },
-      ],
-      tools: [],
-    },
-    {
-      apiKey: typeof apiKey === "string" ? apiKey : undefined,
-      sessionId: requestId,
-      signal: requestSignal,
-      reasoning:
-        thinkingLevel === "auto" || thinkingLevel === "off" || thinkingLevel === "inherit"
-          ? undefined
-          : thinkingLevel,
-      disableReasoning: thinkingLevel === "off",
-      maxTokens: 4096,
-    },
-  );
+        errorMessage: sanitizeErrorMessage(error, apiKey),
+      };
+    }
+    requestSignal.throwIfAborted();
+    const errorMessage = sanitizeErrorMessage(result.errorMessage, apiKey);
+    attempts.push({
+      attempt,
+      mode: attempt === 1 ? "configured" : "no-reasoning",
+      stopReason: result.stopReason,
+      usage: result.usage,
+      ...(errorMessage ? { errorMessage } : {}),
+    });
+    return result;
+  }
+
+  let result = await completeAttempt(1);
+  if (result.stopReason === "length" && !result.content.some((part) => part.type === "toolCall")) {
+    result = await completeAttempt(2);
+  }
   const text = result.content
     .filter((part) => part.type === "text")
     .map((part) => part.text)
     .join("\n")
     .trim();
-  const valid =
-    result.stopReason === "stop" &&
-    /^VERDICT: (KEEP|ADJUST|REPLAN|ESCALATE)\b/.test(text) &&
-    /\nISSUES:\s*\n/.test(text) &&
-    /\nORCHESTRATION CHANGES:\s*\n/.test(text) &&
-    /\nAVOID:\s*\n/.test(text) &&
-    !result.content.some((part) => part.type === "toolCall");
+  let failureKind: ReviewFailureKind | undefined;
+  if (result.stopReason === "error" || result.stopReason === "aborted") {
+    failureKind = "provider_error";
+  } else if (
+    result.stopReason === "toolUse" ||
+    result.content.some((part) => part.type === "toolCall")
+  ) {
+    failureKind = "unexpected_tool_call";
+  } else if (result.stopReason === "length") {
+    failureKind = "output_truncated";
+  } else if (result.stopReason !== "stop" || !hasReviewStructure(text)) {
+    failureKind = "invalid_structure";
+  }
+  const usage = attempts.reduce((total, attempt) => mergeUsage(total, attempt.usage), {} as Usage);
   const details: ReviewResult["details"] = {
     role: ROLE,
     snapshotHash: prepared.snapshotHash,
@@ -213,19 +320,26 @@ export async function runReview(
     model: `${result.provider}/${result.model}`,
     thinkingLevel,
     reused: false,
-    usage: result.usage,
+    usage,
     stopReason: result.stopReason,
+    attempts,
+    ...(failureKind ? { failureKind } : {}),
   };
 
-  if (!valid) {
-    return {
-      text: `Orche-Advisor did not return a complete structured review (${result.stopReason}). ${result.errorMessage ?? text}`,
-      isError: true,
-      details,
+  if (failureKind) {
+    const failures: Record<ReviewFailureKind, string> = {
+      output_truncated: `Orche-Advisor output was truncated at the 4096-token output limit after ${attempts.length} attempts, including a retry with reasoning disabled. No review is available. Choose a different model or retry at a later checkpoint.`,
+      provider_error:
+        "Orche-Advisor encountered a provider/runtime error. No review is available. Check provider availability, credentials, and attempt diagnostics before trying again.",
+      unexpected_tool_call:
+        "Orche-Advisor returned an unexpected tool call, but reviews must be text-only. No review is available. Check the configured model's support for tool-free responses.",
+      invalid_structure:
+        "Orche-Advisor completed without the required review structure. No review is available. Use a model that follows the required verdict and section headings.",
     };
+    return { text: failures[failureKind], isError: true, details };
   }
   return {
-    text: `${text}\n\nModel: ${details.model}; usage: ${result.usage.input} input, ${result.usage.output} output, ${result.usage.cacheRead} cache-read tokens; estimated cost: $${result.usage.cost.total.toFixed(6)}.`,
+    text: `${text}\n\nModel: ${details.model}; usage: ${usage.input} input, ${usage.output} output, ${usage.cacheRead} cache-read tokens; estimated cost: $${usage.cost.total.toFixed(6)}.`,
     isError: false,
     details,
   };
