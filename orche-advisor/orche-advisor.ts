@@ -1,7 +1,9 @@
 // OMP 18.1.20 SDK extension; deliberately separate from the passive WATCHDOG roster.
 // Model: config.yml -> modelRoles.orche-advisor (independent of default/slow/advisor).
 // Install as an OMP package extension. Only DEFAULT's explicit tool call spends tokens.
-// Usage is returned in tool-result details.usage, not the native /advisor status panel.
+// Each review request is recorded as a `model_usage` entry on the primary branch, so session totals
+// and `omp stats` attribute it to the reviewer model/role rather than to the calling model; the native
+// /advisor status panel does not track it. Usage is also returned in tool-result details.usage.
 // Disable with disabledExtensions: ["extension-module:orche-advisor"], preserving other entries.
 // Checkpoint relevance is a prompt policy; tool-less execution, input limits, primary-only
 // access, same-branch snapshot reuse, and overlapping-request rejection are runtime checks.
@@ -157,7 +159,28 @@ export default function orcheAdvisor(pi: ExtensionAPI) {
           throw new Error(
             "Configure modelRoles.orche-advisor with an available model; no DEFAULT/slow fallback is used.",
           );
+        // Capture the initiating branch before the call; the leaf may advance while the review runs.
+        const usageOwner = {
+          sessionId: primary.sessionManager.getSessionId(),
+          parentId: primary.sessionManager.getLeafId(),
+        };
         const review = await runReview(prepared, selection, ctx.modelRegistry, signal);
+        for (const attempt of review.details.attempts) {
+          const entryId = primary.sessionManager.appendModelUsage(
+            {
+              purpose: TOOL,
+              role: ROLE,
+              api: attempt.api,
+              provider: attempt.provider,
+              model: attempt.model,
+              usage: attempt.usage,
+              stopReason: attempt.stopReason,
+              ...(attempt.errorMessage ? { errorMessage: attempt.errorMessage } : {}),
+            },
+            usageOwner,
+          );
+          if (entryId) usageOwner.parentId = entryId;
+        }
         return {
           ...(review.isError ? { isError: true } : {}),
           content: [{ type: "text", text: review.text }],

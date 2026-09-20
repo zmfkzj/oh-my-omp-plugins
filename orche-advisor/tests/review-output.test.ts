@@ -109,7 +109,15 @@ describe("review completion boundary", () => {
     expect(calls[0]?.[2]).toMatchObject({ reasoning: "high", maxTokens: 4096 });
     const attempts: ReviewAttemptDetails[] = result.details.attempts;
     expect(attempts).toEqual([
-      { attempt: 1, mode: "configured", stopReason: "stop", usage: message.usage },
+      {
+        attempt: 1,
+        mode: "configured",
+        api: "openai-responses",
+        provider: "review-test-provider",
+        model: "review-test-model",
+        stopReason: "stop",
+        usage: message.usage,
+      },
     ]);
   });
 

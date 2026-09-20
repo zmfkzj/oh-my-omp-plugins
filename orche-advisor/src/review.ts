@@ -50,6 +50,9 @@ export type ReviewFailureKind =
 export interface ReviewAttemptDetails {
   attempt: 1 | 2;
   mode: "configured" | "no-reasoning";
+  api: string;
+  provider: string;
+  model: string;
   stopReason: StopReason;
   usage: Usage;
   errorMessage?: string;
@@ -238,7 +241,7 @@ export async function runReview(
   const attempts: ReviewAttemptDetails[] = [];
   type AttemptResult = Pick<
     AssistantMessage,
-    "content" | "usage" | "stopReason" | "provider" | "model" | "errorMessage"
+    "content" | "usage" | "stopReason" | "api" | "provider" | "model" | "errorMessage"
   >;
   async function completeAttempt(attempt: 1 | 2): Promise<AttemptResult> {
     requestSignal.throwIfAborted();
@@ -264,6 +267,7 @@ export async function runReview(
       result = {
         content: [],
         stopReason: "error",
+        api: model.api,
         provider: model.provider,
         model: model.id,
         usage: {
@@ -282,6 +286,9 @@ export async function runReview(
     attempts.push({
       attempt,
       mode: attempt === 1 ? "configured" : "no-reasoning",
+      api: result.api,
+      provider: result.provider,
+      model: result.model,
       stopReason: result.stopReason,
       usage: result.usage,
       ...(errorMessage ? { errorMessage } : {}),
