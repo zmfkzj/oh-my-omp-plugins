@@ -1,0 +1,126 @@
+{
+  "name": "omp-jev-router",
+  "version": "1.0.0",
+  "description": "Routes OMP orchestration activation and generic TASK model tier with TypeSafe Jev typed decisions.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "files": [
+    "src/",
+    "agents/",
+    "scripts/",
+    "README.md"
+  ],
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "omp": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "settings": {
+      "enabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Master switch for both routers."
+      },
+      "jevModel": {
+        "type": "string",
+        "default": "",
+        "description": "TypeSafe model id; empty uses the SDK default (jev-latest)."
+      },
+      "orchestrationRoutingEnabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Decide per user request whether to activate OMP's native orchestrate contract."
+      },
+      "orchestrationMinConfidence": {
+        "type": "number",
+        "default": 0.8,
+        "min": 0,
+        "max": 1,
+        "description": "max(probabilities) an orchestration decision must reach."
+      },
+      "orchestrationMinMargin": {
+        "type": "number",
+        "default": 0.25,
+        "min": 0,
+        "max": 1,
+        "description": "top1 - top2 an orchestration decision must reach."
+      },
+      "taskRoutingEnabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Pick @task vs @slow for generic task spawns."
+      },
+      "taskMinConfidence": {
+        "type": "number",
+        "default": 0.75,
+        "min": 0,
+        "max": 1,
+        "description": "max(probabilities) a tier decision must reach; below it the spawn goes deep."
+      },
+      "taskMinMargin": {
+        "type": "number",
+        "default": 0.2,
+        "min": 0,
+        "max": 1,
+        "description": "top1 - top2 a tier decision must reach; below it the spawn goes deep."
+      },
+      "normalTaskRole": {
+        "type": "string",
+        "default": "task",
+        "description": "Model role for TASK_NORMAL. 'task' leaves OMP's bundled agent untouched."
+      },
+      "deepTaskRole": {
+        "type": "string",
+        "default": "slow",
+        "description": "Model role for TASK_DEEP."
+      },
+      "routingTimeoutMs": {
+        "type": "number",
+        "default": 4000,
+        "min": 250,
+        "max": 20000,
+        "description": "Hard per-decision budget; expiry falls back instead of retrying."
+      },
+      "maxRoutingInputChars": {
+        "type": "number",
+        "default": 4000,
+        "min": 200,
+        "max": 40000,
+        "description": "Upper bound on the text sent to Jev per decision."
+      },
+      "telemetryEnabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Aggregate local route counts and worker cost. No prompt text is stored."
+      },
+      "debugLogging": {
+        "type": "boolean",
+        "default": false,
+        "description": "Emit one metrics-only line per routing decision to the OMP log."
+      }
+    }
+  },
+  "scripts": {
+    "gen:agents": "bun scripts/gen-deep-agent.ts",
+    "check": "tsc --noEmit",
+    "lint": "oxlint src scripts test",
+    "test": "bun test",
+    "build": "bun run gen:agents && bun run check && bun run lint && bun test",
+    "format": "oxfmt src scripts test package.json tsconfig.json"
+  },
+  "dependencies": {
+    "@typesafe-ai/sdk": "^0.6.0"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.2.6",
+    "@types/bun": "^1.4.2",
+    "oxfmt": "^0.68.0",
+    "oxlint": "^1.83.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "bun": ">=1.3.14"
+  }
+}
