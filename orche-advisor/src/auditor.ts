@@ -1,4 +1,4 @@
-import type { AdvisorConfig } from "@oh-my-pi/pi-coding-agent/advisor/config";
+import type { AdvisorConfig } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 
 /**
  * Roster name of the advisor this plugin owns. Also the override hook: a `WATCHDOG.yml`

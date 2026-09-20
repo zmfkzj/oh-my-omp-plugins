@@ -22,11 +22,9 @@
     "test": "bun test",
     "format": "oxfmt orche-advisor.ts src bin tests package.json tsconfig.json"
   },
-  "dependencies": {
-    "@oh-my-pi/pi-ai": "18.1.20",
-    "@oh-my-pi/pi-coding-agent": "18.1.20"
-  },
   "devDependencies": {
+    "@oh-my-pi/pi-ai": "18.2.6",
+    "@oh-my-pi/pi-coding-agent": "18.2.6",
     "@types/bun": "^1.4.2",
     "oxfmt": "^0.67.0",
     "typescript": "^7.0.2"
