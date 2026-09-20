@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Effort, type AssistantMessage, type Usage } from "@oh-my-pi/pi-ai";
 import example from "../examples/initial-plan.json";
+import { AUDITOR_NAME } from "../src/auditor.ts";
 import {
   prepareReviewInput,
   runReview,
@@ -287,5 +288,38 @@ describe("review completion boundary", () => {
       firstUsage,
       secondUsage,
     ]);
+  });
+
+  test("attaches verification findings beside the snapshot instead of merging them into it", async () => {
+    const evidenced = prepareReviewInput(example, [
+      {
+        note: "Phase 1 'tests pass' contradicted: no runner output in tool results.",
+        severity: "blocker",
+        advisor: AUDITOR_NAME,
+      },
+    ]);
+    const { completion, calls } = completionSequence(response());
+    const result = await runReview(
+      evidenced,
+      selection,
+      { getApiKey: async () => "test-api-key" },
+      undefined,
+      completion,
+    );
+    const content = calls[0]?.[1].messages[0]?.content as string;
+
+    expect(result.details.findingsForwarded).toBe(1);
+    // Verbatim seven-field JSON: evidence must stay distinguishable from DEFAULT's own report.
+    expect(content).toContain(JSON.stringify(evidenced.snapshot, null, 2));
+    expect(content).toContain(
+      `- [blocker ${AUDITOR_NAME}] Phase 1 'tests pass' contradicted: no runner output in tool results.`,
+    );
+  });
+
+  test("sends no findings block when no verification evidence landed", async () => {
+    const { completion, calls } = completionSequence(response());
+    await review(completion);
+
+    expect(calls[0]?.[1].messages[0]?.content).not.toContain("verification findings");
   });
 });
