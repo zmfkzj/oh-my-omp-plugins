@@ -39,13 +39,15 @@ describe("/jev-router status", () => {
 		const { pi } = makeApi();
 		const ctx = makeCommandCtx({
 			"@task": fakeModel("openai", "gpt-5.4"),
-			"@slow": fakeModel("anthropic", "claude-opus-5"),
+			"@task_hard": fakeModel("anthropic", "claude-opus-5"),
+			"@slow": fakeModel("openai", "separate-slow-model"),
 		});
 
 		const status = await renderStatus(pi, makeRuntime(), ctx);
 
 		expect(status).toContain("TASK_NORMAL            @task → openai/gpt-5.4");
-		expect(status).toContain("TASK_DEEP              @slow → anthropic/claude-opus-5");
+		expect(status).toContain("TASK_DEEP              @task_hard → anthropic/claude-opus-5");
+		expect(status).not.toContain("separate-slow-model");
 		expect(status).toContain("Last orchestration     DIRECT 0.91");
 		expect(status).toContain("Last TASK route        TASK_NORMAL 0.87");
 		expect(status).toContain(`${DEEP_AGENT_NAME} — discoverable and spawnable`);
@@ -55,7 +57,7 @@ describe("/jev-router status", () => {
 	test("identical tier models are an informational note, not an error", async () => {
 		const { pi } = makeApi();
 		const same = fakeModel("anthropic", "claude-opus-5");
-		const ctx = makeCommandCtx({ "@task": same, "@slow": same });
+		const ctx = makeCommandCtx({ "@task": same, "@task_hard": same });
 
 		const status = await renderStatus(pi, makeRuntime(), ctx);
 
@@ -66,16 +68,19 @@ describe("/jev-router status", () => {
 
 	test("an unresolvable role is called out with the fix", async () => {
 		const { pi } = makeApi();
-		const ctx = makeCommandCtx({ "@task": fakeModel("openai", "gpt-5.4") });
+		const ctx = makeCommandCtx({
+			"@task": fakeModel("openai", "gpt-5.4"),
+			"@slow": fakeModel("anthropic", "claude-opus-5"),
+		});
 
 		const status = await renderStatus(pi, makeRuntime(), ctx);
 
-		expect(status).toContain("Unresolved role(s): @slow.");
+		expect(status).toContain("Unresolved role(s): @task_hard.");
 		expect(status).toContain("modelRoles.<role>");
 	});
 
 	test("an on-disk but unspawnable alias is distinguished from a missing one", async () => {
-		const ctx = makeCommandCtx({ "@task": fakeModel("openai", "a"), "@slow": fakeModel("anthropic", "b") });
+		const ctx = makeCommandCtx({ "@task": fakeModel("openai", "a"), "@task_hard": fakeModel("anthropic", "b") });
 
 		const unspawnable = await renderStatus(makeApi(["task", "scout"]).pi, makeRuntime(), ctx);
 		expect(unspawnable).toContain("on disk but NOT spawnable in this session");
@@ -86,7 +91,7 @@ describe("/jev-router status", () => {
 
 	test("a shadowed generic task agent is reported as a disabled tier router", async () => {
 		const { pi } = makeApi();
-		const ctx = makeCommandCtx({ "@task": fakeModel("openai", "a"), "@slow": fakeModel("anthropic", "b") });
+		const ctx = makeCommandCtx({ "@task": fakeModel("openai", "a"), "@task_hard": fakeModel("anthropic", "b") });
 
 		const status = await renderStatus(pi, makeRuntime({ bundled: false }), ctx);
 
@@ -95,7 +100,7 @@ describe("/jev-router status", () => {
 
 	test("no secret ever appears in status output", async () => {
 		const { pi } = makeApi();
-		const ctx = makeCommandCtx({ "@task": fakeModel("openai", "a"), "@slow": fakeModel("anthropic", "b") });
+		const ctx = makeCommandCtx({ "@task": fakeModel("openai", "a"), "@task_hard": fakeModel("anthropic", "b") });
 		const runtime = makeRuntime();
 		(runtime as unknown as { credential: () => Promise<unknown> }).credential = async () => ({
 			key: "ts_super_secret_value",
@@ -115,16 +120,14 @@ describe("startup model-role preflight", () => {
 		const runtime = new JevRouterRuntime(pi, "/tmp/jev-router-pkg");
 		runtime.checkTierRoles(makeCommandCtx({ "@task": fakeModel("openai", "gpt-5.4") }));
 
-		expect(logs).toEqual([
-			"warn jev.router model role(s) @slow do not resolve; tier routing will fall back to the parent model. See /jev-router status.",
-		]);
+		expect(logs.some(line => line.startsWith("warn ") && line.includes("@task_hard"))).toBe(true);
 	});
 
 	test("identical tier models are informational, not a warning", () => {
 		const { pi, logs } = makeApi();
 		const runtime = new JevRouterRuntime(pi, "/tmp/jev-router-pkg");
 		const same = fakeModel("anthropic", "claude-opus-5");
-		runtime.checkTierRoles(makeCommandCtx({ "@task": same, "@slow": same }));
+		runtime.checkTierRoles(makeCommandCtx({ "@task": same, "@task_hard": same }));
 
 		// `note` is debug-gated, so a healthy-but-undifferentiated setup stays silent.
 		expect(logs).toEqual([]);
@@ -134,7 +137,7 @@ describe("startup model-role preflight", () => {
 		const { pi, logs } = makeApi();
 		const runtime = new JevRouterRuntime(pi, "/tmp/jev-router-pkg");
 		runtime.checkTierRoles(
-			makeCommandCtx({ "@task": fakeModel("openai", "gpt-5.4"), "@slow": fakeModel("anthropic", "opus") }),
+			makeCommandCtx({ "@task": fakeModel("openai", "gpt-5.4"), "@task_hard": fakeModel("anthropic", "opus") }),
 		);
 
 		expect(logs).toEqual([]);

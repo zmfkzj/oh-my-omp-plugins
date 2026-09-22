@@ -6,7 +6,7 @@ Two bounded routing decisions for [OMP](https://omp.sh), made by TypeSafe's
 1. **Front door** — should OMP's *native* orchestration contract be activated for
    this user request, or should the primary agent just execute it?
 2. **TASK tier** — once OMP has already chosen its generic `task` worker, should
-   that spawn resolve through `@task` or through `@slow`?
+   that spawn resolve through `@task` or through `@task_hard`?
 
 Everything else OMP does is untouched. In particular the plugin never revisits
 OMP's own SMOL vs TASK decision, never rewrites a specialized or explicitly
@@ -48,7 +48,7 @@ named agent, and never implements an orchestration engine of its own.
                       TASK_NORMAL       TASK_DEEP
                            │               │
                            ▼               ▼
-                        @task            @slow
+                        @task            @task_hard
 ```
 
 ## Architecture
@@ -99,7 +99,7 @@ A `task.batch` call is classified in **one** Jev request carrying one question
 per item, and only the `agent` field is ever changed: `name`, `task`, `context`,
 `effort`, `isolated`, `tools`, `outputSchema` and `schemaMode` survive verbatim.
 
-### Why `@task` → `@slow` needs an alias agent
+### Why `@task` → `@task_hard` needs an alias agent
 
 OMP's task wire schema deletes unknown keys (`"+": "delete"`), and the only
 invocation-local model override (`runSubprocess`'s `modelOverride`) is reachable
@@ -132,16 +132,17 @@ materially reduce the chance of a wrong call, rework, or a retry?*
 modelRoles:
   default: <strongest primary>       # understands, plans, integrates
   task: <cheaper capable worker>     # ordinary delegated coding
-  slow: <strongest reasoning model>  # deep delegated reasoning
+  task_hard: <deep task model>       # independent deep delegated reasoning
+  slow: <general reasoning model>   # other OMP high-reasoning work
   smol: <inexpensive lightweight>    # OMP's own lightweight tier
 ```
 
 No vendor or model name is hard-coded anywhere in the plugin; it resolves
-whatever `modelRoles` says. `slow` stays OMP's general high-reasoning role —
-reviewer, planning and anything else that already uses it are unaffected; the
-plugin only *reuses* it for deep TASK.
+whatever `modelRoles` says. Configure `modelRoles.task_hard` separately from
+`modelRoles.slow`. The `slow` role remains available for reviewer, planning and
+anything else that already uses it; deep TASK no longer shares it by default.
 
-`@task` and `@slow` resolving to the same model is not an error. `/jev-router
+`@task` and `@task_hard` resolving to the same model is not an error. `/jev-router
 status` reports it:
 
 ```text
@@ -211,7 +212,7 @@ Gate                   confidence ≥ 0.8, margin ≥ 0.25
 
 TASK tier routing      enabled
 TASK_NORMAL            @task → openai/gpt-5.4
-TASK_DEEP              @slow → anthropic/claude-opus-5
+TASK_DEEP              @task_hard → anthropic/claude-opus-5
 Gate                   confidence ≥ 0.75, margin ≥ 0.2
 Tier agent             task-deep — discoverable and spawnable
 
@@ -292,15 +293,15 @@ worker already failed.
 
 | failure | front door | TASK tier |
 | --- | --- | --- |
-| credential missing | no automatic orchestration | `@slow` |
-| 401 / 403 | no automatic orchestration | `@slow` |
-| 429 / 5xx | no automatic orchestration | `@slow` |
-| timeout | no automatic orchestration | `@slow` |
-| network failure | no automatic orchestration | `@slow` |
-| malformed response | no automatic orchestration | `@slow` |
-| SDK exception | no automatic orchestration | `@slow` |
-| unknown model | no automatic orchestration | `@slow` |
-| gate not cleared | UNCERTAIN hint | `@slow` |
+| credential missing | no automatic orchestration | `@task_hard` |
+| 401 / 403 | no automatic orchestration | `@task_hard` |
+| 429 / 5xx | no automatic orchestration | `@task_hard` |
+| timeout | no automatic orchestration | `@task_hard` |
+| network failure | no automatic orchestration | `@task_hard` |
+| malformed response | no automatic orchestration | `@task_hard` |
+| SDK exception | no automatic orchestration | `@task_hard` |
+| unknown model | no automatic orchestration | `@task_hard` |
+| gate not cleared | UNCERTAIN hint | `@task_hard` |
 
 Orchestration failure degrades to exactly what OMP would have done without the
 plugin. Tier failure degrades to the strongest safe worker, because a wrong
@@ -364,7 +365,7 @@ omp plugin config get omp-jev-router deepTaskRole
 | `taskMinConfidence` | `0.75` | `max(probabilities)` gate |
 | `taskMinMargin` | `0.20` | `top1 - top2` gate |
 | `normalTaskRole` | `task` | role for TASK_NORMAL |
-| `deepTaskRole` | `slow` | role for TASK_DEEP |
+| `deepTaskRole` | `task_hard` | role for TASK_DEEP |
 | `routingTimeoutMs` | `4000` | hard per-decision budget |
 | `maxRoutingInputChars` | `4000` | upper bound on text sent to Jev |
 | `telemetryEnabled` | `true` | local aggregate counters |
@@ -374,8 +375,18 @@ omp plugin config get omp-jev-router deepTaskRole
 completely untouched — OMP's bundled agent runs exactly as it always did. Set it
 to another role only if you want a second alias agent materialized.
 
-The plugin reads `modelRoles.default`, `.task`, `.slow` and `.smol`; it never
-copies or overwrites them.
+The plugin resolves the configured tier roles (`modelRoles.task` and
+`modelRoles.task_hard` by default); it never copies or overwrites model roles.
+
+To migrate an installation with an explicitly stored `deepTaskRole: slow`, run:
+
+```sh
+omp plugin config set omp-jev-router deepTaskRole task_hard
+```
+
+Set `modelRoles.task_hard` to your chosen model in OMP's `config.yml`, then start
+a new session. Explicit role overrides remain honored. The agent name stays
+`task-deep`; `task_hard` is its independent model role, not a new agent.
 
 ## Troubleshooting
 
@@ -398,7 +409,7 @@ jev.orchestration route=SKIP reason=not-main-session
 | `route=SKIP reason=generic-task-overridden` | an agent named `task` shadows OMP's bundled worker; tier routing stands down so your definition is not replaced |
 | `route=SKIP reason=deep-alias-unspawnable` | `task-deep` is not advertised by the task tool (spawn policy or `task.disabledAgents`) |
 | `TASK_DEEP` everywhere | check `/jev-router status` for a credential or gate problem |
-| `Unresolved role(s): @slow` in status | `modelRoles.slow` does not resolve; OMP falls back to the parent model, so the tiers stop differing |
+| `Unresolved role(s): @task_hard` in status | `modelRoles.task_hard` does not resolve; OMP falls back to the parent model, so configure the independent role |
 
 The same check runs once at session start and writes
 `jev.router model role(s) @slow do not resolve; …` to the OMP log, so a broken

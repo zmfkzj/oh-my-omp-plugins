@@ -7,10 +7,11 @@
  * `task` agent, so a newer OMP self-heals the drift; this build step only
  * guarantees the file exists in the published package.
  */
+import { DEFAULT_CONFIG } from "../src/config.ts";
 import { materializeTierAgents, requiredTierAgents } from "../src/deep-agent.ts";
 
 const packageRoot = new URL("..", import.meta.url).pathname;
-const specs = requiredTierAgents("task", "slow");
+const specs = requiredTierAgents(DEFAULT_CONFIG.normalTaskRole, DEFAULT_CONFIG.deepTaskRole);
 const result = await materializeTierAgents(packageRoot, specs);
 
 if (result.failed.length > 0) {

@@ -132,7 +132,7 @@ export class JevRouterRuntime {
 	/**
 	 * Startup check that both tier roles resolve.
 	 *
-	 * An unresolvable `@task`/`@slow` is not fatal — OMP falls back to the
+	 * An unresolvable `@task`/`@task_hard` is not fatal — OMP falls back to the
 	 * parent's model — but it silently collapses the two tiers, so it is worth
 	 * one log line. Identical resolutions are legal and only informational.
 	 * Nothing here writes `modelRoles`.

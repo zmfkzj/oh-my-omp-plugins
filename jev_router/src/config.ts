@@ -52,7 +52,7 @@ export const DEFAULT_CONFIG: Readonly<JevRouterConfig> = Object.freeze({
 	taskMinMargin: 0.2,
 
 	normalTaskRole: "task",
-	deepTaskRole: "slow",
+	deepTaskRole: "task_hard",
 
 	routingTimeoutMs: 4000,
 	maxRoutingInputChars: 4000,
@@ -78,7 +78,7 @@ function asNumber(value: unknown, fallback: number, min: number, max: number): n
 
 function asRole(value: unknown, fallback: string): string {
 	if (typeof value !== "string") return fallback;
-	// Accept both `slow` and `@slow`; roles are stored bare.
+	// Accept both `task_hard` and `@task_hard`; roles are stored bare.
 	const trimmed = value.trim().replace(/^@/, "");
 	return /^[A-Za-z0-9_-]+$/.test(trimmed) ? trimmed : fallback;
 }

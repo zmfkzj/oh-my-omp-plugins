@@ -3,7 +3,7 @@
  *
  * OMP decides SMOL vs TASK; this router never revisits that. It only looks at
  * spawns that already resolved to the *generic* bundled `task` worker and picks
- * the reasoning tier: keep `@task`, or move to `@slow` via the derived
+ * the reasoning tier: keep `@task`, or move to `@task_hard` via the derived
  * `task-deep` alias. Specialized agents (`sonic`, `scout`, `reviewer`,
  * `security-reviewer`, project/user/plugin agents, `^`-tagged model pseudonyms)
  * pass through untouched, as does any explicitly named agent.

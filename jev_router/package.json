@@ -50,7 +50,7 @@
       "taskRoutingEnabled": {
         "type": "boolean",
         "default": true,
-        "description": "Pick @task vs @slow for generic task spawns."
+        "description": "Pick @task vs @task_hard for generic task spawns."
       },
       "taskMinConfidence": {
         "type": "number",
@@ -73,7 +73,7 @@
       },
       "deepTaskRole": {
         "type": "string",
-        "default": "slow",
+        "default": "task_hard",
         "description": "Model role for TASK_DEEP."
       },
       "routingTimeoutMs": {

@@ -160,7 +160,7 @@ describe("TASK tier routing", () => {
 		expect(decider.taskCalls).toBe(0);
 	});
 
-	test("a low-confidence tier decision fails quality-safe to @slow", async () => {
+	test("a low-confidence tier decision fails quality-safe to the deep tier", async () => {
 		const { router, pi } = build({ t0: { top: "TASK_NORMAL", confidence: 0.6, margin: 0.2 } });
 
 		const result = await router.route(pi, "call-7", batch({ agent: "task", task: "Ambiguous work." }));
@@ -169,7 +169,7 @@ describe("TASK tier routing", () => {
 		expect(router.lastDecision?.confident).toBe(false);
 	});
 
-	test("a Jev failure routes the whole call to @slow", async () => {
+	test("a Jev failure routes the whole call to the deep tier", async () => {
 		const { router, pi } = build(new Error("HTTP 429 rate limited"));
 
 		const result = await router.route(
@@ -184,7 +184,7 @@ describe("TASK tier routing", () => {
 		]);
 	});
 
-	test("a missing credential routes to @slow without calling Jev", async () => {
+	test("a missing credential routes to the deep tier without calling Jev", async () => {
 		const { router, pi, decider } = build({}, { apiKey: undefined });
 
 		const result = await router.route(pi, "call-9", batch({ agent: "task", task: "Work." }));

@@ -4,7 +4,7 @@
  *   1. Front door: should OMP's *native* orchestration contract be activated
  *      for this user request, or should the primary agent just run it?
  *   2. Tier: once OMP has chosen its generic `task` worker, should that spawn
- *      resolve through `@task` or through `@slow`?
+ *      resolve through `@task` or through `@task_hard`?
  *
  * OMP's own SMOL vs TASK decision, its specialized agents, and every explicit
  * user choice are left exactly as they are.

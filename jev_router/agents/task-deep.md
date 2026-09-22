@@ -2,7 +2,7 @@
 name: "task-deep"
 description: "Deep-reasoning tier of the generic task worker, selected automatically by omp-jev-router. Do not request it directly; dispatch `task` and let the router pick the tier."
 spawns: "*"
-model: "@slow"
+model: "@task_hard"
 thinking-level: "auto"
 ---
 Worker agent: delegated tasks.

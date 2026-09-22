@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { getBundledAgent, parseAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
+import { normalizeConfig } from "../src/config.ts";
 import {
 	agentsDir,
 	DEEP_AGENT_NAME,
@@ -27,12 +28,13 @@ describe("tier alias derivation", () => {
 	test("the alias is the bundled task agent with only the model role changed", () => {
 		const base = getBundledAgent("task");
 		expect(base).toBeDefined();
-		const rendered = renderTierAgent(base!, { name: DEEP_AGENT_NAME, role: "slow", description: "Deep tier." });
+		const config = normalizeConfig(undefined);
+		const rendered = renderTierAgent(base!, requiredTierAgents(config.normalTaskRole, config.deepTaskRole)[0]!);
 
 		// Round-trip through OMP's own frontmatter parser, not a local regex.
 		const parsed = parseAgent(`${DEEP_AGENT_NAME}.md`, rendered, "user");
 		expect(parsed.name).toBe(DEEP_AGENT_NAME);
-		expect(parsed.model).toEqual(["@slow"]);
+		expect(parsed.model).toEqual(["@task_hard"]);
 		expect(parsed.systemPrompt.trim()).toBe(base!.systemPrompt.trim());
 		expect(parsed.spawns).toEqual(base!.spawns);
 		expect(parsed.thinkingLevel).toBe(base!.thinkingLevel);
@@ -114,11 +116,11 @@ describe("materialization", () => {
 	test("a role change rewrites the alias", async () => {
 		const root = await tempRoot();
 		await materializeTierAgents(root, requiredTierAgents("task", "slow"));
-		const rewritten = await materializeTierAgents(root, requiredTierAgents("task", "review"));
+		const rewritten = await materializeTierAgents(root, requiredTierAgents("task", "task_hard"));
 
 		expect(rewritten.written).toEqual([DEEP_AGENT_NAME]);
 		const content = await Bun.file(path.join(agentsDir(root), `${DEEP_AGENT_NAME}.md`)).text();
-		expect(content).toContain('model: "@review"');
+		expect(parseAgent("task-deep.md", content, "user").model).toEqual(["@task_hard"]);
 	});
 
 	test("every artifact lives inside the package, so uninstall removes it", async () => {
