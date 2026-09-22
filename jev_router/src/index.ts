@@ -12,7 +12,7 @@
 import path from "node:path";
 import { registerCommands } from "./commands.ts";
 import { TYPESAFE_PROVIDER } from "./credentials.ts";
-import { sessionOf } from "./host.ts";
+import { mainSessionOf, sessionOf } from "./host.ts";
 import { JevRouterRuntime } from "./runtime.ts";
 import { harvestTaskUsage } from "./usage-harvest.ts";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
@@ -27,6 +27,13 @@ export function registerJevRouter(pi: ExtensionAPI, packageRoot: string): JevRou
 	pi.on("session_start", async (_event, ctx) => {
 		runtime.bindContext(ctx);
 		await runtime.reloadConfig(ctx.cwd);
+		// Register the default custom role once, without changing user assignments.
+		// Child sessions inherit settings and must not write global configuration.
+		const settings = mainSessionOf(ctx)?.settings;
+		if (settings && runtime.config.deepTaskRole === "task_hard" && settings.getModelRole("task_hard") === undefined) {
+			settings.setModelRole("task_hard", "@slow");
+			await settings.flush();
+		}
 		await runtime.telemetry.load();
 		// Materialize + verify the tier aliases before the first `task` call.
 		await runtime.surveyAgents(ctx.cwd, sessionOf(ctx)?.settings);

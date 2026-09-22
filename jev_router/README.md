@@ -138,9 +138,13 @@ modelRoles:
 ```
 
 No vendor or model name is hard-coded anywhere in the plugin; it resolves
-whatever `modelRoles` says. Configure `modelRoles.task_hard` separately from
-`modelRoles.slow`. The `slow` role remains available for reviewer, planning and
-anything else that already uses it; deep TASK no longer shares it by default.
+whatever `modelRoles` says. On the first main-session start after installation,
+when `deepTaskRole` is `task_hard` and that role is not configured, the plugin
+persists `modelRoles.task_hard: "@slow"` in OMP's global configuration. This
+makes the custom role visible in OMP's model selector without choosing a vendor
+or model for you. Assign it a separate model there or in `config.yml` when you
+want independent deep TASK reasoning. Existing assignments, including project
+overrides, are preserved; subagent sessions never register the role.
 
 `@task` and `@task_hard` resolving to the same model is not an error. `/jev-router
 status` reports it:
@@ -376,7 +380,9 @@ completely untouched — OMP's bundled agent runs exactly as it always did. Set 
 to another role only if you want a second alias agent materialized.
 
 The plugin resolves the configured tier roles (`modelRoles.task` and
-`modelRoles.task_hard` by default); it never copies or overwrites model roles.
+`modelRoles.task_hard` by default). Its only automatic model-role write is
+registering a missing default `task_hard` as `@slow` on main-session startup;
+it never overwrites an existing assignment or registers custom role overrides.
 
 To migrate an installation with an explicitly stored `deepTaskRole: slow`, run:
 
@@ -384,9 +390,11 @@ To migrate an installation with an explicitly stored `deepTaskRole: slow`, run:
 omp plugin config set omp-jev-router deepTaskRole task_hard
 ```
 
-Set `modelRoles.task_hard` to your chosen model in OMP's `config.yml`, then start
-a new session. Explicit role overrides remain honored. The agent name stays
-`task-deep`; `task_hard` is its independent model role, not a new agent.
+Start a new session to register the missing `task_hard` role automatically,
+then choose its model in OMP's model selector or `config.yml`. Until changed,
+it follows `@slow`. Explicit role overrides remain honored. The agent name
+stays `task-deep`; `task_hard` is its model role, not a new agent. Uninstalling
+the plugin leaves this user-configurable model-role assignment intact.
 
 ## Troubleshooting
 
