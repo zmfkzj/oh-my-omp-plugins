@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
-import { findingsSinceLastReview } from "../orche-advisor.ts";
-import { AUDITOR_NAME } from "../src/auditor.ts";
-import { ROLE, TOOL, type VerificationFinding } from "../src/review.ts";
+import { findingsSinceLastReview } from "../src/orche-advisor.ts";
+import { AUDITOR_NAME } from "../src/verification-auditor.ts";
+import { ROLE, TOOL, type VerificationFinding } from "../src/advisor-review.ts";
 
 function advisorNotes(...notes: VerificationFinding[]): SessionEntry {
   return {

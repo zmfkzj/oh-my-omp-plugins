@@ -20,6 +20,11 @@ export interface JevRouterConfig {
 	jevModel: string;
 
 	orchestrationRoutingEnabled: boolean;
+	mainModelRoutingEnabled: boolean;
+	/** Role the main agent normally uses; explicit other models are never overridden. */
+	mainNormalRole: string;
+	/** Role SLOW and unconfident decisions switch to for this turn. */
+	mainDeepRole: string;
 	orchestrationMinConfidence: number;
 	orchestrationMinMargin: number;
 
@@ -44,8 +49,11 @@ export const DEFAULT_CONFIG: Readonly<JevRouterConfig> = Object.freeze({
 	jevModel: "",
 
 	orchestrationRoutingEnabled: true,
-	orchestrationMinConfidence: 0.8,
-	orchestrationMinMargin: 0.25,
+	orchestrationMinConfidence: 0.6,
+	orchestrationMinMargin: 0.2,
+	mainModelRoutingEnabled: true,
+	mainNormalRole: "default",
+	mainDeepRole: "slow",
 
 	taskRoutingEnabled: true,
 	taskMinConfidence: 0.75,
@@ -102,6 +110,9 @@ export function normalizeConfig(raw: Record<string, unknown> | undefined): JevRo
 		),
 		orchestrationMinMargin: asNumber(r.orchestrationMinMargin, DEFAULT_CONFIG.orchestrationMinMargin, 0, 1),
 
+		mainModelRoutingEnabled: asBoolean(r.mainModelRoutingEnabled, DEFAULT_CONFIG.mainModelRoutingEnabled),
+		mainNormalRole: asRole(r.mainNormalRole, DEFAULT_CONFIG.mainNormalRole),
+		mainDeepRole: asRole(r.mainDeepRole, DEFAULT_CONFIG.mainDeepRole),
 		taskRoutingEnabled: asBoolean(r.taskRoutingEnabled, DEFAULT_CONFIG.taskRoutingEnabled),
 		taskMinConfidence: asNumber(r.taskMinConfidence, DEFAULT_CONFIG.taskMinConfidence, 0, 1),
 		taskMinMargin: asNumber(r.taskMinMargin, DEFAULT_CONFIG.taskMinMargin, 0, 1),

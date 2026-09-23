@@ -7,13 +7,14 @@
  */
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
-export type RouteLabel = "DIRECT" | "ORCHESTRATE" | "UNCERTAIN" | "TASK_NORMAL" | "TASK_DEEP";
+export type RouteLabel = "DEFAULT" | "SLOW" | "ORCHESTRATE" | "UNCERTAIN" | "TASK_NORMAL" | "TASK_DEEP";
 
 export interface RouteLogRecord {
 	route: RouteLabel | "SKIP" | "ERROR";
 	confidence?: number;
 	margin?: number;
 	latencyMs?: number;
+	model?: string;
 	/** Bounded, non-sensitive explanation (`credential-missing`, `timeout`, `http-401`, …). */
 	reason?: string;
 	/** Number of decisions in the batch, when more than one. */
@@ -65,6 +66,7 @@ export class RouteLogger {
 		if (record.margin !== undefined) parts.push(`margin=${record.margin.toFixed(2)}`);
 		if (record.items !== undefined) parts.push(`items=${record.items}`);
 		if (record.latencyMs !== undefined) parts.push(`latency=${Math.round(record.latencyMs)}ms`);
+		if (record.model) parts.push(`model=${record.model}`);
 		if (record.reason) parts.push(`reason=${redact(record.reason, [...this.#secrets])}`);
 		this.#logger.debug(`${channel} ${parts.join(" ")}`);
 	}

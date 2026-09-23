@@ -17,7 +17,7 @@ import {
   runReview,
   type PreparedReview,
   type ReviewSelection,
-} from "./review.ts";
+} from "./advisor-review.ts";
 
 const MAX_INPUT_BYTES = 64 * 1024;
 const VERSION = packageJson.version;
@@ -49,26 +49,24 @@ Exit status:
   130/143  Cancelled by SIGINT/SIGTERM.
 
 Standalone install and use:
-  cd /path/to/orche-advisor
+  cd /path/to/jev_router
   bun install
   bun run bin/orche-advisor.ts examples/initial-plan.json --check
   bun run bin/orche-advisor.ts examples/initial-plan.json
   cat examples/initial-plan.json | bun run bin/orche-advisor.ts --json
 
 Install a release archive as a command:
-  bun install --global /path/to/orche-advisor-${VERSION}.tgz
+  bun install --global /path/to/omp-jev-router-${VERSION}.tgz
   orche-advisor /path/to/snapshot.json --model provider/model:high --check
 Requires Bun >=1.3.14 and credentials for the selected provider, not a running OMP session.
 Use provider API-key environment variables or credentials in the selected OMP agent directory.
 The CLI is stateless: every non-check invocation requests a review. Same-branch reuse is
 available only inside the OMP extension. Review usage is in the result, not /advisor status.
 
-Install the optional OMP extension from the same checkout:
-  omp plugin install /path/to/orche-advisor
-Then configure modelRoles.${ROLE}; examples/config.yml shows the expected role.
-Plugin installation is explicit and does not copy credentials.
-Do not load the legacy single-file extension and this package simultaneously.
-Remove the old registration before enabling the packaged extension.
+Install the OMP extension from this same package:
+  omp plugin install /path/to/jev_router
+Configure modelRoles.${ROLE}; examples/config.yml also shows the independent
+Verification Auditor role (default @smol, not ADVISOR).
 Reload OMP with /reload-plugins or start a new session after installing or updating.
 The standalone prose keyword orchestrate enables required initial-plan and phase/replan
 reviews through OMP's native orchestration notice. Ordinary requests keep reviews optional.

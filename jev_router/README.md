@@ -3,86 +3,89 @@
 Two bounded routing decisions for [OMP](https://omp.sh), made by TypeSafe's
 [Jev](https://typesafe.ai) System One model:
 
-1. **Front door** — should OMP's *native* orchestration contract be activated for
-   this user request, or should the primary agent just execute it?
+1. **Front door** — choose DEFAULT, SLOW, or OMP's native ORCHESTRATE
+   contract for each user request, before the primary agent's first model call.
 2. **TASK tier** — once OMP has already chosen its generic `task` worker, should
    that spawn resolve through `@task` or through `@task_hard`?
 
-Everything else OMP does is untouched. In particular the plugin never revisits
-OMP's own SMOL vs TASK decision, never rewrites a specialized or explicitly
-named agent, and never implements an orchestration engine of its own.
+OMP's own SMOL/TASK decision and explicit agent choices are preserved. This package
+also provides an explicit `orche_advisor` checkpoint-review tool and a passive
+Verification Auditor; neither is a third routing decision.
 
 ---
 
 ## What it does
 
 ```text
-                         USER
-                           │
-                           ▼
-                ┌───────────────────┐
-                │ Jev Orchestration │
-                │      Router       │
-                └─────────┬─────────┘
-                          │
-             ┌────────────┼────────────┐
-             ▼            ▼            ▼
-          DIRECT      ORCHESTRATE   UNCERTAIN
-             │        native OMP    one hidden
-             │        orchestrate   hint line
-             └────────────┬─────────────┘
-                          ▼
-                   Primary @default
-                          │
-                 OMP native decision
-                          │
-                 ┌────────┴────────┐
-                 ▼                 ▼
-               SMOL               TASK
-                 │                 │
-                 ▼                 ▼
-              @smol         Jev Task Router
-              (untouched)          │
-                           ┌───────┴───────┐
-                           ▼               ▼
-                      TASK_NORMAL       TASK_DEEP
-                           │               │
-                           ▼               ▼
-                        @task            @task_hard
+USER → Jev front door
+  DEFAULT     → primary on @default
+  SLOW        → primary on @slow for this turn, then restore
+  ORCHESTRATE → primary on @default + OMP's native orchestrate notice
+  UNCERTAIN   → primary on @slow + one hidden delegation hint
+
+Primary → OMP's native SMOL/TASK choice
+  SMOL → @smol (untouched)
+  TASK → Jev TASK_NORMAL (@task) or TASK_DEEP (@task_hard)
 ```
 
 ## Architecture
 
 ### Front door (`before_agent_start` + `context`)
 
-`before_agent_start` scopes the turn and captures the request text. It performs
-no network work, so OMP's policy-preparation retries cost nothing.
+`before_agent_start` calls Jev once per prompt and awaits the decision before
+dispatch; OMP captures the request model before `context`, so switching in
+`context` would miss the first request. Policy-preparation retries reuse the
+same decision. Jev sees the current request and at most two prior user requests
+(each clipped to 500 characters) to interpret short follow-ups.
 
-`context` makes the decision once per turn and applies it to the messages
-actually about to be sent:
+- **DEFAULT** keeps the main model and adds no notice. It does not prohibit
+  ordinary delegation if evidence warrants it later.
+- **SLOW** temporarily switches the main session from `mainNormalRole` to
+  `mainDeepRole`, including its configured thinking level, then restores both
+  when the turn settles. A user's explicit `/model`, `/switch`, or `--model`
+  choice takes precedence; if another actor changes the model during the turn,
+  the router does not overwrite it on settlement.
+- **ORCHESTRATE** keeps the default main model and injects OMP's own hidden,
+  user-attributed `orchestrate-notice` at `context`.
+- **UNCERTAIN** uses the SLOW model and adds one short hidden hint to weigh
+  delegation during scoping; no second Jev call.
 
-- **ORCHESTRATE** injects the exact notice OMP's `orchestrate` magic keyword
-  injects — `renderOrchestrateNotice(...)` under `customType:
-"orchestrate-notice"`, hidden, user-attributed. No new prompt, no new engine.
-- **UNCERTAIN** injects one short hidden line asking the primary to weigh
-  delegation while scoping. There is no second routing call and no extra
-  planning round-trip.
-- **DIRECT** injects nothing at all. It does **not** say "never delegate": the
-  primary agent can still dispatch subagents through OMP's normal mechanisms if
-  evidence turns up mid-turn. DIRECT only means *the plugin did not switch
-  automatic orchestration on*.
+At `context`, the router detects an existing native notice from the user's
+explicit `orchestrate` keyword and does not duplicate it. That keyword cannot
+be detected before dispatch: Jev still decides once and may switch the model.
+Injected notices live only in provider context, not in the transcript.
 
-Deciding at `context` is what lets the router ask OMP whether the keyword
-already fired — a native notice sits in the hidden companion run immediately
-before the turn's user message — instead of re-implementing OMP's prose matcher.
-It also means the injected notice lives only in the provider context for that
-turn and is never written to the transcript, so an automatically orchestrated
-turn leaves nothing behind for the next one.
+Subagent sessions, plan mode, slash commands, and agent-authored `<system-…>`
+notices skip routing. Disabling orchestration, the `task` tool, or OMP's
+orchestrate keyword suppresses only the orchestration notice while main-model
+routing remains enabled; set both routing flags to false to disable the front door.
 
-The router is skipped entirely for: subagent/child sessions, plan mode,
-sessions without the `task` tool, prompts OMP left as an unexpanded slash
-command, agent-authored `<system-…>` notices, a turn where the user already
-typed `orchestrate`, and any session where `magicKeywords.orchestrate` is off.
+### Checkpoint reviewer and Verification Auditor
+
+The primary may call `orche_advisor` for a bounded orchestration review. Native
+`orchestrate` notices require initial-plan and verified phase-boundary reviews;
+ordinary requests keep them optional. Reviews are tool-less, use only seven
+snapshot fields plus automatically attached Verification Auditor findings, and
+are charged to `modelRoles.orche-advisor`. Configure that role explicitly; there
+is no fallback to DEFAULT or SLOW. Repeating a snapshot without new findings
+reuses the earlier review.
+
+The bundled Verification Auditor runs through OMP's WATCHDOG roster only while
+advisors are enabled. Its model is `@verification-auditor`, a custom role
+registered as `@smol` on primary-session startup if unset. It does not use or
+change `modelRoles.advisor` (ADVISOR); set its role independently to choose a
+different model. A same-named `WATCHDOG.yml` entry overrides the bundled
+auditor. Its evidence-backed concern/blocker notes feed the next checkpoint
+review, not unrelated watchdog notes.
+
+When no WATCHDOG roster is configured, the Verification Auditor is the only
+advisor; the plugin removes OMP's synthesized default advisor. Explicit
+`WATCHDOG.yml` entries are retained, including a general advisor if desired.
+
+The standalone `orche-advisor` CLI remains available from this package:
+`bun bin/orche-advisor.ts examples/initial-plan.json --check` validates the
+input and model selection without requesting a review. The CLI uses
+`modelRoles.orche-advisor` unless `--model` is supplied.
 
 ### TASK tier (`tool_call`)
 
@@ -130,21 +133,22 @@ materially reduce the chance of a wrong call, rework, or a retry?*
 
 ```yaml
 modelRoles:
-  default: <strongest primary>       # understands, plans, integrates
-  task: <cheaper capable worker>     # ordinary delegated coding
-  task_hard: <deep task model>       # independent deep delegated reasoning
-  slow: <general reasoning model>   # other OMP high-reasoning work
-  smol: <inexpensive lightweight>    # OMP's own lightweight tier
+  default: <capable standard primary>       # normal user turns
+  task: <cheaper capable worker>            # ordinary delegated coding
+  task_hard: <deep task model>              # independent deep delegated reasoning
+  slow: <stronger reasoning model>          # SLOW/UNCERTAIN user turns
+  smol: <inexpensive lightweight>           # OMP's own lightweight tier
+  advisor: <general advisor model>          # only if declared in WATCHDOG.yml
+  verification-auditor: "@smol"            # distinct from ADVISOR
+  orche-advisor: <checkpoint reviewer>      # explicitly configured
 ```
 
-No vendor or model name is hard-coded anywhere in the plugin; it resolves
-whatever `modelRoles` says. On the first main-session start after installation,
-when `deepTaskRole` is `task_hard` and that role is not configured, the plugin
-persists `modelRoles.task_hard: "@slow"` in OMP's global configuration. This
-makes the custom role visible in OMP's model selector without choosing a vendor
-or model for you. Assign it a separate model there or in `config.yml` when you
-want independent deep TASK reasoning. Existing assignments, including project
-overrides, are preserved; subagent sessions never register the role.
+No vendor or model name is hard-coded in the routing or auditor defaults;
+roles resolve through `modelRoles`. On the first main-session start, missing
+`task_hard` (when used) is registered as `@slow`; `verification-auditor` is
+registered as `@smol`. This makes both custom roles visible in OMP's model selector
+without choosing a vendor or model. Existing assignments and project overrides
+are preserved; subagent sessions never register either role.
 
 `@task` and `@task_hard` resolving to the same model is not an error. `/jev-router
 status` reports it:
@@ -153,6 +157,10 @@ status` reports it:
 TASK_NORMAL and TASK_DEEP currently resolve to the same model.
 Tier routing is active but provides no model-cost differentiation.
 ```
+
+Likewise, `@default` and `@slow` must resolve to distinct authenticated models
+for main-model routing to change cost. Missing `@default` disables switching;
+an explicit model selection is never replaced.
 
 ## Install
 
@@ -199,8 +207,8 @@ plugin leaves your account credential exactly where you put it.
 | Command | Effect |
 | --- | --- |
 | `/jev-router setup` | Configure or remove the TypeSafe credential. |
-| `/jev-router status` | Routing state, resolved tier models, last decisions. |
-| `/jev-router test` | Live probe of both decision paths with known-answer inputs. |
+| `/jev-router status` | Routing state, resolved main/TASK roles, last decisions and model action. |
+| `/jev-router test` | Live probes of DEFAULT, SLOW, and both TASK tiers. |
 | `/jev-router stats` | Aggregated counts, latencies, distributions, worker cost. |
 | `/jev-router reset` | Clear telemetry and stored configuration. |
 
@@ -211,8 +219,11 @@ Jev Router             enabled
 Credential             configured (OMP credential store)
 
 Orchestration routing  enabled
+Main model routing     enabled
+MAIN_DEFAULT           @default → openai/gpt-5.4
+MAIN_SLOW              @slow → openai/gpt-5.4-deep
 Model                  jev-latest (default)
-Gate                   confidence ≥ 0.8, margin ≥ 0.25
+Gate                   confidence ≥ 0.6, margin ≥ 0.2
 
 TASK tier routing      enabled
 TASK_NORMAL            @task → openai/gpt-5.4
@@ -220,7 +231,7 @@ TASK_DEEP              @task_hard → anthropic/claude-opus-5
 Gate                   confidence ≥ 0.75, margin ≥ 0.2
 Tier agent             task-deep — discoverable and spawnable
 
-Last orchestration     DIRECT 0.91
+Last orchestration     SLOW 0.91 model=@slow
 Last TASK route        TASK_NORMAL 0.87
 ```
 
@@ -233,47 +244,36 @@ max(probabilities)` and `margin = p(top1) - p(top2)`:
 
 | | confidence | margin |
 | --- | --- | --- |
-| orchestration | `≥ 0.80` | `≥ 0.25` |
+| front door (3 labels) | `≥ 0.60` | `≥ 0.20` |
 | TASK tier | `≥ 0.75` | `≥ 0.20` |
 
-Measured behavior of the defaults against `jev-latest`:
+The `/jev-router test` probes observed with `jev-latest`:
 
 | request | outcome |
 | --- | --- |
-| localized fix in one file | `DIRECT` p=1.00 |
-| single well-scoped feature | `DIRECT` p=1.00 |
-| sequential extract-and-reuse refactor | `DIRECT` p=1.00 |
-| three disjoint subsystem migrations | `ORCHESTRATE` p=0.84 |
-| independent investigation across three owners | `ORCHESTRATE` p=0.88 |
-| audit-then-fix over 12 packages | `UNCERTAIN` p=0.66 |
+| rename a field and its two call sites | `DEFAULT` p=1.00 |
+| root-cause stale balances across ledger and cache | `SLOW` p=1.00 |
 
-| subtask | outcome |
-| --- | --- |
-| add a `--json` flag matching existing fields | `TASK_NORMAL` p=1.00 |
-| add four CRUD endpoints following a sibling controller | `TASK_NORMAL` p=1.00 |
-| root-cause stale balances across ledger and cache | `TASK_DEEP` p=1.00 |
-| redesign a public plugin API with compatibility trade-offs | `TASK_DEEP` p=1.00 |
+The TASK probes selected `TASK_NORMAL` for a specified CLI flag and
+`TASK_DEEP` for ledger/cache consistency reasoning.
 
-## DIRECT / ORCHESTRATE
+## DEFAULT / SLOW / ORCHESTRATE
 
-The question Jev answers is:
+Jev chooses the lowest expected total cost and risk for the primary:
 
-> Would splitting this request across independent parallel subagents materially
-> improve the outcome, compared with letting a single strong primary agent
-> execute it directly?
+- **DEFAULT** — the standard model suffices for a clear, coherent task,
+  localized fix, mechanical change, or settled follow-up.
+- **SLOW** — stronger reasoning materially reduces the chance of a wrong
+  judgment or retry in one sequential body of work: root-cause debugging,
+  ambiguous design trade-offs, concurrency, state consistency, security,
+  migration reasoning, or public API redesign.
+- **ORCHESTRATE** — independent workstreams can run in parallel with separate
+  context locality and benefit enough to pay coordination and duplicated
+  context costs.
 
-decided on `orchestration benefit > coordination cost + duplicated context cost`.
-
-**DIRECT**: one coherent code path, strong sequential dependencies, localized bug
-fix, single feature, localized refactor, or subtasks that would each re-read the
-same files.
-
-**ORCHESTRATE**: two or more genuinely independent workstreams that can run at
-the same time, each with good context locality in a different area; independent
-investigation or verification that is useful on its own.
-
-Explicitly *not* reasons to orchestrate: the work is hard; there are many files;
-subagents exist; the primary model is expensive; parallelism sounds good.
+Difficulty, file count, available subagents, and a general preference for
+parallelism do not justify ORCHESTRATE; request length alone does not justify
+SLOW.
 
 ## TASK_NORMAL / TASK_DEEP
 
@@ -297,18 +297,18 @@ worker already failed.
 
 | failure | front door | TASK tier |
 | --- | --- | --- |
-| credential missing | no automatic orchestration | `@task_hard` |
-| 401 / 403 | no automatic orchestration | `@task_hard` |
-| 429 / 5xx | no automatic orchestration | `@task_hard` |
-| timeout | no automatic orchestration | `@task_hard` |
-| network failure | no automatic orchestration | `@task_hard` |
-| malformed response | no automatic orchestration | `@task_hard` |
-| SDK exception | no automatic orchestration | `@task_hard` |
-| unknown model | no automatic orchestration | `@task_hard` |
-| gate not cleared | UNCERTAIN hint | `@task_hard` |
+| credential missing | current model; no automatic orchestration | `@task_hard` |
+| 401 / 403 | current model; no automatic orchestration | `@task_hard` |
+| 429 / 5xx | current model; no automatic orchestration | `@task_hard` |
+| timeout | current model; no automatic orchestration | `@task_hard` |
+| network failure | current model; no automatic orchestration | `@task_hard` |
+| malformed response | current model; no automatic orchestration | `@task_hard` |
+| SDK exception | current model; no automatic orchestration | `@task_hard` |
+| unknown Jev model | current model; no automatic orchestration | `@task_hard` |
+| gate not cleared | SLOW + UNCERTAIN hint | `@task_hard` |
 
-Orchestration failure degrades to exactly what OMP would have done without the
-plugin. Tier failure degrades to the strongest safe worker, because a wrong
+Front-door failure leaves the model and native orchestration behavior unchanged.
+Tier failure degrades to the strongest safe worker, because a wrong
 cheap worker costs a retry that is more expensive than one stronger run.
 
 Every decision runs under a hard `routingTimeoutMs` budget with retries
@@ -316,13 +316,12 @@ disabled: a router that retries costs more than the routing saves.
 
 ## Privacy and security
 
-Sent to Jev: the current user request (front door), or the subtask instructions
-plus the batch's shared `context` (tier router) — each clipped to
-`maxRoutingInputChars`. Never sent: the conversation, the repository tree, source
-files, task transcripts, or prior agent results.
-
-No separate scout or summarizer agent is ever spawned to help the router decide;
-when Jev cannot tell from the request alone, that is what UNCERTAIN is for.
+Sent to Jev: the current user request plus at most two previous user requests
+(oldest first, each clipped to 500 characters) for the front door, or subtask
+instructions plus the batch's shared `context` for the tier router. Current
+request and task text are clipped to `maxRoutingInputChars`. Never sent: the
+full conversation, repository tree, source files, task transcripts, or agent
+results. No scout or summarizer agent is spawned for a routing decision.
 
 Credentials never touch the repository, the project directory, the plugin source
 tree, or any log. Debug lines carry route labels and numbers only; error text is
@@ -334,7 +333,7 @@ Local aggregate counters only — no prompt text, no task text, no source, no
 transcript — in `<omp agent dir>/jev-router/telemetry.json`, cleared by
 `/jev-router reset` and disabled by `telemetryEnabled=false`:
 
-- routed user turns; DIRECT / ORCHESTRATE / UNCERTAIN counts
+- routed user turns; DEFAULT / SLOW / ORCHESTRATE / UNCERTAIN counts
 - TASK batches; TASK_NORMAL / TASK_DEEP counts; gate fallbacks
 - Jev errors and timeouts; average routing latency
 - confidence and margin distributions (10 buckets each)
@@ -362,9 +361,12 @@ omp plugin config get omp-jev-router deepTaskRole
 | --- | --- | --- |
 | `enabled` | `true` | master switch for both routers |
 | `jevModel` | `""` | TypeSafe model id; empty = `jev-latest` |
-| `orchestrationRoutingEnabled` | `true` | front-door routing |
-| `orchestrationMinConfidence` | `0.80` | `max(probabilities)` gate |
-| `orchestrationMinMargin` | `0.25` | `top1 - top2` gate |
+| `orchestrationRoutingEnabled` | `true` | enable native orchestration notices when allowed |
+| `mainModelRoutingEnabled` | `true` | route eligible main-session turns between two model roles |
+| `mainNormalRole` | `default` | baseline model role; explicit user selections win |
+| `mainDeepRole` | `slow` | temporary SLOW/UNCERTAIN model role |
+| `orchestrationMinConfidence` | `0.60` | `max(probabilities)` gate; below it use SLOW |
+| `orchestrationMinMargin` | `0.20` | `top1 - top2` gate; below it use SLOW |
 | `taskRoutingEnabled` | `true` | TASK tier routing |
 | `taskMinConfidence` | `0.75` | `max(probabilities)` gate |
 | `taskMinMargin` | `0.20` | `top1 - top2` gate |
@@ -380,9 +382,9 @@ completely untouched — OMP's bundled agent runs exactly as it always did. Set 
 to another role only if you want a second alias agent materialized.
 
 The plugin resolves the configured tier roles (`modelRoles.task` and
-`modelRoles.task_hard` by default). Its only automatic model-role write is
-registering a missing default `task_hard` as `@slow` on main-session startup;
-it never overwrites an existing assignment or registers custom role overrides.
+`modelRoles.task_hard` by default). Its automatic model-role writes register
+missing `task_hard` as `@slow` and missing `verification-auditor` as `@smol`
+on main-session startup; existing assignments, including ADVISOR, are never overwritten.
 
 To migrate an installation with an explicitly stored `deepTaskRole: slow`, run:
 
@@ -401,7 +403,7 @@ the plugin leaves this user-configurable model-role assignment intact.
 Turn on `debugLogging` and read the OMP log:
 
 ```text
-jev.orchestration route=DIRECT confidence=1.00 margin=1.00 latency=578ms
+jev.orchestration route=SLOW confidence=0.91 margin=0.82 latency=578ms model=@slow
 jev.task route=TASK_NORMAL confidence=1.00 margin=1.00 latency=288ms
 jev.task route=TASK_DEEP confidence=0.99 margin=0.98 latency=247ms
 jev.orchestration route=SKIP reason=not-main-session
@@ -411,8 +413,11 @@ jev.orchestration route=SKIP reason=not-main-session
 | --- | --- |
 | `route=SKIP reason=credential-missing` | no TypeSafe key; run `/jev-router setup` |
 | `route=SKIP reason=not-main-session` | expected — a subagent hit the front door and was rejected |
-| `route=SKIP reason=explicit-orchestrate` | you typed `orchestrate`; your choice wins |
-| `route=SKIP reason=orchestrate-keyword-disabled` | `magicKeywords.orchestrate` is off |
+| `route=SKIP reason=explicit-orchestrate` | OMP's own notice is already present; Jev still decided before dispatch and may have switched the model |
+| `model=skip:explicit-model` | a user-selected model, including `--model`, takes precedence |
+| `model=skip:default-role-unresolved` | configure `modelRoles.default` to enable model switching |
+| `model=skip:deep-role-unresolved` | configure `modelRoles.slow` or `mainDeepRole` |
+| `route=SKIP reason=orchestrate-keyword-disabled` | keyword is off and model routing is also disabled |
 | `route=SKIP reason=plan-mode` | plan mode owns the turn |
 | `route=SKIP reason=generic-task-overridden` | an agent named `task` shadows OMP's bundled worker; tier routing stands down so your definition is not replaced |
 | `route=SKIP reason=deep-alias-unspawnable` | `task-deep` is not advertised by the task tool (spawn policy or `task.disabledAgents`) |
@@ -429,13 +434,12 @@ role mapping surfaces without opening `status`.
 omp plugin uninstall omp-jev-router
 ```
 
-Removes the package, the derived `agents/task-deep.md`, and the plugin settings
-map. OMP's agent list, the `task` tool description and the command list return to
-their bundled state; verified in the test suite and by a real uninstall run. The
-`typesafe` credential in OMP's own store and
-`<omp agent dir>/jev-router/telemetry.json` are intentionally left alone — remove
-them with `/jev-router reset` (before uninstalling) and `omp token`/`/login` if
-you want them gone too.
+Removes the package, its derived `agents/task-deep.md`, the checkpoint tool,
+and the bundled auditor. OMP model-role assignments (`task_hard`,
+`verification-auditor`, `orche-advisor`) are user configuration and remain
+until removed explicitly. The `typesafe` credential and
+`<omp agent dir>/jev-router/telemetry.json` also remain; use
+`/jev-router reset` before uninstalling if those should be cleared.
 
 ## Development / test
 
@@ -470,11 +474,11 @@ and uninstall restoration.
 
 Recorded rather than worked around:
 
-- **`@oh-my-pi/pi-tui` subpaths do not resolve from an extension** in the
-  compiled binary (only the package root does, and it does not re-export
-  `containsOrchestrate`). The front door therefore detects OMP's own injected
-  notice instead of re-implementing the prose matcher — which is also why the
-  decision happens at `context`.
+- **`@oh-my-pi/pi-tui` subpaths do not resolve at runtime from an extension**
+  (only the package root does, and it does not re-export `containsOrchestrate`).
+  The decision and temporary model switch happen at `before_agent_start`;
+  `context` checks for OMP's native notice before injecting an automatic one.
+  Type-only imports of thinking-level definitions are erased at runtime.
 - **No per-invocation model override on the task wire schema.** Unknown keys are
   deleted by the schema, so the tier is expressed through a derived alias agent.
 - **`ExtensionUIDialogOptions` has no masked-input mode**, so `/jev-router setup`

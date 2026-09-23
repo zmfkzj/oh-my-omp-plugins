@@ -1,15 +1,20 @@
 {
   "name": "omp-jev-router",
   "version": "1.0.0",
-  "description": "Routes OMP orchestration activation and generic TASK model tier with TypeSafe Jev typed decisions.",
+  "description": "Routes main-session models, native orchestration, and TASK tiers with Jev; includes checkpoint reviews and independent verification.",
   "license": "UNLICENSED",
   "type": "module",
   "files": [
     "src/",
     "agents/",
+    "bin/",
+    "examples/",
     "scripts/",
     "README.md"
   ],
+  "bin": {
+    "orche-advisor": "./bin/orche-advisor.ts"
+  },
   "exports": {
     ".": "./src/index.ts"
   },
@@ -33,19 +38,34 @@
         "default": true,
         "description": "Decide per user request whether to activate OMP's native orchestrate contract."
       },
+      "mainModelRoutingEnabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Switch the main session model per user request between mainNormalRole and mainDeepRole."
+      },
+      "mainNormalRole": {
+        "type": "string",
+        "default": "default",
+        "description": "Model role the main agent normally runs on; routing engages only while the session is on this role's model."
+      },
+      "mainDeepRole": {
+        "type": "string",
+        "default": "slow",
+        "description": "Model role a SLOW or unconfident decision switches the main agent to for that turn."
+      },
       "orchestrationMinConfidence": {
         "type": "number",
-        "default": 0.8,
+        "default": 0.6,
         "min": 0,
         "max": 1,
-        "description": "max(probabilities) an orchestration decision must reach."
+        "description": "max(probabilities) a front-door decision must reach; below it the turn runs on the deep role with the uncertain hint."
       },
       "orchestrationMinMargin": {
         "type": "number",
-        "default": 0.25,
+        "default": 0.2,
         "min": 0,
         "max": 1,
-        "description": "top1 - top2 an orchestration decision must reach."
+        "description": "top1 - top2 a front-door decision must reach; below it the turn runs on the deep role with the uncertain hint."
       },
       "taskRoutingEnabled": {
         "type": "boolean",
@@ -105,12 +125,13 @@
   "scripts": {
     "gen:agents": "bun scripts/gen-deep-agent.ts",
     "check": "tsc --noEmit",
-    "lint": "oxlint src scripts test",
+    "lint": "oxlint src scripts test bin",
     "test": "bun test",
     "build": "bun run gen:agents && bun run check && bun run lint && bun test",
-    "format": "oxfmt src scripts test package.json tsconfig.json"
+    "format": "oxfmt src scripts test bin package.json tsconfig.json"
   },
   "dependencies": {
+    "@oh-my-pi/pi-ai": "18.2.6",
     "@typesafe-ai/sdk": "^0.6.0"
   },
   "devDependencies": {
@@ -118,7 +139,8 @@
     "@types/bun": "^1.4.2",
     "oxfmt": "^0.68.0",
     "oxlint": "^1.83.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "zod": "^3.25.76"
   },
   "engines": {
     "bun": ">=1.3.14"

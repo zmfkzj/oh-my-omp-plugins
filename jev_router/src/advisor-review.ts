@@ -4,7 +4,7 @@ import type { AssistantMessage, Context, StopReason, Usage } from "@oh-my-pi/pi-
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { resolveRoleSelection } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { slugifyAdvisorName } from "@oh-my-pi/pi-coding-agent/advisor/config";
-import { AUDITOR_NAME } from "./auditor.ts";
+import { AUDITOR_NAME } from "./verification-auditor.ts";
 
 export const ROLE = "orche-advisor";
 export const TOOL = "orche_advisor";

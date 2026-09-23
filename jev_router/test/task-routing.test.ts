@@ -12,7 +12,7 @@ function build(
 	tiers: Record<string, { top: TaskRoute; confidence: number; margin: number }> | Error,
 	options: { agents?: string[]; config?: Partial<JevRouterConfig>; bundled?: boolean; apiKey?: string | undefined } = {},
 ) {
-	const decider = new ScriptedDecider({ top: "DIRECT", confidence: 1, margin: 1, confident: true }, tiers);
+	const decider = new ScriptedDecider({ top: "DEFAULT", confidence: 1, margin: 1, confident: true }, tiers);
 	const { pi } = makeApi(options.agents);
 	const telemetry = new Telemetry("/tmp/jev-router-test-state");
 	telemetry.setEnabled(false);

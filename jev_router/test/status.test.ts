@@ -9,11 +9,16 @@ import type { JevRouterConfig } from "../src/config.ts";
 import { JevRouterRuntime } from "../src/runtime.ts";
 
 function makeCommandCtx(roles: Record<string, Model | undefined>): ExtensionCommandContext {
+	const resolvedRoles = {
+		"@default": fakeModel("openai", "gpt-5.4"),
+		"@slow": fakeModel("openai", "separate-slow-model"),
+		...roles,
+	};
 	return {
 		cwd: "/tmp",
 		hasUI: false,
 		sessionManager: { getSessionId: () => "s1" },
-		models: { resolve: (spec: string) => roles[spec] },
+		models: { resolve: (spec: string) => resolvedRoles[spec as keyof typeof resolvedRoles] },
 		modelRegistry: {
 			authStorage: { getApiKey: async () => undefined, hasNonEnvCredential: () => false },
 		},
@@ -29,7 +34,7 @@ function makeRuntime(options: { config?: Partial<JevRouterConfig>; bundled?: boo
 			materialized: { available: [DEEP_AGENT_NAME], failed: [], written: [] },
 		},
 		credential: async () => undefined,
-		orchestration: { lastDecision: { outcome: "DIRECT", confidence: 0.91, at: 0 } },
+		orchestration: { lastDecision: { outcome: "DEFAULT", confidence: 0.91, model: "kept", at: 0 } },
 		task: { lastDecision: { route: "TASK_NORMAL", confidence: 0.87, margin: 0.7, confident: true, at: 0 } },
 	} as unknown as JevRouterRuntime;
 }
@@ -47,8 +52,9 @@ describe("/jev-router status", () => {
 
 		expect(status).toContain("TASK_NORMAL            @task → openai/gpt-5.4");
 		expect(status).toContain("TASK_DEEP              @task_hard → anthropic/claude-opus-5");
-		expect(status).not.toContain("separate-slow-model");
-		expect(status).toContain("Last orchestration     DIRECT 0.91");
+		expect(status).toContain("MAIN_DEFAULT           @default → openai/gpt-5.4");
+		expect(status).toContain("MAIN_SLOW              @slow → openai/separate-slow-model");
+		expect(status).toContain("Last orchestration     DEFAULT 0.91 model=kept");
 		expect(status).toContain("Last TASK route        TASK_NORMAL 0.87");
 		expect(status).toContain(`${DEEP_AGENT_NAME} — discoverable and spawnable`);
 		expect(status).not.toContain("no model-cost differentiation");
@@ -64,6 +70,7 @@ describe("/jev-router status", () => {
 		expect(status).toContain("TASK_NORMAL and TASK_DEEP currently resolve to the same model.");
 		expect(status).toContain("Tier routing is active but provides no model-cost differentiation.");
 		expect(status).toContain("TASK tier routing      enabled");
+		expect(status).toContain("Main model routing     enabled");
 	});
 
 	test("an unresolvable role is called out with the fix", async () => {

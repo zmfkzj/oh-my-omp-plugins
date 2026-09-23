@@ -17,7 +17,7 @@ import {
 	requiredTierAgents,
 	type TierAgentSpec,
 } from "./deep-agent.ts";
-import { resolveRole } from "./host.ts";
+import { resolveRole, resolveRoleModel } from "./host.ts";
 import { JevEngine } from "./jev.ts";
 import { RouteLogger } from "./logging.ts";
 import { OrchestrationRouter } from "./orchestration.ts";
@@ -73,6 +73,7 @@ export class JevRouterRuntime {
 			telemetry: this.telemetry,
 			credential: () => this.apiKey(),
 			config: () => this.#config,
+			resolveRole: resolveRoleModel,
 		};
 		this.orchestration = new OrchestrationRouter(deps);
 		this.task = new TaskRouter({ ...deps, genericTaskIsBundled: () => this.#survey.genericTaskIsBundled });
@@ -130,25 +131,27 @@ export class JevRouterRuntime {
 	}
 
 	/**
-	 * Startup check that both tier roles resolve.
-	 *
-	 * An unresolvable `@task`/`@task_hard` is not fatal — OMP falls back to the
-	 * parent's model — but it silently collapses the two tiers, so it is worth
-	 * one log line. Identical resolutions are legal and only informational.
-	 * Nothing here writes `modelRoles`.
+	 * Startup check that TASK and main-model roles resolve. Missing roles are
+	 * non-fatal, but silently collapse a tier or prevent a main-model switch.
+	 * Identical resolutions are legal and only informational. No role is written.
 	 */
 	checkTierRoles(ctx: ExtensionContext): void {
 		const normal = resolveRole(ctx, this.#config.normalTaskRole);
 		const deep = resolveRole(ctx, this.#config.deepTaskRole);
-		const unresolved = [normal, deep].filter(role => !role.modelId).map(role => role.alias);
+		const mainNormal = this.#config.mainModelRoutingEnabled ? resolveRole(ctx, this.#config.mainNormalRole) : undefined;
+		const mainDeep = this.#config.mainModelRoutingEnabled ? resolveRole(ctx, this.#config.mainDeepRole) : undefined;
+		const unresolved = [normal, deep, mainNormal, mainDeep]
+			.flatMap(role => role && !role.modelId ? [role.alias] : []);
 		if (unresolved.length > 0) {
 			this.logger.warn(
-				`model role(s) ${unresolved.join(", ")} do not resolve; tier routing will fall back to the parent model. See /jev-router status.`,
+				`model role(s) ${unresolved.join(", ")} do not resolve; routing may keep the current model. See /jev-router status.`,
 			);
-			return;
 		}
-		if (normal.modelId === deep.modelId) {
+		if (normal.modelId && normal.modelId === deep.modelId) {
 			this.logger.note(`TASK_NORMAL and TASK_DEEP both resolve to ${normal.label}; tier routing adds no cost difference`);
+		}
+		if (mainNormal?.modelId && mainNormal.modelId === mainDeep?.modelId) {
+			this.logger.note(`MAIN_DEFAULT and MAIN_SLOW both resolve to ${mainNormal.label}; main-model routing adds no cost difference`);
 		}
 	}
 

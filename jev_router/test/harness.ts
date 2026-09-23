@@ -8,6 +8,7 @@
  */
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import type { Model } from "@oh-my-pi/pi-ai";
 import type {
 	EngineOptions,
@@ -15,6 +16,7 @@ import type {
 	JevDecider,
 	JevSubtask,
 	OrchestrationDecision,
+	OrchestrationRoute,
 	TaskTierBatch,
 	TaskRoute,
 } from "../src/jev.ts";
@@ -24,40 +26,64 @@ export interface FakeSessionOptions {
 	magicKeywords?: boolean;
 	orchestrateKeyword?: boolean;
 	planMode?: boolean;
+	currentModel?: Model;
+	branch?: SessionEntry[];
+	thinkingLevel?: string;
+	modelRoleProvenance?: "global" | "runtime";
 }
 
 export interface FakeSession {
 	session: AgentSession;
 	ctx: ExtensionContext;
 	sessionManager: object;
+	modelCalls: { model: Model; thinkingLevel?: string; ephemeral?: boolean }[];
+	setCurrentModel(model: Model): void;
+	setModelRoleProvenance(source: "global" | "runtime"): void;
 }
 
 /** A session object exposing only what the routers read. */
 export function makeSession(options: FakeSessionOptions = {}): FakeSession {
-	const sessionManager = { getSessionId: () => "session-1" };
+	let currentModel = options.currentModel;
+	let thinkingLevel = options.thinkingLevel ?? "medium";
+	let roleProvenance = options.modelRoleProvenance ?? "global";
+	const modelCalls: FakeSession["modelCalls"] = [];
+	const sessionManager = { getSessionId: () => "session-1", getBranch: () => options.branch ?? [] };
 	const settings = {
 		get(key: string): unknown {
 			if (key === "magicKeywords.enabled") return options.magicKeywords ?? true;
 			if (key === "magicKeywords.orchestrate") return options.orchestrateKeyword ?? true;
 			return undefined;
 		},
+		getModelRoleProvenance: (_role: string) => roleProvenance,
 	};
 	const session = {
 		sessionManager,
 		settings,
 		getEnabledToolNames: () => options.enabledTools ?? ["task", "read", "edit", "bash", "todo"],
+		get thinkingLevel() { return thinkingLevel; },
+		async setModelTemporary(model: Model, level?: string, opts?: { ephemeral?: boolean }) {
+			if (model.id === "no-auth") throw new Error("No API key for x/no-auth");
+			modelCalls.push({ model, thinkingLevel: level, ephemeral: opts?.ephemeral });
+			currentModel = model;
+			if (level) thinkingLevel = level;
+		},
 		getPlanModeState: () => ({ enabled: options.planMode ?? false }),
 	} as unknown as AgentSession;
 
 	const ctx = {
 		cwd: "/tmp/jev-router-test",
 		hasUI: false,
+		get model() { return currentModel; },
 		sessionManager,
 		models: { resolve: () => undefined, list: () => [], current: () => undefined, family: () => "x" },
 		modelRegistry: { authStorage: { getApiKey: async () => undefined, hasNonEnvCredential: () => false } },
 	} as unknown as ExtensionContext;
 
-	return { session, ctx, sessionManager };
+	return {
+		session, ctx, sessionManager, modelCalls,
+		setCurrentModel(model) { currentModel = model; },
+		setModelRoleProvenance(source) { roleProvenance = source; },
+	};
 }
 
 /** Register `session` as the process main agent, as OMP does for a real session. */
@@ -95,7 +121,7 @@ export function makeApi(taskAgents: string[] = ["scout", "reviewer", "security-r
 }
 
 export interface ScriptedOrchestration {
-	top: "DIRECT" | "ORCHESTRATE";
+	top: OrchestrationRoute;
 	confidence: number;
 	margin: number;
 	confident: boolean;
@@ -107,6 +133,7 @@ export class ScriptedDecider implements JevDecider {
 	taskCalls = 0;
 	lastSubtasks: readonly JevSubtask[] = [];
 	lastOptions: EngineOptions | undefined;
+	lastPriorRequests: readonly string[] = [];
 	#orchestrationQueue: (ScriptedOrchestration | Error)[];
 
 	constructor(
@@ -118,12 +145,14 @@ export class ScriptedDecider implements JevDecider {
 
 	async decideOrchestration(
 		_request: string,
+		priorRequests: readonly string[],
 		options: EngineOptions,
 		gates: GateThresholds,
 		_maxChars: number,
 	): Promise<OrchestrationDecision> {
 		this.orchestrationCalls++;
 		this.lastOptions = options;
+		this.lastPriorRequests = priorRequests;
 		const next =
 			this.#orchestrationQueue.length > 1 ? this.#orchestrationQueue.shift()! : this.#orchestrationQueue[0]!;
 		if (next instanceof Error) throw next;

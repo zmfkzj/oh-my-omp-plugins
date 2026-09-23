@@ -19,7 +19,8 @@ describe("telemetry aggregation", () => {
 	test("counters and distributions survive a save/load cycle", async () => {
 		const dir = await tempDir();
 		const telemetry = new Telemetry(dir);
-		telemetry.recordOrchestration("DIRECT", 0.91, 0.82, 12);
+		telemetry.recordOrchestration("DEFAULT", 0.91, 0.82, 12);
+		telemetry.recordOrchestration("SLOW", 0.88, 0.7, 14);
 		telemetry.recordOrchestration("UNCERTAIN", 0.54, 0.08, 20);
 		telemetry.recordTaskBatch(9);
 		telemetry.recordTaskDecision("TASK_DEEP", 0.6, 0.2, false);
@@ -32,7 +33,7 @@ describe("telemetry aggregation", () => {
 		await reloaded.load();
 		const snapshot = reloaded.snapshot();
 
-		expect(snapshot.orchestration).toMatchObject({ requests: 2, DIRECT: 1, UNCERTAIN: 1, latencySumMs: 32 });
+		expect(snapshot.orchestration).toMatchObject({ requests: 3, DEFAULT: 1, SLOW: 1, UNCERTAIN: 1, latencySumMs: 46 });
 		expect(snapshot.orchestration.confidence[9]).toBe(1);
 		expect(snapshot.orchestration.confidence[5]).toBe(1);
 		expect(snapshot.task).toMatchObject({ batches: 1, TASK_DEEP: 1, fallbackDeep: 1, errors: 1, timeouts: 1 });
@@ -57,7 +58,7 @@ describe("telemetry aggregation", () => {
 	test("reset clears memory and removes the file", async () => {
 		const dir = await tempDir();
 		const telemetry = new Telemetry(dir);
-		telemetry.recordOrchestration("DIRECT", 0.9, 0.8, 1);
+		telemetry.recordOrchestration("DEFAULT", 0.9, 0.8, 1);
 		await telemetry.flush();
 
 		await telemetry.reset();
@@ -70,7 +71,7 @@ describe("telemetry aggregation", () => {
 		expect(reviveSnapshot("not an object").orchestration.requests).toBe(0);
 		expect(reviveSnapshot({ orchestration: { requests: "x", DIRECT: 3 } }).orchestration).toMatchObject({
 			requests: 0,
-			DIRECT: 3,
+			DEFAULT: 0,
 		});
 	});
 
@@ -85,7 +86,7 @@ describe("telemetry aggregation", () => {
 		const dir = await tempDir();
 		const telemetry = new Telemetry(dir);
 		telemetry.setEnabled(false);
-		telemetry.recordOrchestration("DIRECT", 0.9, 0.8, 1);
+		telemetry.recordOrchestration("DEFAULT", 0.9, 0.8, 1);
 		await telemetry.flush();
 
 		expect(telemetry.snapshot().orchestration.requests).toBe(0);
@@ -113,10 +114,10 @@ describe("telemetry aggregation", () => {
 		const dir = await tempDir();
 		const telemetry = new Telemetry(dir);
 		await telemetry.load();
-		telemetry.recordOrchestration("DIRECT", 0.9, 0.8, 1);
+		telemetry.recordOrchestration("DEFAULT", 0.9, 0.8, 1);
 		await telemetry.load();
 
-		expect(telemetry.snapshot().orchestration.DIRECT).toBe(1);
+		expect(telemetry.snapshot().orchestration.DEFAULT).toBe(1);
 	});
 });
 

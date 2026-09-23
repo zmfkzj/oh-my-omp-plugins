@@ -51,9 +51,9 @@ export interface WorkerUsageSample {
 }
 
 export interface TelemetrySnapshot {
-	version: 1;
+	version: 2;
 	updatedAt: number;
-	orchestration: RouteCounters & { DIRECT: number; ORCHESTRATE: number; UNCERTAIN: number };
+	orchestration: RouteCounters & { DEFAULT: number; SLOW: number; ORCHESTRATE: number; UNCERTAIN: number };
 	task: RouteCounters & { batches: number; TASK_NORMAL: number; TASK_DEEP: number; fallbackDeep: number };
 	workers: Record<string, WorkerCounters>;
 }
@@ -76,9 +76,9 @@ export function emptyWorkerCounters(): WorkerCounters {
 
 export function emptySnapshot(): TelemetrySnapshot {
 	return {
-		version: 1,
+		version: 2,
 		updatedAt: 0,
-		orchestration: { ...emptyRouteCounters(), DIRECT: 0, ORCHESTRATE: 0, UNCERTAIN: 0 },
+		orchestration: { ...emptyRouteCounters(), DEFAULT: 0, SLOW: 0, ORCHESTRATE: 0, UNCERTAIN: 0 },
 		task: { ...emptyRouteCounters(), batches: 0, TASK_NORMAL: 0, TASK_DEEP: 0, fallbackDeep: 0 },
 		workers: {},
 	};
@@ -213,7 +213,7 @@ export class Telemetry {
 		this.#timer.unref?.();
 	}
 
-	recordOrchestration(route: "DIRECT" | "ORCHESTRATE" | "UNCERTAIN", confidence: number, margin: number, latencyMs: number): void {
+	recordOrchestration(route: "DEFAULT" | "SLOW" | "ORCHESTRATE" | "UNCERTAIN", confidence: number, margin: number, latencyMs: number): void {
 		if (!this.#enabled) return;
 		const bucket = this.#snapshot.orchestration;
 		bucket.requests++;

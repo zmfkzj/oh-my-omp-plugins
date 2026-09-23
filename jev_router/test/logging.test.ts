@@ -27,9 +27,9 @@ describe("secret redaction", () => {
 		const logger = new RouteLogger(pi.logger);
 		logger.setEnabled(true);
 
-		logger.route("jev.orchestration", { route: "DIRECT", confidence: 0.912, margin: 0.824, latencyMs: 12.4 });
+		logger.route("jev.orchestration", { route: "SLOW", confidence: 0.912, margin: 0.824, latencyMs: 12.4, model: "@slow", reason: "probe" });
 
-		expect(logs).toEqual(["debug jev.orchestration route=DIRECT confidence=0.91 margin=0.82 latency=12ms"]);
+		expect(logs).toEqual(["debug jev.orchestration route=SLOW confidence=0.91 margin=0.82 latency=12ms model=@slow reason=probe"]);
 	});
 
 	test("debug lines are suppressed entirely when debug logging is off", () => {

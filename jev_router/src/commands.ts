@@ -31,6 +31,8 @@ function row(label: string, value: string): string {
 /** Fixed probes for `/jev-router test`; they exercise both routers end to end. */
 const TEST_REQUEST =
 	"Rename the `retryCount` field to `attempts` in the HTTP client and update its two call sites.";
+const TEST_DEEP_REQUEST =
+	"Users intermittently see stale balances after a concurrent transfer. Find the root cause across the ledger and cache layers and decide how to make reads consistent.";
 const TEST_SUBTASKS = [
 	{ id: "t0", instruction: "Add a `--json` flag to the existing `status` CLI command that prints the same fields as JSON." },
 	{
@@ -56,6 +58,8 @@ export async function renderStatus(
 	const credential = await runtime.credential();
 	const normal = resolveRole(ctx, config.normalTaskRole);
 	const deep = resolveRole(ctx, config.deepTaskRole);
+	const mainNormal = resolveRole(ctx, config.mainNormalRole);
+	const mainDeep = resolveRole(ctx, config.mainDeepRole);
 	const survey = runtime.survey;
 	// Spawnability, not mere existence: this is what the router actually gates on.
 	const spawnable = spawnableTaskAgents(pi);
@@ -71,6 +75,9 @@ export async function renderStatus(
 		row("Credential", formatCredential(runtime, hasStoredCredential(ctx), credential?.source)),
 		"",
 		row("Orchestration routing", config.orchestrationRoutingEnabled ? "enabled" : "disabled"),
+		row("Main model routing", config.mainModelRoutingEnabled ? "enabled" : "disabled"),
+		row("MAIN_DEFAULT", `${mainNormal.alias} → ${mainNormal.label}`),
+		row("MAIN_SLOW", `${mainDeep.alias} → ${mainDeep.label}`),
 		row("Model", config.jevModel || "jev-latest (default)"),
 		row("Gate", `confidence ≥ ${config.orchestrationMinConfidence}, margin ≥ ${config.orchestrationMinMargin}`),
 		"",
@@ -91,7 +98,7 @@ export async function renderStatus(
 		row(
 			"Last orchestration",
 			orchestration
-				? `${orchestration.outcome}${orchestration.confidence === undefined ? "" : ` ${orchestration.confidence.toFixed(2)}`}`
+				? `${orchestration.outcome}${orchestration.confidence === undefined ? "" : ` ${orchestration.confidence.toFixed(2)}`}${orchestration.model ? ` model=${orchestration.model}` : ""}`
 				: "none this session",
 		),
 		row("Last TASK route", task ? `${task.route} ${task.confidence.toFixed(2)}` : "none this session"),
@@ -104,10 +111,18 @@ export async function renderStatus(
 			"Tier routing is active but provides no model-cost differentiation.",
 		);
 	}
-	if (!normal.modelId || !deep.modelId) {
+	if (config.mainModelRoutingEnabled && mainNormal.modelId && mainNormal.modelId === mainDeep.modelId) {
 		lines.push(
 			"",
-			`Unresolved role(s): ${[normal, deep].filter(role => !role.modelId).map(role => role.alias).join(", ")}.`,
+			"MAIN_DEFAULT and MAIN_SLOW currently resolve to the same model. Main-model routing is active but provides no model-cost differentiation.",
+		);
+	}
+	const unresolved = [normal, deep, ...(config.mainModelRoutingEnabled ? [mainNormal, mainDeep] : [])]
+		.filter(role => !role.modelId).map(role => role.alias);
+	if (unresolved.length > 0) {
+		lines.push(
+			"",
+			`Unresolved role(s): ${unresolved.join(", ")}.`,
 			"Set them with `omp config set modelRoles.<role> <provider/model>` or the /model Roles view.",
 		);
 	}
@@ -133,7 +148,8 @@ export function renderStats(runtime: JevRouterRuntime): string {
 
 	const lines = [
 		row("Routed user turns", String(orchestration.requests)),
-		row("  DIRECT", String(orchestration.DIRECT)),
+		row("  DEFAULT", String(orchestration.DEFAULT)),
+		row("  SLOW", String(orchestration.SLOW)),
 		row("  ORCHESTRATE", String(orchestration.ORCHESTRATE)),
 		row("  UNCERTAIN", String(orchestration.UNCERTAIN)),
 		row("  errors / timeouts", `${orchestration.errors} / ${orchestration.timeouts}`),
@@ -235,22 +251,28 @@ async function runTest(runtime: JevRouterRuntime): Promise<string> {
 	const options = { apiKey, model: config.jevModel, timeoutMs: Math.max(config.routingTimeoutMs, 10_000) };
 	const lines: string[] = [row("Jev model", runtime.engine.modelFor(options))];
 
-	try {
-		const decision = await runtime.engine.decideOrchestration(
-			TEST_REQUEST,
-			options,
-			{ minConfidence: config.orchestrationMinConfidence, minMargin: config.orchestrationMinMargin },
-			config.maxRoutingInputChars,
-		);
-		lines.push(
-			row(
-				"Orchestration probe",
-				`${decision.confident ? decision.top : "UNCERTAIN"} confidence=${decision.confidence.toFixed(2)} margin=${decision.margin.toFixed(2)} ${Math.round(decision.latencyMs)}ms`,
-			),
-			row("  (expected)", "DIRECT — a localized two-call-site rename"),
-		);
-	} catch (error) {
-		lines.push(row("Orchestration probe", `failed: ${runtime.logger.describeError(error)}`));
+	for (const [index, request, expected] of [
+		[1, TEST_REQUEST, "DEFAULT — a localized two-call-site rename"],
+		[2, TEST_DEEP_REQUEST, "SLOW — root-cause plus consistency reasoning, one sequential body of work"],
+	] as const) {
+		try {
+			const decision = await runtime.engine.decideOrchestration(
+				request,
+				[],
+				options,
+				{ minConfidence: config.orchestrationMinConfidence, minMargin: config.orchestrationMinMargin },
+				config.maxRoutingInputChars,
+			);
+			lines.push(
+				row(
+					`Front-door probe ${index}/2`,
+					`${decision.confident ? decision.top : "UNCERTAIN"} confidence=${decision.confidence.toFixed(2)} margin=${decision.margin.toFixed(2)} ${Math.round(decision.latencyMs)}ms`,
+				),
+				row("  (expected)", expected),
+			);
+		} catch (error) {
+			lines.push(row(`Front-door probe ${index}/2`, `failed: ${runtime.logger.describeError(error)}`));
+		}
 	}
 
 	try {

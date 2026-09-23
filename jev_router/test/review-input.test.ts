@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import example from "../examples/initial-plan.json";
-import { AUDITOR_NAME } from "../src/auditor.ts";
-import { prepareFindings, prepareReviewInput, SNAPSHOT_KEYS } from "../src/review.ts";
+import { AUDITOR_NAME } from "../src/verification-auditor.ts";
+import { prepareFindings, prepareReviewInput, SNAPSHOT_KEYS } from "../src/advisor-review.ts";
 
 describe("orchestration snapshot boundary", () => {
   test("rejects conversation and repository fields rather than sending hidden context", () => {

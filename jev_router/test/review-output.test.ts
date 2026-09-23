@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { Effort, type AssistantMessage, type Usage } from "@oh-my-pi/pi-ai";
+import type { Effort, AssistantMessage, Usage } from "@oh-my-pi/pi-ai";
 import example from "../examples/initial-plan.json";
-import { AUDITOR_NAME } from "../src/auditor.ts";
+import { AUDITOR_NAME } from "../src/verification-auditor.ts";
 import {
   prepareReviewInput,
   runReview,
@@ -9,7 +9,7 @@ import {
   type ReviewFailureKind,
   type ReviewResult,
   type ReviewSelection,
-} from "../src/review.ts";
+} from "../src/advisor-review.ts";
 
 const structuredReview = `VERDICT: KEEP
 The independent slices are appropriately bounded.
@@ -30,7 +30,7 @@ const selection: ReviewSelection = {
     provider: "review-test-provider",
     api: "openai-responses",
   } as ReviewSelection["model"],
-  thinkingLevel: Effort.High,
+  thinkingLevel: "high" as Effort,
 };
 
 type Completion = NonNullable<Parameters<typeof runReview>[4]>;

@@ -1,29 +1,18 @@
-// OMP 18.1.20 SDK extension; deliberately separate from the passive WATCHDOG roster.
-// Model: config.yml -> modelRoles.orche-advisor (independent of default/slow/advisor).
-// Install as an OMP package extension. Only DEFAULT's explicit tool call spends tokens.
-// Each review request is recorded as a `model_usage` entry on the primary branch, so session totals
-// and `omp stats` attribute it to the reviewer model/role rather than to the calling model; the native
-// /advisor status panel does not track it. Usage is also returned in tool-result details.usage.
-// Disable with disabledExtensions: ["extension-module:orche-advisor"], preserving other entries.
-// Checkpoint relevance is a prompt policy; tool-less execution, input limits, primary-only
-// access, same-branch snapshot reuse, and overlapping-request rejection are runtime checks.
-// Verification findings are lifted from the branch by this extension, never transcribed by DEFAULT:
-// a self-reported audit finding can be softened on the way in, which is the gap they exist to close.
-// The plugin ships its own `Verification Auditor` advisor and installs it into the live WATCHDOG
-// roster, so the findings channel works without the user hand-writing a WATCHDOG.yml. It runs only
-// while `advisor.enabled` is on, and a same-named roster entry overrides it instead of duplicating it.
+// Bundled checkpoint reviewer and independent Verification Auditor for Jev Router.
+// A review is requested explicitly by DEFAULT; the auditor runs in OMP's passive
+// WATCHDOG roster when enabled. The two use distinct configurable model roles.
 
-import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import {
   discoverAdvisorConfigs,
   slugifyAdvisorName,
 } from "@oh-my-pi/pi-coding-agent/advisor/config";
 import type { AdvisorMessageDetails } from "@oh-my-pi/pi-coding-agent/advisor/advise-tool";
 import { resolveRoleSelection } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
-import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { mainSessionOf } from "./host.ts";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
-import { AUDITOR_NAME, VERIFICATION_AUDITOR } from "./src/auditor.ts";
+import { AUDITOR_NAME, VERIFICATION_AUDITOR } from "./verification-auditor.ts";
 import {
   CHECKPOINTS,
   ROLE,
@@ -32,7 +21,7 @@ import {
   AUDITOR_SLUG,
   prepareReviewInput,
   runReview,
-} from "./src/review.ts";
+} from "./advisor-review.ts";
 
 const DEFAULT_GUIDANCE = `Orche-Advisor reviews orchestration, not code; it is not a worker or second orchestrator.
 You retain planning, delegation, implementation integration, verification, and termination responsibility.
@@ -65,10 +54,7 @@ Orche-Advisor integration for this orchestrate request. These checkpoints are RE
    If the tool fails, report the failure rather than claiming review succeeded; do not loop on retries.
 </system-notice>`;
 
-function primarySession(ctx: ExtensionContext) {
-  const primary = AgentRegistry.global().get(MAIN_AGENT_ID)?.session;
-  return primary?.sessionManager === ctx.sessionManager ? primary : undefined;
-}
+const primarySession = mainSessionOf;
 
 /**
  * Add the bundled auditor to the live advisor roster unless the user declares their own.
@@ -93,6 +79,8 @@ async function installVerificationAuditor(primary: AgentSession): Promise<void> 
   );
   if (discovered.advisors.some((advisor) => slugifyAdvisorName(advisor.name) === AUDITOR_SLUG))
     return;
+  // Applying a non-empty roster is what removes OMP's synthesized default advisor
+  // (`session-advisors.ts:855-856`); a user who wants a general advisor declares one in `WATCHDOG.yml`.
   primary.applyAdvisorConfigs(
     [...discovered.advisors, VERIFICATION_AUDITOR],
     discovered.sharedInstructions,
@@ -131,7 +119,7 @@ export function findingsSinceLastReview(branch: readonly SessionEntry[]): Verifi
   return collected;
 }
 
-export default function orcheAdvisor(pi: ExtensionAPI) {
+export function registerOrcheAdvisor(pi: ExtensionAPI): void {
   const z = pi.zod;
   const field = z.string().min(1).max(2000);
   let inFlight = false;

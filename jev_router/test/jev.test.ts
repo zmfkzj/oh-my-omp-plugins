@@ -3,16 +3,14 @@ import { clip, gate } from "../src/jev.ts";
 
 describe("confidence gate", () => {
 	test("accepts a decision only when confidence and margin both clear", () => {
-		// Spec example: DIRECT 0.91 / ORCHESTRATE 0.09.
-		const clear = gate({ DIRECT: 0.91, ORCHESTRATE: 0.09 }, "DIRECT", 0.8, 0.25);
-		expect(clear).toMatchObject({ top: "DIRECT", confident: true });
-		expect(clear.confidence).toBeCloseTo(0.91, 5);
-		expect(clear.margin).toBeCloseTo(0.82, 5);
+		const clear = gate({ DEFAULT: 0.7, SLOW: 0.2, ORCHESTRATE: 0.1 }, "DEFAULT", 0.6, 0.2);
+		expect(clear).toMatchObject({ top: "DEFAULT", confident: true });
+		expect(clear.confidence).toBeCloseTo(0.7, 5);
+		expect(clear.margin).toBeCloseTo(0.5, 5);
 
-		// Spec example: 0.54 / 0.46 is UNCERTAIN.
-		const split = gate({ DIRECT: 0.54, ORCHESTRATE: 0.46 }, "DIRECT", 0.8, 0.25);
-		expect(split).toMatchObject({ top: "DIRECT", confident: false });
-		expect(split.margin).toBeCloseTo(0.08, 5);
+		const split = gate({ DEFAULT: 0.45, SLOW: 0.4, ORCHESTRATE: 0.15 }, "DEFAULT", 0.6, 0.2);
+		expect(split).toMatchObject({ top: "DEFAULT", confident: false });
+		expect(split.margin).toBeCloseTo(0.05, 5);
 	});
 
 	test("a high top probability still fails when the runner-up is close", () => {

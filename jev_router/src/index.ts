@@ -1,8 +1,8 @@
 /**
  * omp-jev-router — two bounded routing decisions for OMP.
  *
- *   1. Front door: should OMP's *native* orchestration contract be activated
- *      for this user request, or should the primary agent just run it?
+ *   1. Front door: DEFAULT, SLOW, or OMP's native ORCHESTRATE contract
+ *      for this user request.
  *   2. Tier: once OMP has chosen its generic `task` worker, should that spawn
  *      resolve through `@task` or through `@task_hard`?
  *
@@ -10,6 +10,8 @@
  * user choice are left exactly as they are.
  */
 import path from "node:path";
+import { registerOrcheAdvisor } from "./orche-advisor.ts";
+import { AUDITOR_ROLE } from "./verification-auditor.ts";
 import { registerCommands } from "./commands.ts";
 import { TYPESAFE_PROVIDER } from "./credentials.ts";
 import { mainSessionOf, sessionOf } from "./host.ts";
@@ -27,40 +29,45 @@ export function registerJevRouter(pi: ExtensionAPI, packageRoot: string): JevRou
 	pi.on("session_start", async (_event, ctx) => {
 		runtime.bindContext(ctx);
 		await runtime.reloadConfig(ctx.cwd);
-		// Register the default custom role once, without changing user assignments.
+		// Register missing custom roles without changing user assignments.
 		// Child sessions inherit settings and must not write global configuration.
 		const settings = mainSessionOf(ctx)?.settings;
-		if (settings && runtime.config.deepTaskRole === "task_hard" && settings.getModelRole("task_hard") === undefined) {
-			settings.setModelRole("task_hard", "@slow");
-			await settings.flush();
+		if (settings) {
+			let changed = false;
+			if (runtime.config.deepTaskRole === "task_hard" && settings.getModelRole("task_hard") === undefined) {
+				settings.setModelRole("task_hard", "@slow");
+				changed = true;
+			}
+			if (settings.getModelRole(AUDITOR_ROLE) === undefined) {
+				settings.setModelRole(AUDITOR_ROLE, "@smol");
+				changed = true;
+			}
+			if (changed) await settings.flush();
 		}
 		await runtime.telemetry.load();
 		// Materialize + verify the tier aliases before the first `task` call.
 		await runtime.surveyAgents(ctx.cwd, sessionOf(ctx)?.settings);
 		runtime.checkTierRoles(ctx);
 	});
+	registerOrcheAdvisor(pi);
 
-	// Front door, phase 1: scope the turn. No network work here, so OMP's
-	// policy-preparation retries cost nothing. Main-session-only guards live in
-	// the router; a subagent that reaches this handler is rejected there, so
-	// orchestration can never nest.
-	pi.on("before_agent_start", (event, ctx) => {
+	// One Jev call per prompt, memoized across policy-preparation retries.
+	// The model must be set here: agent-loop.ts captures it before `context`.
+	pi.on("before_agent_start", async (event, ctx) => {
 		runtime.bindContext(ctx);
-		runtime.orchestration.beginTurn(ctx, event.prompt);
+		await runtime.orchestration.beginTurn(ctx, event.prompt);
 	});
 
-	// Front door, phase 2: decide once against the messages actually going out,
-	// and attach OMP's own orchestrate notice for this turn only.
+	// Attach the decided notice for this turn, without persisting it.
 	pi.on("context", async (event, ctx) => {
 		runtime.bindContext(ctx);
 		const messages = await runtime.orchestration.applyToContext(ctx, event.messages);
 		return messages ? { messages } : undefined;
 	});
 
-	// A settled agent loop ends the turn scope: the next request routes fresh,
-	// with no carry-over from an automatically orchestrated previous turn.
-	pi.on("agent_end", event => {
-		if (event.willContinue !== true) runtime.orchestration.endTurn();
+	// A settled turn restores the model unless another actor changed it.
+	pi.on("agent_end", async (event, ctx) => {
+		if (event.willContinue !== true) await runtime.orchestration.endTurn(ctx.model);
 	});
 
 	pi.on("tool_call", async (event, ctx) => {

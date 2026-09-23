@@ -2,20 +2,22 @@
  * The Jev decision engine.
  *
  * Two bounded decisions, nothing else:
- *   - orchestration: DIRECT vs ORCHESTRATE for one user request;
+ *   - front door: DEFAULT vs SLOW vs ORCHESTRATE for one user request;
  *   - task tier: TASK_NORMAL vs TASK_DEEP for each generic `task` spawn.
  *
  * Both are TypeSafe `choice` questions over a minimal state. A `task.batch`
  * call is one request carrying one question per item, so a fan-out of six
- * subagents still costs a single Jev call. Nothing about the repository, the
- * conversation, or prior agent output is sent: the state is the request text
- * (or the subtask instructions) truncated to `maxRoutingInputChars`.
+ * subagents still costs a single Jev call. The front door sends the request and
+ * up to two clipped prior user requests to interpret short follow-ups; task
+ * routing sends only the subtask instructions and optional shared context.
  */
 import { TypeSafeClient } from "@typesafe-ai/sdk";
 import type { ChoiceQuestion, Questions, SystemOneResult } from "@typesafe-ai/sdk";
 
-export type OrchestrationRoute = "DIRECT" | "ORCHESTRATE";
+export type OrchestrationRoute = "DEFAULT" | "SLOW" | "ORCHESTRATE";
 export type TaskRoute = "TASK_NORMAL" | "TASK_DEEP";
+export const PRIOR_REQUEST_COUNT = 2;
+export const PRIOR_REQUEST_CHARS = 500;
 
 export interface GateOutcome<Label extends string> {
 	/** Highest-probability label, regardless of whether the gate accepted it. */
@@ -54,16 +56,13 @@ export interface EngineOptions {
 }
 
 const ORCHESTRATION_INSTRUCTIONS =
-	"A user has sent this request to a single, very capable primary coding agent that can read, edit, run commands, and optionally delegate to subagents. " +
-	"Would splitting this request across independent parallel subagents materially improve the outcome, compared with letting the primary agent execute it directly? " +
-	"Decide on expected total cost: orchestration only wins when its benefit exceeds the coordination cost plus the cost of duplicating context into every subagent. " +
-	"Difficulty alone, file count alone, subagent availability alone, primary-model price alone, and a general preference for parallelism are NOT reasons to orchestrate.";
+	"A user has sent `request` to a single, very capable primary coding agent that can read, edit, run commands, and optionally delegate to subagents. `prior_requests`, when present, are the user's previous requests in this session, oldest first; use them only to interpret a short follow-up such as 'do that' or 'continue'. Choose how the primary should handle this request. DEFAULT: execute directly on the standard model. SLOW: execute directly on a markedly stronger, slower, more expensive reasoning model. ORCHESTRATE: split the work across independent parallel subagents. Decide on expected total cost and risk: SLOW only wins when stronger reasoning materially reduces the chance of a wrong call, rework, or repeated attempts; ORCHESTRATE only wins when its benefit exceeds the coordination cost plus the cost of duplicating context into every subagent. Difficulty alone, file count alone, subagent availability alone, and a general preference for parallelism are NOT reasons to orchestrate; length alone is NOT a reason for SLOW.";
 
 const ORCHESTRATION_CRITERIA = {
-	DIRECT:
-		"One coherent code path, strong sequential dependencies, or work where a single agent keeping context end to end is cheaper. " +
-		"Localized bug fix, single feature, localized refactor, or subtasks that would each have to re-read the same files and context. " +
-		"The primary agent's trajectory is shorter if it simply does the work.",
+	DEFAULT:
+		"A capable standard model suffices: one coherent code path, clear specification, localized bug fix, single feature, localized refactor, mechanical migration, clear CRUD, well-defined TODO, a question with a direct answer, or a short follow-up continuing already-settled work.",
+	SLOW:
+		"Stronger reasoning materially lowers the risk of a wrong call on one sequential body of work: root-cause debugging, architecture or design decisions, ambiguous requirements, trade-offs between plausible solutions, cross-module semantic reasoning, concurrency or race conditions, security-sensitive change, state consistency, data-migration reasoning, public API redesign, or a retry of work that already failed.",
 	ORCHESTRATE:
 		"Two or more genuinely independent workstreams that can run at the same time, each with good context locality in a different subsystem, area, or file set. " +
 		"Independent investigation or verification that is actually useful on its own. " +
@@ -134,6 +133,7 @@ export interface GateThresholds {
 export interface JevDecider {
 	decideOrchestration(
 		request: string,
+		priorRequests: readonly string[],
 		options: EngineOptions,
 		gates: GateThresholds,
 		maxChars: number,
@@ -181,6 +181,7 @@ export class JevEngine implements JevDecider {
 
 	async decideOrchestration(
 		request: string,
+		priorRequests: readonly string[],
 		options: EngineOptions,
 		gates: { minConfidence: number; minMargin: number },
 		maxChars: number,
@@ -190,12 +191,20 @@ export class JevEngine implements JevDecider {
 			route: choiceQuestion(ORCHESTRATION_INSTRUCTIONS, { ...ORCHESTRATION_CRITERIA }),
 		} satisfies Questions;
 		const response = (await this.#clientFor(options).systemOne(
-			{ state: { request: clip(request, maxChars) }, questions },
+			{
+				state: {
+					request: clip(request, maxChars),
+					...(priorRequests.length > 0
+						? { prior_requests: priorRequests.map(text => clip(text, PRIOR_REQUEST_CHARS)) }
+						: {}),
+				},
+				questions,
+			},
 			{ signal: AbortSignal.timeout(options.timeoutMs) },
 		)) as SystemOneResult<typeof questions>;
 		const outcome = gate<OrchestrationRoute>(
 			response.answers.route.probabilities,
-			"DIRECT",
+			"DEFAULT",
 			gates.minConfidence,
 			gates.minMargin,
 		);

@@ -6,6 +6,8 @@ import type { AdvisorConfig } from "@oh-my-pi/pi-tui/overlays/advisor-config";
  */
 export const AUDITOR_NAME = "Verification Auditor";
 
+export const AUDITOR_ROLE = "verification-auditor";
+
 /**
  * The advisor that produces the evidence `orche_advisor` forwards.
  *
@@ -13,14 +15,13 @@ export const AUDITOR_NAME = "Verification Auditor";
  * the findings channel is worthless without a tool-backed auditor on the other end, and a
  * review that silently degrades to rubber-stamping self-reports is worse than no review.
  *
- * `model` pins the `smol` role alias so the auditor always runs on the small, cheap model
- * regardless of `modelRoles.advisor` — verification is a high-frequency, low-context task
- * that does not need the primary's reasoning tier. A same-named `WATCHDOG.yml` entry still
- * overrides this, so a user can repoint it (e.g. `@slow`) without code changes.
+ * The dedicated `verification-auditor` model role defaults to `@smol`, independently
+ * of OMP's ADVISOR role. An explicit model-role selection or a same-named
+ * `WATCHDOG.yml` entry may override it without changing other advisors.
  */
 export const VERIFICATION_AUDITOR: AdvisorConfig = {
   name: AUDITOR_NAME,
-  model: "@smol",
+  model: `@${AUDITOR_ROLE}`,
   tools: ["read", "grep", "glob"],
   instructions: `Act as Verification Auditor. Own the gap between what the primary claims
 and what the evidence shows. Do not review code quality or design.
