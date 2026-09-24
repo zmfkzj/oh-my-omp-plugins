@@ -329,22 +329,40 @@ scrubbed of any tracked credential and of key-shaped tokens before it is written
 
 ## Telemetry
 
-Local aggregate counters only — no prompt text, no task text, no source, no
-transcript — in `<omp agent dir>/jev-router/telemetry.json`, cleared by
-`/jev-router reset` and disabled by `telemetryEnabled=false`:
+Local data only — no prompt text, no task text, no source, no transcript — under
+`<omp agent dir>/jev-router/`, deleted by `/jev-router reset` and disabled by
+`telemetryEnabled=false`.
+
+`telemetry.json` holds aggregate counters:
 
 - routed user turns; DEFAULT / SLOW / ORCHESTRATE / UNCERTAIN counts
 - TASK batches; TASK_NORMAL / TASK_DEEP counts; gate fallbacks
 - Jev errors and timeouts; average routing latency
-- confidence and margin distributions (10 buckets each)
-- per-tier-agent spawns, results, tokens, cost and **cost per completed task**
+- confidence and margin distributions (10 buckets each, one entry per decision)
+- per-tier-agent spawns, settled and completed spawns, tokens, cost and
+  **cost per completed task**
+
+`decisions.jsonl` has one line per Jev decision: `kind`, applied `route`, the
+pre-gate `top` label, per-label `probabilities`, `confidence`, `margin`,
+`confident`, latency, and the main-model action or TASK batch size (errors log
+only `route: "ERROR"` and `timedOut`). For decisions that carry probabilities,
+the pre-gate label and distribution let a different confidence/margin gate be
+replayed exactly offline — the buckets cannot resolve a threshold inside a
+bucket. Errors and missing answers carry no distribution. The log records what
+was routed, not whether the route was right.
 
 Worker usage is attributed by agent name, which is exactly the tier the router
-selected. OMP reports a spawn's usage in the `task` tool result, so totals cover
-every spawn whose result the parent session observed; background spawns that
-settle after the session exits are not counted.
+selected. It is read from OMP's `task:subagent:progress` and
+`task:subagent:lifecycle` frames on the session event bus, which fire for sync
+and background (`async.enabled`) spawns alike; the `task` tool result of a
+background spawn carries no usage. Each spawn is counted once when it settles.
 `ctx.sessionManager.getUsageStatistics()` is a single session-wide total with no
 per-role breakdown, so it cannot substitute.
+
+Snapshots are versioned. Older snapshots are migrated on load — v1 `DIRECT`
+counts appear as `DIRECT (v1, migrated)` in `stats`, v2 split token fields are
+folded into `tokens` — and a snapshot written by a newer plugin is moved to
+`telemetry.v<N>.json` instead of being overwritten.
 
 ## Configuration
 
@@ -438,7 +456,7 @@ Removes the package, its derived `agents/task-deep.md`, the checkpoint tool,
 and the bundled auditor. OMP model-role assignments (`task_hard`,
 `verification-auditor`, `orche-advisor`) are user configuration and remain
 until removed explicitly. The `typesafe` credential and
-`<omp agent dir>/jev-router/telemetry.json` also remain; use
+`<omp agent dir>/jev-router/` telemetry files also remain; use
 `/jev-router reset` before uninstalling if those should be cleared.
 
 ## Development / test
@@ -488,5 +506,5 @@ Recorded rather than worked around:
   frontmatter equivalent, so an override configured for `task` does not follow a
   spawn routed to `task-deep`. Add a `task-deep` entry if you use per-agent
   service tiers.
-- **Background spawn usage** is only counted when its result reaches the parent
-  session; a job that settles after the session exits is not in `stats`.
+- **Spawns that settle after the process exits** are not in `stats`: usage is
+  read from in-process subagent frames.

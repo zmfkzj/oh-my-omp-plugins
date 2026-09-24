@@ -148,6 +148,7 @@ export function renderStats(runtime: JevRouterRuntime): string {
 
 	const lines = [
 		row("Routed user turns", String(orchestration.requests)),
+		...(orchestration.legacyDirect > 0 ? [row("  DIRECT (v1, migrated)", String(orchestration.legacyDirect))] : []),
 		row("  DEFAULT", String(orchestration.DEFAULT)),
 		row("  SLOW", String(orchestration.SLOW)),
 		row("  ORCHESTRATE", String(orchestration.ORCHESTRATE)),
@@ -171,22 +172,21 @@ export function renderStats(runtime: JevRouterRuntime): string {
 	if (workers.length > 0) {
 		lines.push(
 			"",
-			"Worker cost by tier agent (spawns whose result this session observed)",
-			row("  agent", "spawns / results / tokens / cost / cost-per-result"),
+			"Worker cost by tier agent (settled spawns observed in this process)",
+			row("  agent", "spawns / settled / completed / tokens / cost / cost-per-completed"),
 		);
 		for (const [agent, counters] of workers) {
-			const tokens = counters.input + counters.output + counters.cacheRead + counters.cacheWrite;
 			// The North Star metric: spend per successfully completed delegated task.
-			const perResult = counters.results === 0 ? "—" : `$${(counters.costUsd / counters.results).toFixed(4)}`;
+			const perCompleted = counters.completed === 0 ? "—" : `$${(counters.costUsd / counters.completed).toFixed(4)}`;
 			lines.push(
 				row(
 					`  ${agent}`,
-					`${counters.spawns} / ${counters.results} / ${tokens.toLocaleString()} / $${counters.costUsd.toFixed(4)} / ${perResult}`,
+					`${counters.spawns} / ${counters.results} / ${counters.completed} / ${counters.tokens.toLocaleString()} / $${counters.costUsd.toFixed(4)} / ${perCompleted}`,
 				),
 			);
 		}
 	}
-	lines.push("", `State file: ${runtime.telemetry.file}`);
+	lines.push("", `State file: ${runtime.telemetry.file}`, `Decision log: ${runtime.telemetry.decisionsFile}`);
 	return lines.join("\n");
 }
 

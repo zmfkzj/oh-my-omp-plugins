@@ -27,6 +27,7 @@ test("one extension registers the checkpoint tool and an independent auditor rol
     zod: z,
     logger: { debug() {}, warn() {}, info() {}, error() {} },
     setLabel() {},
+    events: { on: () => () => {} },
     registerCommand() {},
     registerTool(tool: Parameters<ExtensionAPI["registerTool"]>[0]) { checkpointTool = tool; },
     on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) {

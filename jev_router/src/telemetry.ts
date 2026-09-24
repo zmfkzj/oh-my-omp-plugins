@@ -1,23 +1,27 @@
 /**
- * Aggregate routing telemetry.
+ * Aggregate routing telemetry plus a per-decision log.
  *
- * Counts and distributions only — no prompt text, no task text, no source, no
- * transcript, no credential. The file lives outside the repository and outside
- * the plugin source tree, under OMP's agent state directory, and
- * `/jev-router reset` deletes it.
+ * No prompt text, no task text, no source, no transcript, no credential. Both
+ * files live outside the repository and outside the plugin source tree, under
+ * OMP's agent state directory, and `/jev-router reset` deletes them:
  *
- * Worker token usage is attributed by agent name, which is exactly the tier the
- * router selected (`task` = normal, `task-deep` = deep). OMP reports a spawn's
- * `usage` in the `task` tool result; background spawns report it when their job
- * settles, so totals cover every spawn whose result the parent session
- * observed. That is the closest per-tier cost signal the public extension
- * surface exposes: `ctx.sessionManager.getUsageStatistics()` is a single
- * session-wide total with no per-role breakdown (`UsageStatistics` in
- * `src/session/session-entries.ts`).
+ * - `telemetry.json` — counters and distributions.
+ * - `decisions.jsonl` — one line per Jev decision: labels, raw probabilities,
+ *   gate outcome, latency. The pre-gate `top` and probabilities let any other
+ *   gate be replayed exactly offline; the aggregate histograms cannot.
+ *
+ * Worker usage is attributed by agent name, which is exactly the tier the
+ * router selected (`task` = normal, `task-deep` = deep). It is read from OMP's
+ * subagent progress/lifecycle frames, which fire for sync and background
+ * spawns alike (see `worker-usage.ts`). `ctx.sessionManager.getUsageStatistics()`
+ * is a single session-wide total with no per-role breakdown, so it cannot
+ * substitute.
  */
+import { appendFile, rename } from "node:fs/promises";
 import path from "node:path";
 
 export const HISTOGRAM_BUCKETS = 10;
+export const TELEMETRY_VERSION = 3;
 
 export interface RouteCounters {
 	requests: number;
@@ -30,33 +34,56 @@ export interface RouteCounters {
 }
 
 export interface WorkerCounters {
+	/** Routing decisions that selected this agent. */
 	spawns: number;
+	/** Settled spawns (completed, failed, or aborted) whose usage was observed. */
 	results: number;
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	/** Provider-reported spend, when OMP attached a cost to the spawn's usage. */
+	/** Settled spawns that completed successfully. */
+	completed: number;
+	/** Input + output + cacheWrite tokens (OMP's `AgentProgress.tokens`; excludes cacheRead). */
+	tokens: number;
+	/** Provider-reported spend accumulated by OMP for the spawn. */
 	costUsd: number;
 	durationMs: number;
 }
 
-/** One spawn's reported usage, as extracted from a `task` tool result. */
-export interface WorkerUsageSample {
-	input?: number;
-	output?: number;
-	cacheRead?: number;
-	cacheWrite?: number;
-	costUsd?: number;
+/** One settled spawn's final usage. */
+export interface WorkerSettlement {
+	tokens: number;
+	costUsd: number;
+	durationMs: number;
+	completed: boolean;
 }
 
 export interface TelemetrySnapshot {
-	version: 2;
+	version: typeof TELEMETRY_VERSION;
 	updatedAt: number;
-	orchestration: RouteCounters & { DEFAULT: number; SLOW: number; ORCHESTRATE: number; UNCERTAIN: number };
+	orchestration: RouteCounters & {
+		DEFAULT: number;
+		SLOW: number;
+		ORCHESTRATE: number;
+		UNCERTAIN: number;
+		/** v1 `DIRECT` decisions (no notice, no model switch), carried over by migration. */
+		legacyDirect: number;
+	};
 	task: RouteCounters & { batches: number; TASK_NORMAL: number; TASK_DEEP: number; fallbackDeep: number };
 	workers: Record<string, WorkerCounters>;
 }
+
+interface GateFields {
+	/** Pre-gate highest-probability label. */
+	top: string;
+	probabilities: Readonly<Record<string, number>>;
+	confidence: number;
+	margin: number;
+	confident: boolean;
+}
+
+/** One line of `decisions.jsonl`, minus the timestamp added on append. */
+export type DecisionRecord =
+	| (GateFields & { kind: "orchestration"; route: string; latencyMs: number; model: string })
+	| (GateFields & { kind: "task"; route: string; latencyMs: number; batchSize: number })
+	| { kind: "orchestration" | "task"; route: "ERROR"; timedOut: boolean; items?: number };
 
 function emptyRouteCounters(): RouteCounters {
 	return {
@@ -71,14 +98,14 @@ function emptyRouteCounters(): RouteCounters {
 }
 
 export function emptyWorkerCounters(): WorkerCounters {
-	return { spawns: 0, results: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0, durationMs: 0 };
+	return { spawns: 0, results: 0, completed: 0, tokens: 0, costUsd: 0, durationMs: 0 };
 }
 
 export function emptySnapshot(): TelemetrySnapshot {
 	return {
-		version: 2,
+		version: TELEMETRY_VERSION,
 		updatedAt: 0,
-		orchestration: { ...emptyRouteCounters(), DEFAULT: 0, SLOW: 0, ORCHESTRATE: 0, UNCERTAIN: 0 },
+		orchestration: { ...emptyRouteCounters(), DEFAULT: 0, SLOW: 0, ORCHESTRATE: 0, UNCERTAIN: 0, legacyDirect: 0 },
 		task: { ...emptyRouteCounters(), batches: 0, TASK_NORMAL: 0, TASK_DEEP: 0, fallbackDeep: 0 },
 		workers: {},
 	};
@@ -91,11 +118,15 @@ export function bucketOf(value: number): number {
 	return Math.floor(clamped * HISTOGRAM_BUCKETS);
 }
 
+function finite(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 function mergeCounters(target: number[], source: unknown): void {
 	if (!Array.isArray(source)) return;
 	for (let index = 0; index < target.length; index++) {
-		const value = source[index];
-		if (typeof value === "number" && Number.isFinite(value)) target[index] = value;
+		const value = finite(source[index]);
+		if (value !== undefined) target[index] = value;
 	}
 }
 
@@ -106,43 +137,65 @@ function reviveRoute<T extends RouteCounters>(target: T, source: unknown): T {
 		const value = record[key];
 		if (key === "confidence" || key === "margin") {
 			mergeCounters(target[key] as unknown as number[], value);
-		} else if (typeof value === "number" && Number.isFinite(value)) {
-			(target as Record<string, unknown>)[key] = value;
+		} else {
+			const number = finite(value);
+			if (number !== undefined) (target as Record<string, unknown>)[key] = number;
 		}
 	}
 	return target;
 }
 
-/** Parse a persisted snapshot, discarding anything malformed. */
+function reviveWorker(source: Record<string, unknown>): WorkerCounters {
+	const counters = emptyWorkerCounters();
+	for (const key of Object.keys(counters) as (keyof WorkerCounters)[]) {
+		const value = finite(source[key]);
+		if (value !== undefined) counters[key] = value;
+	}
+	// v1/v2 stored split token fields; fold them into v3's `tokens` definition.
+	if (finite(source.tokens) === undefined) {
+		counters.tokens = (finite(source.input) ?? 0) + (finite(source.output) ?? 0) + (finite(source.cacheWrite) ?? 0);
+	}
+	return counters;
+}
+
+/**
+ * Parse a persisted snapshot, discarding anything malformed.
+ *
+ * Every label ever written stays accounted for: a renamed route counter is
+ * migrated here rather than dropped, so `requests` keeps matching the sum of
+ * its route counters.
+ */
 export function reviveSnapshot(raw: unknown): TelemetrySnapshot {
 	const snapshot = emptySnapshot();
 	if (typeof raw !== "object" || raw === null) return snapshot;
 	const record = raw as Record<string, unknown>;
 	reviveRoute(snapshot.orchestration, record.orchestration);
 	reviveRoute(snapshot.task, record.task);
-	if (typeof record.updatedAt === "number") snapshot.updatedAt = record.updatedAt;
+	if (typeof record.orchestration === "object" && record.orchestration !== null) {
+		// v1 named the no-notice route `DIRECT`; v2 dropped it on load.
+		snapshot.orchestration.legacyDirect += finite((record.orchestration as Record<string, unknown>).DIRECT) ?? 0;
+	}
+	const updatedAt = finite(record.updatedAt);
+	if (updatedAt !== undefined) snapshot.updatedAt = updatedAt;
 	if (typeof record.workers === "object" && record.workers !== null) {
 		for (const [agent, value] of Object.entries(record.workers as Record<string, unknown>)) {
 			if (typeof value !== "object" || value === null) continue;
-			const counters = emptyWorkerCounters();
-			for (const key of Object.keys(counters) as (keyof WorkerCounters)[]) {
-				const entry = (value as Record<string, unknown>)[key];
-				if (typeof entry === "number" && Number.isFinite(entry)) counters[key] = entry;
-			}
-			snapshot.workers[agent] = counters;
+			snapshot.workers[agent] = reviveWorker(value as Record<string, unknown>);
 		}
 	}
 	return snapshot;
 }
 
 const FLUSH_DEBOUNCE_MS = 2000;
+/** Settled spawn keys remembered for de-duplication across session buses. */
+const MAX_SETTLED_KEYS = 4096;
 
 /**
- * In-memory counters with a debounced JSON sink.
+ * In-memory counters with a debounced JSON sink, plus an append-only decision log.
  *
  * One instance per state directory per process. Every session in an OMP
  * process — the main session and each subagent — builds its own extension
- * runtime (the factory runs per session), and they all target the same file;
+ * runtime (the factory runs per session), and they all target the same files;
  * separate instances would race and lose counts, so {@link Telemetry.shared}
  * hands them the same writer.
  */
@@ -166,17 +219,25 @@ export class Telemetry {
 	#snapshot = emptySnapshot();
 	#dirty = false;
 	#flushing: Promise<void> | undefined;
+	#appending: Promise<void> = Promise.resolve();
 	#timer: Timer | undefined;
 	#enabled = true;
 	#loaded: Promise<void> | undefined;
+	readonly #settled = new Set<string>();
 	readonly #file: string;
+	readonly #decisionsFile: string;
 
 	constructor(stateDir: string) {
 		this.#file = path.join(stateDir, "telemetry.json");
+		this.#decisionsFile = path.join(stateDir, "decisions.jsonl");
 	}
 
 	get file(): string {
 		return this.#file;
+	}
+
+	get decisionsFile(): string {
+		return this.#decisionsFile;
 	}
 
 	setEnabled(enabled: boolean): void {
@@ -196,7 +257,17 @@ export class Telemetry {
 	async #read(): Promise<void> {
 		try {
 			const handle = Bun.file(this.#file);
-			if (await handle.exists()) this.#snapshot = reviveSnapshot(await handle.json());
+			if (!(await handle.exists())) return;
+			const raw: unknown = await handle.json();
+			const version = typeof raw === "object" && raw !== null ? finite((raw as Record<string, unknown>).version) : undefined;
+			if (version !== undefined && version > TELEMETRY_VERSION) {
+				// Written by a newer plugin: set it aside instead of overwriting it.
+				await rename(this.#file, path.join(path.dirname(this.#file), `telemetry.v${version}.json`));
+				return;
+			}
+			this.#snapshot = reviveSnapshot(raw);
+			// Persist a migrated snapshot so the upgrade is not repeated on every load.
+			if (version !== TELEMETRY_VERSION) this.#touch();
 		} catch {
 			this.#snapshot = emptySnapshot();
 		}
@@ -258,17 +329,35 @@ export class Telemetry {
 		this.#touch();
 	}
 
-	recordWorkerUsage(agent: string, usage: WorkerUsageSample, durationMs: number): void {
-		if (!this.#enabled) return;
+	/**
+	 * Count one settled spawn. `key` identifies the spawn process-wide; a spawn
+	 * seen on several session buses is counted once.
+	 */
+	recordWorkerSettled(key: string, agent: string, settlement: WorkerSettlement): void {
+		if (!this.#enabled || this.#settled.has(key)) return;
+		this.#settled.add(key);
+		if (this.#settled.size > MAX_SETTLED_KEYS) {
+			const oldest = this.#settled.values().next();
+			if (!oldest.done) this.#settled.delete(oldest.value);
+		}
 		const counters = this.#worker(agent);
 		counters.results++;
-		counters.input += usage.input ?? 0;
-		counters.output += usage.output ?? 0;
-		counters.cacheRead += usage.cacheRead ?? 0;
-		counters.cacheWrite += usage.cacheWrite ?? 0;
-		counters.costUsd += usage.costUsd ?? 0;
-		counters.durationMs += durationMs;
+		if (settlement.completed) counters.completed++;
+		counters.tokens += settlement.tokens;
+		counters.costUsd += settlement.costUsd;
+		counters.durationMs += settlement.durationMs;
 		this.#touch();
+	}
+
+	/** Append one decision to `decisions.jsonl`. Writes are serialized and never throw. */
+	appendDecision(record: DecisionRecord): void {
+		if (!this.#enabled) return;
+		const line = `${JSON.stringify({ ts: Date.now(), ...record })}\n`;
+		this.#appending = this.#appending.then(() =>
+			appendFile(this.#decisionsFile, line).catch(() => {
+				// A log write must never break a turn; drop the line.
+			}),
+		);
 	}
 
 	#worker(agent: string): WorkerCounters {
@@ -280,6 +369,7 @@ export class Telemetry {
 	}
 
 	async flush(): Promise<void> {
+		await this.#appending;
 		if (!this.#dirty) return;
 		await this.#flushing;
 		if (!this.#dirty) return;
@@ -301,12 +391,16 @@ export class Telemetry {
 		}
 		this.#snapshot = emptySnapshot();
 		this.#dirty = false;
+		this.#settled.clear();
 		// The cleared state is authoritative; a later `load()` must not re-read.
 		this.#loaded = Promise.resolve();
-		try {
-			await Bun.file(this.#file).delete();
-		} catch {
-			// Already absent.
+		await this.#appending;
+		for (const file of [this.#file, this.#decisionsFile]) {
+			try {
+				await Bun.file(file).delete();
+			} catch {
+				// Already absent.
+			}
 		}
 	}
 }

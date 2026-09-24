@@ -28,6 +28,8 @@ export interface GateOutcome<Label extends string> {
 	margin: number;
 	/** True when both thresholds are met. */
 	confident: boolean;
+	/** Finite per-label probabilities the gate ranked; empty when Jev returned none. */
+	probabilities: Readonly<Record<string, number>>;
 }
 
 export interface OrchestrationDecision extends GateOutcome<OrchestrationRoute> {
@@ -109,7 +111,7 @@ export function gate<Label extends string>(
 		.filter((entry): entry is [string, number] => Number.isFinite(entry[1]))
 		.sort((a, b) => b[1] - a[1]);
 	const first = ranked[0];
-	if (!first) return { top: fallback, confidence: 0, margin: 0, confident: false };
+	if (!first) return { top: fallback, confidence: 0, margin: 0, confident: false, probabilities: {} };
 	const confidence = first[1];
 	const margin = confidence - (ranked[1]?.[1] ?? 0);
 	return {
@@ -117,6 +119,7 @@ export function gate<Label extends string>(
 		confidence,
 		margin,
 		confident: confidence >= minConfidence && margin >= minMargin,
+		probabilities: Object.fromEntries(ranked),
 	};
 }
 
@@ -243,7 +246,7 @@ export class JevEngine implements JevDecider {
 		for (const subtask of subtasks) {
 			const answer = response.answers[subtask.id];
 			if (!answer || answer.type !== "choice") {
-				decisions.push({ id: subtask.id, top: "TASK_DEEP", confidence: 0, margin: 0, confident: false });
+				decisions.push({ id: subtask.id, top: "TASK_DEEP", confidence: 0, margin: 0, confident: false, probabilities: {} });
 				continue;
 			}
 			decisions.push({

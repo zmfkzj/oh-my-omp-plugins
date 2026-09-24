@@ -30,9 +30,9 @@ export function sessionOf(ctx: ExtensionContext): AgentSession | undefined {
 /**
  * Agent names the `task` tool is currently advertising.
  *
- * The tool renders one `### <name>` heading per agent that survives the live
- * spawn policy and `task.disabledAgents` (`renderDescription` in
- * `src/task/index.ts`), so this is an exact, policy-accurate spawnability
+ * The tool renders one ``- `<name>` `` bullet per agent that survives the live
+ * spawn policy and `task.disabledAgents` (`# Available Agents` in
+ * `src/prompts/tools/task.md`), so this is an exact, policy-accurate spawnability
  * check — not a guess about what a restricted parent allows. A name absent
  * here would be rejected at preflight, so the router must not route to it.
  */
@@ -40,8 +40,10 @@ export function spawnableTaskAgents(pi: ExtensionAPI): Set<string> {
 	const names = new Set<string>();
 	const description = pi.getAllTools().find(tool => tool.name === "task")?.description;
 	if (!description) return names;
-	for (const line of description.split("\n")) {
-		const match = /^### ([A-Za-z0-9_-]+)/.exec(line);
+	const listing = description.split("# Available Agents")[1];
+	if (!listing) return names;
+	for (const line of listing.split("\n")) {
+		const match = /^- `([A-Za-z0-9_-]+)`/.exec(line);
 		if (match?.[1]) names.add(match[1]);
 	}
 	return names;

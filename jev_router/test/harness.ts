@@ -106,7 +106,7 @@ export function makeApi(taskAgents: string[] = ["scout", "reviewer", "security-r
 		"Delegate work to background subagents.",
 		"",
 		"# Available Agents",
-		...taskAgents.flatMap(name => [`### ${name}`, `${name} description`]),
+		...taskAgents.map(name => `- \`${name}\`: ${name} description`),
 	].join("\n");
 	const pi = {
 		logger: {
@@ -162,6 +162,7 @@ export class ScriptedDecider implements JevDecider {
 			confidence,
 			margin,
 			confident: confidence >= gates.minConfidence && margin >= gates.minMargin,
+			probabilities: { [top]: confidence },
 			latencyMs: 7,
 		};
 	}
@@ -188,6 +189,7 @@ export class ScriptedDecider implements JevDecider {
 					confidence: answer.confidence,
 					margin: answer.margin,
 					confident: answer.confidence >= gates.minConfidence && answer.margin >= gates.minMargin,
+					probabilities: { [answer.top]: answer.confidence },
 				};
 			}),
 		};

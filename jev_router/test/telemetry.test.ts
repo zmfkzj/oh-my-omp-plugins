@@ -2,8 +2,9 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { bucketOf, reviveSnapshot, Telemetry } from "../src/telemetry.ts";
-import { harvestTaskUsage } from "../src/usage-harvest.ts";
+import { SUBAGENT_LIFECYCLE_CHANNEL, SUBAGENT_PROGRESS_CHANNEL, trackWorkerUsage } from "../src/worker-usage.ts";
 
 const roots: string[] = [];
 async function tempDir(): Promise<string> {
@@ -26,7 +27,7 @@ describe("telemetry aggregation", () => {
 		telemetry.recordTaskDecision("TASK_DEEP", 0.6, 0.2, false);
 		telemetry.recordFailure("task", true);
 		telemetry.recordSpawn("task-deep");
-		telemetry.recordWorkerUsage("task-deep", { input: 100, output: 50, costUsd: 0.25 }, 1500);
+		telemetry.recordWorkerSettled("call:a", "task-deep", { tokens: 150, costUsd: 0.25, durationMs: 1500, completed: true });
 		await telemetry.flush();
 
 		const reloaded = new Telemetry(dir);
@@ -37,14 +38,14 @@ describe("telemetry aggregation", () => {
 		expect(snapshot.orchestration.confidence[9]).toBe(1);
 		expect(snapshot.orchestration.confidence[5]).toBe(1);
 		expect(snapshot.task).toMatchObject({ batches: 1, TASK_DEEP: 1, fallbackDeep: 1, errors: 1, timeouts: 1 });
-		expect(snapshot.workers["task-deep"]).toMatchObject({ spawns: 1, results: 1, output: 50, costUsd: 0.25 });
+		expect(snapshot.workers["task-deep"]).toMatchObject({ spawns: 1, results: 1, completed: 1, tokens: 150, costUsd: 0.25 });
 	});
 
 	test("no prompt, task, or credential text is ever stored", async () => {
 		const dir = await tempDir();
 		const telemetry = new Telemetry(dir);
 		telemetry.recordOrchestration("ORCHESTRATE", 0.9, 0.8, 5);
-		telemetry.recordWorkerUsage("task", { input: 1 }, 1);
+		telemetry.recordWorkerSettled("call:a", "task", { tokens: 1, costUsd: 0, durationMs: 1, completed: true });
 		await telemetry.flush();
 
 		const raw = await Bun.file(telemetry.file).text();
@@ -55,16 +56,75 @@ describe("telemetry aggregation", () => {
 		expect(raw).not.toContain("ts_");
 	});
 
-	test("reset clears memory and removes the file", async () => {
+	test("reset clears memory and removes both files", async () => {
 		const dir = await tempDir();
 		const telemetry = new Telemetry(dir);
 		telemetry.recordOrchestration("DEFAULT", 0.9, 0.8, 1);
+		telemetry.appendDecision({ kind: "task", route: "ERROR", timedOut: false });
 		await telemetry.flush();
 
 		await telemetry.reset();
 
 		expect(telemetry.snapshot().orchestration.requests).toBe(0);
 		expect(await Bun.file(telemetry.file).exists()).toBe(false);
+		expect(await Bun.file(telemetry.decisionsFile).exists()).toBe(false);
+	});
+
+	test("v1 DIRECT counts are migrated so route counters still sum to requests", async () => {
+		const dir = await tempDir();
+		const v1 = { version: 1, orchestration: { requests: 5, DIRECT: 3, ORCHESTRATE: 1, UNCERTAIN: 1 } };
+		await Bun.write(path.join(dir, "telemetry.json"), JSON.stringify(v1));
+		const telemetry = new Telemetry(dir);
+		await telemetry.load();
+
+		expect(telemetry.snapshot().orchestration).toMatchObject({ requests: 5, legacyDirect: 3, ORCHESTRATE: 1, UNCERTAIN: 1 });
+	});
+
+	test("v2 split token fields fold into tokens, excluding cacheRead", async () => {
+		const dir = await tempDir();
+		const v2 = {
+			version: 2,
+			workers: { "task-deep": { spawns: 2, results: 1, input: 100, output: 40, cacheRead: 999, cacheWrite: 10, costUsd: 0.5 } },
+		};
+		await Bun.write(path.join(dir, "telemetry.json"), JSON.stringify(v2));
+		const telemetry = new Telemetry(dir);
+		await telemetry.load();
+
+		expect(telemetry.snapshot().workers["task-deep"]).toMatchObject({ spawns: 2, results: 1, tokens: 150, costUsd: 0.5 });
+	});
+
+	test("a snapshot from a newer plugin version is set aside, not overwritten", async () => {
+		const dir = await tempDir();
+		const future = JSON.stringify({ version: 99, orchestration: { requests: 5 } });
+		await Bun.write(path.join(dir, "telemetry.json"), future);
+		const telemetry = new Telemetry(dir);
+		await telemetry.load();
+		telemetry.recordOrchestration("DEFAULT", 0.9, 0.8, 1);
+		await telemetry.flush();
+
+		expect(await Bun.file(path.join(dir, "telemetry.v99.json")).text()).toBe(future);
+		expect(telemetry.snapshot().orchestration.requests).toBe(1);
+	});
+
+	test("the decision log keeps the pre-gate label so another gate can be replayed", async () => {
+		const dir = await tempDir();
+		const telemetry = new Telemetry(dir);
+		telemetry.appendDecision({
+			kind: "task",
+			route: "TASK_DEEP",
+			top: "TASK_NORMAL",
+			probabilities: { TASK_NORMAL: 0.7, TASK_DEEP: 0.3 },
+			confidence: 0.7,
+			margin: 0.4,
+			confident: false,
+			latencyMs: 12,
+			batchSize: 1,
+		});
+		await telemetry.flush();
+
+		const lines = (await Bun.file(telemetry.decisionsFile).text()).trim().split("\n");
+		expect(lines).toHaveLength(1);
+		expect(JSON.parse(lines[0]!)).toMatchObject({ route: "TASK_DEEP", top: "TASK_NORMAL", probabilities: { TASK_NORMAL: 0.7 } });
 	});
 
 	test("a corrupt snapshot degrades to empty counters instead of throwing", () => {
@@ -121,24 +181,52 @@ describe("telemetry aggregation", () => {
 	});
 });
 
-describe("task usage harvesting", () => {
-	test("per-spawn usage is attributed to the tier agent that ran it", () => {
-		const harvested = harvestTaskUsage({
-			results: [
-				{ agent: "task", durationMs: 1200, usage: { input: 10, output: 20, cost: { total: 0.01 } } },
-				{ agent: "task-deep", durationMs: 3400, usage: { input: 30, output: 40, cost: { total: 0.9 } } },
-			],
+describe("worker usage from subagent frames", () => {
+	const progress = (bus: EventBus, agent: string, cost: number) =>
+		bus.emit(SUBAGENT_PROGRESS_CHANNEL, {
+			parentToolCallId: "call-1",
+			progress: { id: "0-W", agent, tokens: 500, cost, durationMs: 800 },
 		});
 
-		expect(harvested).toEqual([
-			{ agent: "task", usage: { input: 10, output: 20, cacheRead: undefined, cacheWrite: undefined, costUsd: 0.01 }, durationMs: 1200 },
-			{ agent: "task-deep", usage: { input: 30, output: 40, cacheRead: undefined, cacheWrite: undefined, costUsd: 0.9 }, durationMs: 3400 },
-		]);
+	test("a settled background spawn records its final usage once, even when seen on two buses", async () => {
+		const dir = await tempDir();
+		const telemetry = new Telemetry(dir);
+		const tiers = new Set(["task", "task-deep"]);
+		const main = new EventBus();
+		const child = new EventBus();
+		trackWorkerUsage(main, telemetry, tiers);
+		trackWorkerUsage(child, telemetry, tiers);
+
+		for (const bus of [main, child]) {
+			progress(bus, "task-deep", 0.1);
+			progress(bus, "task-deep", 0.4);
+			bus.emit(SUBAGENT_LIFECYCLE_CHANNEL, { id: "0-W", agent: "task-deep", parentToolCallId: "call-1", status: "completed" });
+		}
+
+		expect(telemetry.snapshot().workers["task-deep"]).toMatchObject({
+			results: 1,
+			completed: 1,
+			tokens: 500,
+			costUsd: 0.4,
+			durationMs: 800,
+		});
 	});
 
-	test("a background call with no settled results yields no samples", () => {
-		expect(harvestTaskUsage({ results: [] })).toEqual([]);
-		expect(harvestTaskUsage(undefined)).toEqual([]);
-		expect(harvestTaskUsage({ results: "nope" })).toEqual([]);
+	test("non-tier agents, non-terminal frames, and spawns without usage are ignored; failures settle uncompleted", async () => {
+		const dir = await tempDir();
+		const telemetry = new Telemetry(dir);
+		const bus = new EventBus();
+		trackWorkerUsage(bus, telemetry, new Set(["task"]));
+
+		progress(bus, "scout", 1);
+		bus.emit(SUBAGENT_LIFECYCLE_CHANNEL, { id: "0-W", agent: "scout", parentToolCallId: "call-1", status: "completed" });
+		progress(bus, "task", 0.2);
+		bus.emit(SUBAGENT_LIFECYCLE_CHANNEL, { id: "0-W", agent: "task", parentToolCallId: "call-1", status: "started" });
+		bus.emit(SUBAGENT_LIFECYCLE_CHANNEL, { id: "0-W", agent: "task", parentToolCallId: "call-1", status: "failed" });
+		bus.emit(SUBAGENT_LIFECYCLE_CHANNEL, { id: "1-X", agent: "task", parentToolCallId: "call-1", status: "completed" });
+
+		const workers = telemetry.snapshot().workers;
+		expect(workers.scout).toBeUndefined();
+		expect(workers.task).toMatchObject({ results: 1, completed: 0, costUsd: 0.2 });
 	});
 });

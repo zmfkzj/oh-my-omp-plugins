@@ -206,6 +206,17 @@ export class TaskRouter {
 				const route: TaskRoute = decision.confident ? decision.top : "TASK_DEEP";
 				routes.set(index, route);
 				this.#deps.telemetry.recordTaskDecision(route, decision.confidence, decision.margin, decision.confident);
+				this.#deps.telemetry.appendDecision({
+					kind: "task",
+					route,
+					top: decision.top,
+					probabilities: decision.probabilities,
+					confidence: decision.confidence,
+					margin: decision.margin,
+					confident: decision.confident,
+					latencyMs: batch.latencyMs,
+					batchSize: routable.length,
+				});
 				this.#last = {
 					route,
 					confidence: decision.confidence,
@@ -229,6 +240,7 @@ export class TaskRouter {
 			const reason = this.#deps.logger.describeError(error);
 			const timedOut = /timeout|abort/i.test(reason);
 			this.#deps.telemetry.recordFailure("task", timedOut);
+			this.#deps.telemetry.appendDecision({ kind: "task", route: "ERROR", timedOut, items: routable.length });
 			this.#deps.logger.route("jev.task", { route: "TASK_DEEP", reason, items: routable.length });
 			this.#last = { route: "TASK_DEEP", confidence: 0, margin: 0, confident: false, at: Date.now() };
 			for (const item of routable) routes.set(item.index, "TASK_DEEP");

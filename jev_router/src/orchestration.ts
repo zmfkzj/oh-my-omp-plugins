@@ -210,6 +210,17 @@ export class OrchestrationRouter {
 			const outcome: OrchestrationRoute | "UNCERTAIN" = decision.confident ? decision.top : "UNCERTAIN";
 			const model = await this.#applyMainModel(ctx, turn, outcome);
 			this.#deps.telemetry.recordOrchestration(outcome, decision.confidence, decision.margin, decision.latencyMs);
+			this.#deps.telemetry.appendDecision({
+				kind: "orchestration",
+				route: outcome,
+				top: decision.top,
+				probabilities: decision.probabilities,
+				confidence: decision.confidence,
+				margin: decision.margin,
+				confident: decision.confident,
+				latencyMs: decision.latencyMs,
+				model,
+			});
 			this.#deps.logger.route("jev.orchestration", {
 				route: outcome,
 				confidence: decision.confidence,
@@ -223,7 +234,9 @@ export class OrchestrationRouter {
 		} catch (error) {
 			// Failure leaves the model and native orchestration behavior untouched.
 			const reason = this.#deps.logger.describeError(error);
-			this.#deps.telemetry.recordFailure("orchestration", /timeout|abort/i.test(reason));
+			const timedOut = /timeout|abort/i.test(reason);
+			this.#deps.telemetry.recordFailure("orchestration", timedOut);
+			this.#deps.telemetry.appendDecision({ kind: "orchestration", route: "ERROR", timedOut });
 			this.#deps.logger.route("jev.orchestration", { route: "ERROR", reason });
 			turn.record = { outcome: "ERROR", reason, at: Date.now() };
 			this.#last = turn.record;

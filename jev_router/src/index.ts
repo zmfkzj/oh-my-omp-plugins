@@ -16,7 +16,9 @@ import { registerCommands } from "./commands.ts";
 import { TYPESAFE_PROVIDER } from "./credentials.ts";
 import { mainSessionOf, sessionOf } from "./host.ts";
 import { JevRouterRuntime } from "./runtime.ts";
-import { harvestTaskUsage } from "./usage-harvest.ts";
+import { GENERIC_TASK_AGENT } from "./task-routing.ts";
+import { DEEP_AGENT_NAME, NORMAL_AGENT_NAME } from "./deep-agent.ts";
+import { trackWorkerUsage } from "./worker-usage.ts";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 export const TASK_TOOL = "task";
@@ -50,6 +52,11 @@ export function registerJevRouter(pi: ExtensionAPI, packageRoot: string): JevRou
 		runtime.checkTierRoles(ctx);
 	});
 	registerOrcheAdvisor(pi);
+	const stopUsageTracking = trackWorkerUsage(
+		pi.events,
+		runtime.telemetry,
+		new Set([GENERIC_TASK_AGENT, NORMAL_AGENT_NAME, DEEP_AGENT_NAME]),
+	);
 
 	// One Jev call per prompt, memoized across policy-preparation retries.
 	// The model must be set here: agent-loop.ts captures it before `context`.
@@ -76,19 +83,13 @@ export function registerJevRouter(pi: ExtensionAPI, packageRoot: string): JevRou
 		return await runtime.task.route(pi, event.toolCallId, event.input);
 	});
 
-	pi.on("tool_result", event => {
-		if (event.toolName !== TASK_TOOL) return;
-		for (const spawn of harvestTaskUsage(event.details)) {
-			runtime.telemetry.recordWorkerUsage(spawn.agent, spawn.usage, spawn.durationMs);
-		}
-	});
-
 	// A rotated or rejected key must not be reused from the short-lived cache.
 	pi.on("credential_disabled", event => {
 		if (event.provider === TYPESAFE_PROVIDER) runtime.invalidateCredential();
 	});
 
 	pi.on("session_shutdown", async () => {
+		stopUsageTracking();
 		await runtime.telemetry.flush();
 	});
 
