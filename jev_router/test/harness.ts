@@ -76,7 +76,7 @@ export function makeSession(options: FakeSessionOptions = {}): FakeSession {
 		get model() { return currentModel; },
 		sessionManager,
 		models: { resolve: () => undefined, list: () => [], current: () => undefined, family: () => "x" },
-		modelRegistry: { authStorage: { getApiKey: async () => undefined, hasNonEnvCredential: () => false } },
+		modelRegistry: { authStorage: { keys: { get: async () => undefined }, credentials: { has: () => false } } },
 	} as unknown as ExtensionContext;
 
 	return {

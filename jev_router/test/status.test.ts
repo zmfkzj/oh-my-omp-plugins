@@ -20,7 +20,7 @@ function makeCommandCtx(roles: Record<string, Model | undefined>): ExtensionComm
 		sessionManager: { getSessionId: () => "s1" },
 		models: { resolve: (spec: string) => resolvedRoles[spec as keyof typeof resolvedRoles] },
 		modelRegistry: {
-			authStorage: { getApiKey: async () => undefined, hasNonEnvCredential: () => false },
+			authStorage: { keys: { get: async () => undefined }, credentials: { has: () => false } },
 		},
 	} as unknown as ExtensionCommandContext;
 }

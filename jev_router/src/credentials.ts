@@ -33,15 +33,14 @@ export async function resolveCredential(ctx: ExtensionContext): Promise<Resolved
 	const fromEnv = process.env[TYPESAFE_ENV_VAR]?.trim();
 	if (fromEnv) return { key: fromEnv, source: "env" };
 
-	const storage = ctx.modelRegistry.authStorage;
-	const stored = await storage.getApiKey(TYPESAFE_PROVIDER, ctx.sessionManager.getSessionId());
+	const stored = await ctx.modelRegistry.authStorage.keys.get(TYPESAFE_PROVIDER, ctx.sessionManager.getSessionId());
 	if (stored?.trim()) return { key: stored.trim(), source: "omp-credential-store" };
 	return undefined;
 }
 
 /** Whether a key is persisted in OMP's store (as opposed to supplied by the environment). */
 export function hasStoredCredential(ctx: ExtensionContext): boolean {
-	return ctx.modelRegistry.authStorage.hasNonEnvCredential(TYPESAFE_PROVIDER);
+	return ctx.modelRegistry.authStorage.credentials.has(TYPESAFE_PROVIDER);
 }
 
 export interface ValidationResult {
@@ -77,10 +76,10 @@ export async function validateCredential(key: string, timeoutMs: number): Promis
 
 /** Persist a validated key into OMP's credential store. Invalid keys are never stored. */
 export async function storeCredential(ctx: ExtensionContext, key: string): Promise<void> {
-	await ctx.modelRegistry.authStorage.set(TYPESAFE_PROVIDER, { type: "api_key", key, source: "login" });
+	await ctx.modelRegistry.authStorage.credentials.set(TYPESAFE_PROVIDER, { type: "api_key", key, source: "login" });
 }
 
 /** Remove the plugin-provisioned credential. Environment keys are untouched. */
 export async function clearStoredCredential(ctx: ExtensionContext): Promise<void> {
-	await ctx.modelRegistry.authStorage.remove(TYPESAFE_PROVIDER);
+	await ctx.modelRegistry.authStorage.credentials.remove(TYPESAFE_PROVIDER);
 }

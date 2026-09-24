@@ -11,7 +11,7 @@
  * At settled `agent_end`, a temporary model switch is restored unless another
  * actor changed the model during the turn.
  */
-import { renderOrchestrateNotice } from "@oh-my-pi/pi-coding-agent/modes/orchestrate";
+import { renderOrchestrateNotice } from "@oh-my-pi/pi-coding-agent/modes/magic-keywords";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AgentSession, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Model } from "@oh-my-pi/pi-ai";

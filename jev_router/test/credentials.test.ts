@@ -13,13 +13,15 @@ function makeCtx(options: { stored?: string } = {}): { ctx: ExtensionContext; ca
 		sessionManager: { getSessionId: () => "s1" },
 		modelRegistry: {
 			authStorage: {
-				// Mirrors AuthStorage: env wins inside getApiKey too, so the plugin's own
-				// env branch must short-circuit before this is consulted.
-				getApiKey: async () => process.env[TYPESAFE_ENV_VAR]?.trim() || stored,
-				hasNonEnvCredential: () => stored !== undefined,
-				set: async (provider: string, credential: unknown) => {
-					calls.set.push({ provider, credential });
-					stored = (credential as { key: string }).key;
+				// Mirrors AuthStorage.keys.get: env wins inside the cascade too, so the
+				// plugin's own env branch must short-circuit before this is consulted.
+				keys: { get: async () => process.env[TYPESAFE_ENV_VAR]?.trim() || stored },
+				credentials: {
+					has: () => stored !== undefined,
+					set: async (provider: string, credential: { key: string }) => {
+						calls.set.push({ provider, credential });
+						stored = credential.key;
+					},
 				},
 			},
 		},
