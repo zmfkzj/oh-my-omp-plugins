@@ -16,7 +16,9 @@
  * `omp plugin uninstall` removes it along with the plugin.
  */
 import path from "node:path";
+import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { getBundledAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
+import { cfgTaskAgentAdvisor, cfgTaskAgentPrewalk, cfgTaskPrewalk } from "@oh-my-pi/pi-coding-agent/task/settings";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 
 /** The bundled generic worker whose per-agent settings the aliases inherit. */
@@ -161,20 +163,16 @@ export function requiredTierAgents(
  * prewalk for the bundled generic worker. Absent or `"off"` yields nothing, so
  * the plugin never attaches an advisor or a prewalk hand-off by itself.
  */
-export function readInheritedAgentBehavior(settings: {
-	get(key: string): unknown;
-}): InheritedAgentBehavior {
-	const record = (key: string): string | undefined => {
-		const map = settings.get(key);
-		if (typeof map !== "object" || map === null) return undefined;
-		const value = (map as Record<string, unknown>)[GENERIC_TASK_AGENT_NAME];
+export function readInheritedAgentBehavior(settings: Settings): InheritedAgentBehavior {
+	const record = (map: Readonly<Record<string, string>>): string | undefined => {
+		const value = map[GENERIC_TASK_AGENT_NAME];
 		return typeof value === "string" && value !== "off" ? value : undefined;
 	};
 	const normalize = (value: string | undefined): boolean | string | undefined =>
 		value === undefined ? undefined : value === "on" ? true : value;
 
-	const prewalkSetting = normalize(record("task.agentPrewalk"));
-	const prewalk = prewalkSetting ?? (settings.get("task.prewalk") === true ? true : undefined);
-	const advisor = normalize(record("task.agentAdvisor"));
+	const prewalkSetting = normalize(record(cfgTaskAgentPrewalk.get(settings)));
+	const prewalk = prewalkSetting ?? (cfgTaskPrewalk.get(settings) ? true : undefined);
+	const advisor = normalize(record(cfgTaskAgentAdvisor.get(settings)));
 	return { ...(prewalk === undefined ? {} : { prewalk }), ...(advisor === undefined ? {} : { advisor }) };
 }

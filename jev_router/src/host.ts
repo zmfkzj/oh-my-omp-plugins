@@ -10,6 +10,7 @@
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { resolveRoleSelection } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { cfgMagicKeyword, cfgMagicKeywordsEnabled } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
@@ -51,7 +52,8 @@ export function spawnableTaskAgents(pi: ExtensionAPI): Set<string> {
 
 /** Whether OMP would honor a typed `orchestrate` keyword in this session. */
 export function orchestrateKeywordEnabled(session: AgentSession): boolean {
-	return session.settings.get("magicKeywords.enabled") === true && session.settings.get("magicKeywords.orchestrate") === true;
+	const orchestrate = cfgMagicKeyword.orchestrate;
+	return cfgMagicKeywordsEnabled.get(session) && orchestrate !== undefined && orchestrate.get(session);
 }
 
 export interface RoleResolution {

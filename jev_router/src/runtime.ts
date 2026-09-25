@@ -6,6 +6,7 @@
  */
 import path from "node:path";
 import { getAgentDir } from "@oh-my-pi/pi-coding-agent";
+import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { discoverAgents } from "@oh-my-pi/pi-coding-agent/task/discovery";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { type JevRouterConfig, loadConfig, normalizeConfig } from "./config.ts";
@@ -166,7 +167,7 @@ export class JevRouterRuntime {
 	 * spawn tree would otherwise redo the same discovery and file comparison
 	 * once per subagent. The key covers everything that changes the answer.
 	 */
-	async surveyAgents(cwd: string, settings?: { get(key: string): unknown }): Promise<AgentSurvey> {
+	async surveyAgents(cwd: string, settings?: Settings): Promise<AgentSurvey> {
 		const inherited = settings ? readInheritedAgentBehavior(settings) : {};
 		const specs = requiredTierAgents(this.#config.normalTaskRole, this.#config.deepTaskRole, inherited);
 		const key = JSON.stringify([cwd, this.packageRoot, specs]);

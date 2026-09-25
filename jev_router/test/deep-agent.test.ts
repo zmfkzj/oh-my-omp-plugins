@@ -2,6 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { getBundledAgent, parseAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
 import { normalizeConfig } from "../src/config.ts";
 import {
@@ -57,14 +58,10 @@ describe("tier alias derivation", () => {
 
 
 	test("per-agent prewalk and advisor configured for `task` carry to the alias", () => {
-		const settings = {
-			get: (key: string) =>
-				key === "task.agentAdvisor"
-					? { task: "deepseek/deepseek-v4-flash" }
-					: key === "task.agentPrewalk"
-						? { task: "on" }
-						: undefined,
-		};
+		const settings = Settings.isolated({
+			"task.agentAdvisor": { task: "deepseek/deepseek-v4-flash" },
+			"task.agentPrewalk": { task: "on" },
+		});
 		const inherited = readInheritedAgentBehavior(settings);
 		expect(inherited).toEqual({ prewalk: true, advisor: "deepseek/deepseek-v4-flash" });
 
@@ -80,11 +77,9 @@ describe("tier alias derivation", () => {
 	});
 
 	test("the plugin never introduces an advisor or prewalk of its own", () => {
-		const none = readInheritedAgentBehavior({ get: () => undefined });
+		const none = readInheritedAgentBehavior(Settings.isolated());
 		expect(none).toEqual({});
-		const off = readInheritedAgentBehavior({
-			get: (key: string) => (key === "task.agentAdvisor" ? { task: "off" } : undefined),
-		});
+		const off = readInheritedAgentBehavior(Settings.isolated({ "task.agentAdvisor": { task: "off" } }));
 		expect(off).toEqual({});
 
 		const rendered = renderTierAgent(getBundledAgent("task")!, { name: DEEP_AGENT_NAME, role: "slow", description: "d" });
@@ -93,7 +88,7 @@ describe("tier alias derivation", () => {
 	});
 
 	test("the global `task.prewalk` switch also carries", () => {
-		const inherited = readInheritedAgentBehavior({ get: (key: string) => key === "task.prewalk" || undefined });
+		const inherited = readInheritedAgentBehavior(Settings.isolated({ "task.prewalk": true }));
 		expect(inherited).toEqual({ prewalk: true });
 	});
 });

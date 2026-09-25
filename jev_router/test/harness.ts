@@ -6,6 +6,7 @@
  * agent registry is the *real* one (`resetGlobalForTests` between cases) so the
  * main-session identity check under test is the production check.
  */
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -48,14 +49,12 @@ export function makeSession(options: FakeSessionOptions = {}): FakeSession {
 	let roleProvenance = options.modelRoleProvenance ?? "global";
 	const modelCalls: FakeSession["modelCalls"] = [];
 	const sessionManager = { getSessionId: () => "session-1", getBranch: () => options.branch ?? [] };
-	const settings = {
-		get(key: string): unknown {
-			if (key === "magicKeywords.enabled") return options.magicKeywords ?? true;
-			if (key === "magicKeywords.orchestrate") return options.orchestrateKeyword ?? true;
-			return undefined;
-		},
-		getModelRoleProvenance: (_role: string) => roleProvenance,
-	};
+	const settings = Settings.isolated({
+		"magicKeywords.enabled": options.magicKeywords ?? true,
+		"magicKeywords.orchestrate": options.orchestrateKeyword ?? true,
+	});
+	// Provenance tracks a mutable test knob rather than real layer state.
+	settings.getModelRoleProvenance = (_role: string) => roleProvenance;
 	const session = {
 		sessionManager,
 		settings,
