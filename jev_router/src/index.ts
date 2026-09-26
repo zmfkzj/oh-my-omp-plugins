@@ -13,6 +13,7 @@ import { AUDITOR_ROLE } from "./verification-auditor.ts";
 import { registerCommands } from "./commands.ts";
 import { TYPESAFE_PROVIDER } from "./credentials.ts";
 import { mainSessionOf, sessionOf } from "./host.ts";
+import { registerFindingTools } from "./findings.ts";
 import { JevRouterRuntime } from "./runtime.ts";
 import { GENERIC_TASK_AGENT } from "./task-routing.ts";
 import { EASY_AGENT_NAME, HARD_AGENT_NAME, CHALLENGE_AGENT_NAME } from "./deep-agent.ts";
@@ -25,6 +26,8 @@ export function registerJevRouter(pi: ExtensionAPI, packageRoot: string): JevRou
 	const runtime = new JevRouterRuntime(pi, packageRoot);
 	pi.setLabel("Jev Router");
 	registerCommands(pi, runtime);
+	runtime.reviewGate.registerCommands(pi);
+	registerFindingTools(pi);
 
 	pi.on("session_start", async (_event, ctx) => {
 		runtime.bindContext(ctx);
@@ -70,8 +73,10 @@ export function registerJevRouter(pi: ExtensionAPI, packageRoot: string): JevRou
 	// Attach the decided notice for this turn, without persisting it.
 	pi.on("context", async (event, ctx) => {
 		runtime.bindContext(ctx);
-		const messages = await runtime.orchestration.applyToContext(ctx, event.messages);
-		return messages ? { messages } : undefined;
+		const messages = await runtime.orchestration.applyToContext(ctx, event.messages) ?? event.messages;
+		const reviewed = runtime.reviewGate.applyGuidance(ctx, messages);
+		if (reviewed) return { messages: reviewed };
+		return messages !== event.messages ? { messages } : undefined;
 	});
 
 	pi.on("agent_end", (event) => {
@@ -80,16 +85,21 @@ export function registerJevRouter(pi: ExtensionAPI, packageRoot: string): JevRou
 
 	// Reconsider orchestration after a successful plan commit, never model selection.
 	pi.on("tool_result", async (event, ctx) => {
-		if (event.toolName !== "todo") return;
 		runtime.bindContext(ctx);
-		await runtime.orchestration.onTodoResult(ctx, event);
+		runtime.reviewGate.observeToolResult(ctx, event);
+		if (event.toolName === "todo") await runtime.orchestration.onTodoResult(ctx, event);
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
-		if (event.toolName !== TASK_TOOL) return undefined;
 		runtime.bindContext(ctx);
+		const blocked = runtime.reviewGate.beforeTool(ctx, event.toolName, { ...event.input });
+		if (blocked) return blocked;
+		if (event.toolName !== TASK_TOOL) return undefined;
 		return await runtime.task.route(pi, event.toolCallId, event.input);
 	});
+
+	// Shared preflight covers actual task dispatch and eval agent()/workpool.
+	pi.on("before_subagent_spawn", (event, ctx) => runtime.reviewGate.beforeSpawn(ctx, event));
 
 	// A rotated or rejected key must not be reused from the short-lived cache.
 	pi.on("credential_disabled", event => {
@@ -101,7 +111,7 @@ export function registerJevRouter(pi: ExtensionAPI, packageRoot: string): JevRou
 		await runtime.telemetry.flush();
 	});
 	// Run after our context hook so new orchestration notices get review guidance immediately.
-	registerOrcheAdvisor(pi);
+	registerOrcheAdvisor(pi, runtime.reviewGate);
 
 	return runtime;
 }

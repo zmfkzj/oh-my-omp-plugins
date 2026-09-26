@@ -1,5 +1,7 @@
-import { describe, expect, test } from "bun:test";
-import { clip, gate, orchestrationState } from "../src/jev.ts";
+import { afterEach, describe, expect, test } from "bun:test";
+import type { Server } from "bun";
+import { clip, gate, JevEngine, orchestrationState } from "../src/jev.ts";
+import type { RoutingContext } from "../src/jev.ts";
 
 describe("confidence gate", () => {
 	test("accepts a decision only when confidence and margin both clear", () => {
@@ -56,5 +58,81 @@ describe("input bounding", () => {
 		expect(state.plan).toContain("p");
 		expect(state.recent_messages.map(item => item.role)).toEqual(["user", "assistant"]);
 		expect(clip("oversized", 0)).toBe("");
+	});
+});
+
+describe("front-door classifier request", () => {
+	const savedBaseUrl = process.env.TYPESAFE_BASE_URL;
+	let server: Server<undefined> | undefined;
+	afterEach(() => {
+		server?.stop(true);
+		server = undefined;
+		if (savedBaseUrl === undefined) delete process.env.TYPESAFE_BASE_URL;
+		else process.env.TYPESAFE_BASE_URL = savedBaseUrl;
+	});
+
+	/** The path and JSON body the SDK sent: named questions over one state. */
+	interface RecordedRequest {
+		path: string;
+		body: { state: unknown; questions: Record<string, { type: string; criteria: Record<string, unknown> }> };
+	}
+
+	/** A local TypeSafe endpoint that records each request and answers with `answers`. */
+	function serve(answers: Record<string, unknown>): RecordedRequest[] {
+		const requests: RecordedRequest[] = [];
+		server?.stop(true);
+		server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				const body = (await request.json()) as RecordedRequest["body"];
+				requests.push({ path: new URL(request.url).pathname, body });
+				return Response.json({ model: "jev-test", answers, usage: { input_tokens: 1, output_tokens: 1 } });
+			},
+		});
+		process.env.TYPESAFE_BASE_URL = `http://127.0.0.1:${server.port}`;
+		return requests;
+	}
+
+	const context: RoutingContext = {
+		recentMessages: [{ role: "user", text: "Ship the invoice backfill once billing reads the new column." }],
+		plan: "Billing\n- Backfill invoice totals [pending]\n- Switch reads to the new column [pending]",
+	};
+	const options = { apiKey: "ts_test_key_0123456789", model: "", timeoutMs: 5000 };
+	const gates = { minConfidence: 0.6, minMargin: 0.2 };
+	const route = { type: "choice", choice: "DEFAULT", confidence: 0.9, probabilities: { DEFAULT: 0.9, ORCHESTRATE: 0.1 } };
+
+	test("one request asks separate route and review questions over the same bounded state", async () => {
+		const requests = serve({
+			route,
+			review: { type: "choice", choice: "REQUIRED", confidence: 0.85, probabilities: { REQUIRED: 0.85, OPTIONAL: 0.15 } },
+		});
+		const decision = await new JevEngine().decideOrchestration("Go ahead.", context, options, gates, 600);
+		expect(requests).toHaveLength(1);
+		const { path, body } = requests[0]!;
+		expect(path).toBe("/v1/systemone");
+		const questions = Object.fromEntries(Object.entries(body.questions).map(([name, question]) =>
+			[name, { type: question.type, labels: Object.keys(question.criteria).sort() }]));
+		expect(questions).toEqual({
+			route: { type: "choice", labels: ["DEFAULT", "ORCHESTRATE"] },
+			review: { type: "choice", labels: ["OPTIONAL", "REQUIRED"] },
+		});
+		expect(body.state).toEqual(orchestrationState("Go ahead.", context, 600));
+		expect(decision).toMatchObject({ top: "DEFAULT", confident: true, review: { top: "REQUIRED", confident: true } });
+	});
+
+	test("a missing, malformed or split review answer never counts as a confident answer and keeps the route", async () => {
+		for (const [review, top, missing] of [
+			[undefined, "REQUIRED", true],
+			[{ type: "score", score: 1, confidence: 0.9, probabilities: { 0: 0.1, 1: 0.9 } }, "REQUIRED", true],
+			[{ type: "choice", choice: "OPTIONAL", confidence: 0.9 }, "REQUIRED", true],
+			[{ type: "choice", choice: "OPTIONAL", confidence: 0.55, probabilities: { OPTIONAL: 0.55, REQUIRED: 0.45 } }, "OPTIONAL", false],
+		] as const) {
+			serve(review ? { route, review } : { route });
+			const decision = await new JevEngine().decideOrchestration("Go ahead.", context, options, gates, 600);
+			expect(decision).toMatchObject({ top: "DEFAULT", confident: true, review: { top, confident: false } });
+			// The router reports an empty distribution as a missing answer.
+			expect(Object.keys(decision.review.probabilities).length === 0).toBe(missing);
+		}
 	});
 });

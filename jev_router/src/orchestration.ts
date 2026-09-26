@@ -1,7 +1,14 @@
 /**
- * Front-door routing chooses only whether to attach native orchestration guidance.
+ * Front-door routing chooses whether to attach native orchestration guidance and,
+ * independently, whether the turn's plan requires checkpoint review. Review is
+ * assessed even when orchestration is unavailable; only the guidance is withheld.
  * A successful todo init/append can promote a direct turn after its committed
- * plan reveals independent work; provider context notices are never persisted.
+ * plan reveals independent work. Once a turn is orchestrated its route is final,
+ * so a changed plan requires review without another Jev request. Once a turn
+ * requires review, each newly finished phase requires a phase-boundary review.
+ * Without a risk assessment (no credential, failed request) review is required.
+ * Provider context notices are never persisted; review requirements leave through
+ * `onReviewDecision`, and the primary model never changes.
  */
 import { renderOrchestrateNotice } from "@oh-my-pi/pi-coding-agent/modes/magic-keywords";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
@@ -10,7 +17,13 @@ import type { ToolResultEvent } from "@oh-my-pi/pi-coding-agent/extensibility/ex
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import type { JevRouterConfig } from "./config.ts";
 import { mainSessionOf, orchestrateKeywordEnabled } from "./host.ts";
-import type { JevDecider, OrchestrationRoute } from "./jev.ts";
+import type {
+	GateOutcome,
+	JevDecider,
+	OrchestrationDecision,
+	OrchestrationRoute,
+	ReviewRequirement,
+} from "./jev.ts";
 import type { RouteLogger } from "./logging.ts";
 import { buildRoutingContext, formatTodoPlan, isTodoPlan, latestCommittedTodoPlan, visibleText } from "./routing-context.ts";
 import type { Telemetry } from "./telemetry.ts";
@@ -20,11 +33,18 @@ export const ORCHESTRATE_NOTICE_TYPE = "orchestrate-notice";
 
 export type OrchestrationOutcome = OrchestrationRoute | "SKIP" | "ERROR";
 
+/** The point in a turn a review requirement applies to. */
+export type ReviewCheckpoint = "initial-plan" | "scope-expansion" | "phase-boundary";
+
 export interface OrchestrationRecord {
 	outcome: OrchestrationOutcome;
 	confidence?: number;
 	margin?: number;
 	reason?: string;
+	/** Whether this decision requires checkpoint review; absent when the front door skipped the turn. */
+	reviewRequired?: boolean;
+	/** The independent review answer, when Jev returned a decision. */
+	review?: GateOutcome<ReviewRequirement>;
 	at: number;
 }
 
@@ -70,7 +90,36 @@ export function noticeInsertIndex(messages: readonly AgentMessage[], todoToolCal
 	return userIndex < 0 ? messages.length : userIndex;
 }
 
-type Gate = { ok: true; session: AgentSession } | { ok: false; reason: string };
+/** Every task closed and at least one completed; a wholly abandoned phase is dropped scope, not a boundary. */
+function phaseFinished(phase: TodoPhase): boolean {
+	return phase.tasks.some(task => task.status === "completed") &&
+		phase.tasks.every(task => task.status === "completed" || task.status === "abandoned");
+}
+
+/**
+ * Match the assistant's actual todo call to this user's turn. A late result
+ * from a prior turn must not act on the next request, even in one session.
+ */
+function turnOwnsTodoCall(session: AgentSession, prompt: string, toolCallId: string): boolean {
+	const branch = session.sessionManager.getBranch();
+	let userIndex = branch.length - 1;
+	while (userIndex >= 0) {
+		const entry = branch[userIndex];
+		if (entry?.type === "message" && entry.message.role === "user") break;
+		userIndex--;
+	}
+	const currentUser = branch[userIndex];
+	if (currentUser?.type !== "message" || currentUser.message.role !== "user" ||
+		visibleText(currentUser.message.content) !== prompt.trim()) return false;
+	return branch.slice(userIndex + 1).some(entry => entry.type === "message" &&
+		entry.message.role === "assistant" && entry.message.content.some(part =>
+			part.type === "toolCall" && part.id === toolCallId && part.name === "todo"));
+}
+
+/** A gated-in request always has its review assessed; `orchestrationAllowed` only governs guidance. */
+type Gate =
+	| { ok: true; session: AgentSession; orchestrationAllowed: boolean; reason?: string }
+	| { ok: false; reason: string };
 
 /** Everything that can be decided from the prompt alone, before any network work. */
 export function gateRequest(ctx: ExtensionContext, prompt: string, config: JevRouterConfig): Gate {
@@ -95,10 +144,15 @@ export function gateRequest(ctx: ExtensionContext, prompt: string, config: JevRo
 			: !taskAvailable
 				? "task-tool-unavailable"
 				: "orchestrate-keyword-disabled";
-		return { ok: false, reason };
+		return { ok: true, session, orchestrationAllowed, reason };
 	}
-	return { ok: true, session };
+	return { ok: true, session, orchestrationAllowed };
 }
+
+/** A Jev decision, or why none exists; a missing assessment never makes review optional. */
+type Classification =
+	| { ok: true; decision: OrchestrationDecision }
+	| { ok: false; reason: "credential-missing" | "classification-timeout" | "classification-error" };
 
 export interface OrchestrationRouterDeps {
 	engine: JevDecider;
@@ -106,16 +160,37 @@ export interface OrchestrationRouterDeps {
 	telemetry: Telemetry;
 	credential: () => Promise<string | undefined>;
 	config: () => JevRouterConfig;
+	/**
+	 * Receives each accepted review requirement of the current main-session turn.
+	 * A missing credential or failed classification requires review. A turn the
+	 * front-door gate skips (router disabled, subagent, slash, synthetic or empty
+	 * prompt, plan mode) reports nothing; unavailable orchestration still reports.
+	 * A throwing handler fails the hook that triggered it. `request` is that turn's
+	 * prompt: `before_agent_start` runs before the user message is persisted, so
+	 * the branch cannot identify the request yet.
+	 */
+	onReviewDecision?: (
+		ctx: ExtensionContext,
+		required: boolean,
+		checkpoint: ReviewCheckpoint,
+		reason: string,
+		request: string,
+	) => void;
 }
 
 interface TurnState {
 	prompt: string;
 	session: AgentSession;
+	/** OMP's own orchestrate notice precedes this turn's user message. */
 	explicitLogged: boolean;
 	notice?: AgentMessage;
 	noticeAnchor?: string;
 	pending?: Promise<void>;
 	seenPlans: Set<string>;
+	/** The latest committed plan this turn has seen; finished phases are measured against it. */
+	phases: readonly TodoPhase[];
+	/** Some requirement reported this turn was required; each later finished phase then needs review. */
+	reviewRequired: boolean;
 }
 
 export class OrchestrationRouter {
@@ -148,10 +223,13 @@ export class OrchestrationRouter {
 		const turn: TurnState = {
 			prompt, session: gate.session,
 			explicitLogged: false, seenPlans: new Set(priorPlan ? [JSON.stringify(priorPlan)] : []),
+			phases: priorPlan ?? [], reviewRequired: false,
 		};
 		this.#turn = turn;
-		turn.pending = this.#decide(ctx, turn);
-		await turn.pending;
+		const decided = this.#decide(ctx, turn, "initial-plan");
+		// A failing review handler rejects this caller; later steps of the turn still run.
+		turn.pending = decided.catch(() => undefined);
+		await decided;
 	}
 
 	/** Called when the agent loop settles: never change the user's chosen model. */
@@ -159,41 +237,45 @@ export class OrchestrationRouter {
 		this.#turn = undefined;
 	}
 
-	/** Reconsider only successful committed plan creation/expansion, once per new plan. */
+	/**
+	 * Act only on successful committed results of this turn's own todo calls. A new
+	 * plan from init/append is reclassified, or requires review outright once the
+	 * turn is orchestrated. Any other change that newly finishes a phase requires a
+	 * phase-boundary review once the turn requires review. Neither an unchanged
+	 * plan nor each done counts.
+	 */
 	async onTodoResult(ctx: ExtensionContext, event: ToolResultEvent): Promise<void> {
 		const turn = this.#turn;
-		if (!turn || turn.notice || turn.explicitLogged || turn.session !== mainSessionOf(ctx) ||
+		if (!turn || turn.session !== mainSessionOf(ctx) ||
 			!gateRequest(ctx, turn.prompt, this.#deps.config()).ok ||
-			event.toolName !== "todo" || event.isError ||
-			(event.input.op !== "init" && event.input.op !== "append")) return;
+			event.toolName !== "todo" || event.isError) return;
 		const details = event.details as { op?: unknown; phases?: unknown } | undefined;
-		if (details?.op !== event.input.op || !isTodoPlan(details.phases)) return;
-		const branch = turn.session.sessionManager.getBranch();
-		// Match the assistant's actual tool call to this user's turn. A late result
-		// from a prior turn must not promote the next request, even in one session.
-		let userIndex = branch.length - 1;
-		while (userIndex >= 0) {
-			const entry = branch[userIndex];
-			if (entry?.type === "message" && entry.message.role === "user") break;
-			userIndex--;
-		}
-		const currentUser = branch[userIndex];
-		if (currentUser?.type !== "message" || currentUser.message.role !== "user" ||
-			visibleText(currentUser.message.content) !== turn.prompt.trim()) return;
-		const hasCall = branch.slice(userIndex + 1).some(entry => entry.type === "message" &&
-			entry.message.role === "assistant" && entry.message.content.some(part =>
-				part.type === "toolCall" && part.id === event.toolCallId && part.name === "todo"));
-		if (!hasCall) return;
-		const phases = details.phases as TodoPhase[];
-		const fingerprint = JSON.stringify(phases);
-		if (turn.seenPlans.has(fingerprint)) return;
-		turn.seenPlans.add(fingerprint);
-		turn.pending = (turn.pending ?? Promise.resolve()).then(async () => {
-			if (this.#turn !== turn || turn.notice || turn.explicitLogged ||
-				!gateRequest(ctx, turn.prompt, this.#deps.config()).ok) return;
-			await this.#decide(ctx, turn, phases, event.toolCallId);
+		const op = details?.op;
+		const phases = details?.phases;
+		if (typeof op !== "string" || op === "view" || op !== event.input.op || !isTodoPlan(phases) ||
+			!turnOwnsTodoCall(turn.session, turn.prompt, event.toolCallId)) return;
+		const previous = turn.phases;
+		turn.phases = phases;
+		let step: () => Promise<void> | void;
+		if (op === "init" || op === "append") {
+			const fingerprint = JSON.stringify(phases);
+			if (turn.seenPlans.has(fingerprint)) return;
+			turn.seenPlans.add(fingerprint);
+			const checkpoint: ReviewCheckpoint = op === "init" ? "initial-plan" : "scope-expansion";
+			step = () => this.#decide(ctx, turn, checkpoint, phases, event.toolCallId);
+		} else if (phases.some(phase => phaseFinished(phase) &&
+			!previous.some(prior => prior.name === phase.name && phaseFinished(prior)))) {
+			// Each done is not a checkpoint; only a newly finished phase is, once review is required.
+			step = () => {
+				if (turn.reviewRequired) this.#notify(ctx, turn, true, "phase-boundary", "phase-completed");
+			};
+		} else return;
+		const run = (turn.pending ?? Promise.resolve()).then(async () => {
+			if (this.#turn !== turn || !gateRequest(ctx, turn.prompt, this.#deps.config()).ok) return;
+			await step();
 		});
-		await turn.pending;
+		turn.pending = run.catch(() => undefined);
+		await run;
 	}
 
 	/** Attach the turn's decided notice to each provider request, if needed. */
@@ -206,6 +288,7 @@ export class OrchestrationRouter {
 			if (!turn.explicitLogged) {
 				this.#deps.logger.route("jev.orchestration", { route: "SKIP", reason: "explicit-orchestrate" });
 				turn.explicitLogged = true;
+				this.#notify(ctx, turn, true, "initial-plan", "explicit-orchestrate");
 			}
 			return undefined;
 		}
@@ -217,17 +300,86 @@ export class OrchestrationRouter {
 		return next;
 	}
 
-	async #decide(ctx: ExtensionContext, turn: TurnState, phases?: readonly TodoPhase[], todoToolCallId?: string): Promise<void> {
+	async #decide(
+		ctx: ExtensionContext,
+		turn: TurnState,
+		checkpoint: ReviewCheckpoint,
+		phases?: readonly TodoPhase[],
+		todoToolCallId?: string,
+	): Promise<void> {
 		if (this.#turn !== turn) return;
-		const config = this.#deps.config();
-		const apiKey = await this.#deps.credential();
+		// An orchestrated route is final for the turn, so Jev cannot change its review requirement.
+		const result = turn.notice || turn.explicitLogged ? undefined : await this.#classify(turn, phases);
 		if (this.#turn !== turn) return;
-		if (!apiKey) {
-			this.#deps.logger.route("jev.orchestration", { route: "SKIP", reason: "credential-missing" });
-			this.#last = { outcome: "SKIP", reason: "credential-missing", at: Date.now() };
+		const gate = gateRequest(ctx, turn.prompt, this.#deps.config());
+		if (!gate.ok) return;
+		if (turn.notice || turn.explicitLogged) {
+			// Also covers native guidance that arrived while Jev was deciding.
+			this.#notify(ctx, turn, true, checkpoint, turn.explicitLogged ? "explicit-orchestrate" : "orchestrate");
 			return;
 		}
+		if (!result) return;
+		if (!result.ok) {
+			// A missing risk assessment is not evidence that review is optional.
+			this.#notify(ctx, turn, true, checkpoint, result.reason);
+			return;
+		}
+		const { decision } = result;
+		// Unavailable orchestration withholds only the route; review is still assessed.
+		const outcome: OrchestrationRoute = decision.confident && gate.orchestrationAllowed ? decision.top : "DEFAULT";
+		// A missing or unconfident review answer requires review.
+		const reviewReason = Object.keys(decision.review.probabilities).length === 0
+			? "review-missing"
+			: !decision.review.confident
+				? "review-uncertain"
+				: decision.review.top === "REQUIRED" ? "review-required" : "review-optional";
+		const reviewRequired = outcome === "ORCHESTRATE" || reviewReason !== "review-optional";
+		this.#deps.telemetry.recordOrchestration(outcome, decision.confidence, decision.margin, decision.latencyMs);
+		this.#deps.telemetry.appendDecision({
+			kind: "orchestration",
+			route: outcome,
+			top: decision.top,
+			probabilities: decision.probabilities,
+			confidence: decision.confidence,
+			margin: decision.margin,
+			confident: decision.confident,
+			latencyMs: decision.latencyMs,
+			reviewRequired,
+			review: decision.review,
+		});
+		this.#deps.logger.route("jev.orchestration", {
+			route: outcome,
+			confidence: decision.confidence,
+			margin: decision.margin,
+			latencyMs: decision.latencyMs,
+			reason: gate.reason ? `${reviewReason} ${gate.reason}` : reviewReason,
+		});
+		this.#last = {
+			outcome,
+			confidence: decision.confidence,
+			margin: decision.margin,
+			...(gate.reason ? { reason: gate.reason } : {}),
+			reviewRequired,
+			review: decision.review,
+			at: Date.now(),
+		};
+		if (outcome === "ORCHESTRATE") {
+			turn.notice = this.#buildNotice(turn.session);
+			turn.noticeAnchor = todoToolCallId;
+		}
+		this.#notify(ctx, turn, reviewRequired, checkpoint, outcome === "ORCHESTRATE" ? "orchestrate" : reviewReason);
+	}
 
+	/** One bounded Jev request; failures are recorded here. Undefined once the turn is superseded. */
+	async #classify(turn: TurnState, phases?: readonly TodoPhase[]): Promise<Classification | undefined> {
+		const config = this.#deps.config();
+		const apiKey = await this.#deps.credential();
+		if (this.#turn !== turn) return undefined;
+		if (!apiKey) {
+			this.#deps.logger.route("jev.orchestration", { route: "SKIP", reason: "credential-missing" });
+			this.#last = { outcome: "SKIP", reason: "credential-missing", reviewRequired: true, at: Date.now() };
+			return { ok: false, reason: "credential-missing" };
+		}
 		try {
 			const context = buildRoutingContext(turn.session.sessionManager.getBranch(), turn.prompt);
 			if (phases) context.plan = formatTodoPlan(phases);
@@ -238,40 +390,23 @@ export class OrchestrationRouter {
 				{ minConfidence: config.orchestrationMinConfidence, minMargin: config.orchestrationMinMargin },
 				config.maxRoutingInputChars,
 			);
-			if (this.#turn !== turn || (phases && (turn.explicitLogged ||
-				!gateRequest(ctx, turn.prompt, this.#deps.config()).ok))) return;
-			const outcome: OrchestrationRoute = decision.confident ? decision.top : "DEFAULT";
-			this.#deps.telemetry.recordOrchestration(outcome, decision.confidence, decision.margin, decision.latencyMs);
-			this.#deps.telemetry.appendDecision({
-				kind: "orchestration",
-				route: outcome,
-				top: decision.top,
-				probabilities: decision.probabilities,
-				confidence: decision.confidence,
-				margin: decision.margin,
-				confident: decision.confident,
-				latencyMs: decision.latencyMs,
-			});
-			this.#deps.logger.route("jev.orchestration", {
-				route: outcome,
-				confidence: decision.confidence,
-				margin: decision.margin,
-				latencyMs: decision.latencyMs,
-			});
-			this.#last = { outcome, confidence: decision.confidence, margin: decision.margin, at: Date.now() };
-			if (outcome === "ORCHESTRATE") {
-				turn.notice = this.#buildNotice(turn.session);
-				turn.noticeAnchor = todoToolCallId;
-			}
+			return { ok: true, decision };
 		} catch (error) {
-			if (this.#turn !== turn) return;
+			if (this.#turn !== turn) return undefined;
 			const reason = this.#deps.logger.describeError(error);
 			const timedOut = /timeout|abort/i.test(reason);
 			this.#deps.telemetry.recordFailure("orchestration", timedOut);
 			this.#deps.telemetry.appendDecision({ kind: "orchestration", route: "ERROR", timedOut });
 			this.#deps.logger.route("jev.orchestration", { route: "ERROR", reason });
-			this.#last = { outcome: "ERROR", reason, at: Date.now() };
+			this.#last = { outcome: "ERROR", reason, reviewRequired: true, at: Date.now() };
+			return { ok: false, reason: timedOut ? "classification-timeout" : "classification-error" };
 		}
+	}
+
+	/** Handler failures propagate: an unrecorded requirement fails its hook rather than passing as reviewed. */
+	#notify(ctx: ExtensionContext, turn: TurnState, required: boolean, checkpoint: ReviewCheckpoint, reason: string): void {
+		if (required) turn.reviewRequired = true;
+		this.#deps.onReviewDecision?.(ctx, required, checkpoint, reason, turn.prompt);
 	}
 
 	#buildNotice(session: AgentSession): AgentMessage {

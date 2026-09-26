@@ -25,6 +25,7 @@ import { RouteLogger } from "./logging.ts";
 import { OrchestrationRouter } from "./orchestration.ts";
 import { GENERIC_TASK_AGENT, TaskRouter } from "./task-routing.ts";
 import { Telemetry } from "./telemetry.ts";
+import { ReviewGate } from "./review-gate.ts";
 
 /** Re-resolve the credential at most this often; setup and 401s invalidate early. */
 const CREDENTIAL_TTL_MS = 60_000;
@@ -51,6 +52,7 @@ export class JevRouterRuntime {
 	readonly engine = new JevEngine();
 	readonly orchestration: OrchestrationRouter;
 	readonly task: TaskRouter;
+	readonly reviewGate: ReviewGate;
 	readonly packageRoot: string;
 	readonly stateDir: string;
 
@@ -76,7 +78,12 @@ export class JevRouterRuntime {
 			credential: () => this.apiKey(),
 			config: () => this.#config,
 		};
-		this.orchestration = new OrchestrationRouter(deps);
+		this.reviewGate = new ReviewGate(() => this.#config.enabled);
+		this.orchestration = new OrchestrationRouter({
+			...deps,
+			onReviewDecision: (ctx, required, checkpoint, reason, request) =>
+				this.reviewGate.noteDecision(ctx, required, checkpoint, reason, request),
+		});
 		this.task = new TaskRouter({
 			...deps,
 			genericTaskIsBundled: () => this.#survey.genericTaskIsBundled,

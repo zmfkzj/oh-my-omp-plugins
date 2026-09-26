@@ -1,16 +1,16 @@
 # omp-jev-router
 
-Two bounded routing decisions for [OMP](https://omp.sh), made by TypeSafe's
+Two bounded decision calls for [OMP](https://omp.sh), made by TypeSafe's
 [Jev](https://typesafe.ai) System One model:
 
 1. **Orchestration** — choose DEFAULT or OMP's native ORCHESTRATE contract.
-   The primary model stays fixed, including on uncertainty and errors.
+   An independent review-risk question runs in the same call. The primary model stays fixed.
 2. **TASK tier** — route generic `task` workers through `@task_easy`,
    `@task_hard`, or `@task_challenge`.
 
 OMP's own SMOL/TASK decision and explicit agent choices are preserved. This package
 also provides an explicit `orche_advisor` checkpoint-review tool and a passive
-Verification Auditor; neither is a third routing decision.
+Verification Auditor. Actual review execution is separate from Jev classification.
 
 ---
 
@@ -23,6 +23,8 @@ USER → Jev (bounded dialogue + committed plan)
   uncertain   → DEFAULT, no model switch
 
 Successful todo init/append → reconsider changed plan → optionally promote to ORCHESTRATE
+Independent review REQUIRED → scope-bound gate → successful review or explicit user waiver
+Multiple implementation workers → pre-dispatch gate even when route is DEFAULT
 
 Primary → OMP's native SMOL/TASK choice
   SMOL → untouched
@@ -38,41 +40,106 @@ reuse the decision. Jev sees the current request, recent visible user/assistant
 messages, the earliest user goal still on the active branch, and the latest
 committed todo plan. It never receives hidden thinking or raw tool-result bodies.
 
-- **DEFAULT** adds no notice and does not prohibit ordinary delegation.
+- **DEFAULT** permits direct work or ordinary delegation; it does not mean review is optional.
 - **ORCHESTRATE** injects OMP's hidden, user-attributed `orchestrate-notice`.
-- **Below gate or routing error** leaves the primary model and native behavior alone.
+- In the **same Jev request**, an independent REQUIRED/OPTIONAL question assesses
+  review risk: release gates, persistent data, compensation/payment/security,
+  material redesign or scope expansion, and repeated failures. Ambiguous/missing
+  review answers and unavailable classification require review before execution.
+  Neither decision changes the primary model.
 
 A successful `todo init` or `todo append` reconsiders a changed committed plan.
-Failed writes, `view`, status-only operations, repeated identical plans, and
-already-orchestrated turns do not cause another classification. Late results
-from a previous turn cannot promote the current turn. No planner agent is spawned.
+Already-orchestrated turns renew the review requirement without another routing
+call. A newly completed phase renews review for required-review turns, including
+DEFAULT; ordinary task completion does not. Failed writes, views, identical
+plans and late prior-turn results do not trigger spurious transitions.
 
 Initial notices stay before the current user message. A todo-triggered notice is
 anchored after that result's contiguous tool-result group, preserving the earlier prefix.
 The advisor hook then adds required review guidance on the same provider request.
-This does **not** block a `task` dispatched alongside `todo` in the same model
-response; guidance applies to the next provider request, not already-running work.
+The mandatory review gate independently blocks unreviewed implementation and
+dispatch, including a worker batch submitted alongside todo. It cannot undo an
+operation already started before a new requirement existed.
 
 Existing native keyword notices are not duplicated. Injected notices live only
 in provider context, not in the transcript. Subagents, plan mode, slash commands,
-synthetic notices, or disabled orchestration/task/keyword support skip routing.
+synthetic notices and the master disable switch skip classification.
+Disabling orchestration, its keyword or the task tool suppresses the parallel
+route only: inline work still receives the independent review assessment.
 There is no primary model switch or end-of-turn model restoration path.
 
 ### Checkpoint reviewer and Verification Auditor
 
-The primary may call `orche_advisor` for a bounded orchestration review. Native
-`orchestrate` notices require initial-plan and verified phase-boundary reviews;
-ordinary requests keep them optional. Reviews are tool-less, use only seven
-snapshot fields plus automatically attached Verification Auditor findings, and
-are charged to `modelRoles.orche-advisor`. Configure that role explicitly; there
-is no fallback to DEFAULT or SLOW. Repeating a snapshot without new findings
-reuses the earlier review.
+`orche_advisor` reviews orchestration, not source code. It is primary-only and
+uses `modelRoles.orche-advisor` without falling back to the primary's model.
+Native orchestrate checkpoints and independent risk decisions require it.
+Otherwise routine work can still use an optional review.
 
-Finding collection reads persisted `custom_message` advisor entries on the active
-branch, not provider-message shapes. Only the owned auditor's concern/blocker
-notes since the last successful review are admitted; existing caps retain at most
-three findings, prioritizing blockers. New admitted findings invalidate snapshot
-reuse. Failed reviews do not close the finding window.
+### Review before execution
+
+- A batch with two or more implementation workers requires a review before any
+  of those workers starts. Named `scout`/`librarian` read-only discovery is exempt.
+- A required-review scope blocks inline mutation and arbitrary execution too:
+  edit/write/bash/eval and unknown tools are blocked. Native read/search, todo,
+  ask, finding management and the reviewer remain available for scoping.
+- The shared `before_subagent_spawn` hook checks task and eval `agent()`/workpool
+  dispatches before artifact allocation/child execution. An ordinary single
+  worker cleared by the task preflight receives one native spawn permit.
+- Programmatic implementation spawns require review. The eval hook binds the
+  caller's recorded eval arguments, spawn identity and model patterns; the host
+  event does not expose its expanded assignment or mutable kernel state. Use
+  stable names on retries, and prefer native `task` when exact assignment-level
+  scope binding is required. This is a coordination policy, not a sandbox.
+- Two matching execution errors within the current request require a
+  repeated-failure review, once per problem rather than on every failed retry.
+
+To avoid a blocked staging attempt, pass an optional top-level `dispatch` to
+`orche_advisor` containing the exact planned task input (`context`/`tasks`, or
+a flat `task`). The tool binds and separately summarizes that scope, reviews it,
+then the caller submits the unchanged task input. Otherwise the first task
+attempt is blocked before execution and stages its scope for review. One review
+can cover initial planning and fan-out; do not review every worker completion.
+
+Receipts are persisted on the active session branch and bind the user request,
+semantic todo plan, blockers/abandonments, phase generation, exact native dispatch
+and finding revision. Routine in-progress/completed status changes alone do not
+invalidate a receipt. A new phase, changed contract or evidence does. Reload and
+branch rewind cannot turn a stale review into permission; a finding arriving
+during review leaves the changed scope blocked. Unchanged unresolved findings
+do not force infinite rereviews.
+
+Failure is not permission. After a failed review, an unchanged scope cannot make
+another paid review automatically. The user can authorize one new attempt with
+`/review-retry <scope-key> <reason>` or waive review with
+`/review-waive <scope-key> <reason>`. `/review-status` shows the current full key.
+These slash commands are not model-callable tools. A waiver covers only that
+scope and never resolves findings or claims verification passed.
+
+### Durable finding ledger
+
+`review_findings` exposes `list`, `resolve`, `waive`, and `reopen`. Each finding
+has a stable ID, original advisor entry, timestamp, current status, and the
+actual user message identifying its scope. Only the owned auditor's concern and
+blocker notes are admitted; repeated equivalent notes in the same scope merge.
+Neither age nor a successful review resolves or deletes a finding.
+
+- `resolve` needs a reason and IDs of later successful tool results or actual
+  user messages on this branch. Assistant claims, failed results, review verdicts
+  and ledger listings cannot serve as resolution evidence.
+- Resolutions are explicitly **orchestrator-reported**, not proof. The original
+  note and bounded evidence excerpts stay visible to the reviewer.
+- `waive` requires explicit user confirmation. `reopen` records a renewed concern.
+  A renewed auditor objection after a reported resolution opens a new finding.
+- New findings and valid lifecycle changes invalidate receipts/cache reuse.
+  Exact repeated notes, unrelated messages and nits do not.
+
+The reviewer receives up to five unresolved findings in detail, reserving space
+for the two newest, plus up to three recent resolutions/waivers with evidence.
+Older or excess findings remain in the ledger and are represented by omission
+counts and bounded ID lists, not silently treated as resolved. Use `list` with
+`findingId` to inspect any omitted item. An auditor's account of a user
+instruction is not itself a direct user instruction; scope and evidence must be
+weighed before superseding restrictions.
 
 The bundled Verification Auditor runs through OMP's WATCHDOG roster only while
 advisors are enabled. Its model is `@verification-auditor`, a custom role
@@ -206,6 +273,9 @@ plugin leaves your account credential exactly where you put it.
 | `/jev-router test` | Live DEFAULT/ORCHESTRATE and three-tier classification probes. |
 | `/jev-router stats` | Aggregated counts, latencies, distributions, worker cost. |
 | `/jev-router reset` | Clear telemetry and stored configuration. |
+| `/review-status` | Current required-review scope, receipt and failure state. |
+| `/review-retry <key> <reason>` | User-authorized new attempt after a failed review. |
+| `/review-waive <key> <reason>` | Explicit user waiver for exactly that scope. |
 
 `status` output:
 
@@ -309,6 +379,11 @@ thinking, or complete transcripts. Visible dialogue/plan text can itself contain
 user-provided sensitive material; expanded context is sent to TypeSafe.
 It is not copied to telemetry. No scout/summarizer agent is launched for routing.
 
+The checkpoint reviewer additionally receives plugin-owned execution-scope
+metadata and bounded excerpts from explicitly cited finding-resolution evidence.
+It never receives the whole transcript. Inspect evidence IDs before citing
+outputs containing sensitive data.
+
 Credentials never touch the repository, the project directory, the plugin source
 tree, or any log. Debug lines carry route labels and numbers only; error text is
 scrubbed of any tracked credential and of key-shaped tokens before it is written.
@@ -330,8 +405,9 @@ Local data only — no prompt text, no task text, no source, no transcript — u
 
 `decisions.jsonl` has one line per Jev decision: `kind`, applied `route`, the
 pre-gate `top` label, per-label `probabilities`, `confidence`, `margin`,
-`confident`, latency, and TASK batch size (errors log `route: "ERROR"` and
-`timedOut`). Primary model actions are no longer emitted. For decisions with probabilities,
+`confident`, latency, and TASK batch size. Orchestration rows also carry
+`reviewRequired` and the independent `review` distribution. Errors log
+`route: "ERROR"` and `timedOut`; no primary model action is emitted. For decisions with probabilities,
 the pre-gate label and distribution let a different confidence/margin gate be
 replayed exactly offline — the buckets cannot resolve a threshold inside a
 bucket. Errors and missing answers carry no distribution. The log records what

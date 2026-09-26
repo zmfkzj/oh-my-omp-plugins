@@ -26,7 +26,7 @@
       "enabled": {
         "type": "boolean",
         "default": true,
-        "description": "Master switch for both routers."
+        "description": "Master switch for routing and mandatory review enforcement. Manual review/finding tools remain available."
       },
       "jevModel": {
         "type": "string",
@@ -36,7 +36,7 @@
       "orchestrationRoutingEnabled": {
         "type": "boolean",
         "default": true,
-        "description": "Decide whether to activate native orchestration at request start and after a committed todo plan change; never changes the primary model."
+        "description": "Allow the ORCHESTRATE execution route. Independent risk/review assessment remains active; the primary model never changes."
       },
       "orchestrationMinConfidence": {
         "type": "number",

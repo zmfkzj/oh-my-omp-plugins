@@ -7,6 +7,7 @@ import { prepareReviewInput, ROLE, TOOL } from "../src/advisor-review.ts";
 import { registerJevRouter } from "../src/index.ts";
 import { AUDITOR_NAME, VERIFICATION_AUDITOR } from "../src/verification-auditor.ts";
 import { clearRegistry, makeSession, registerAsMain } from "./harness.ts";
+import { findingRevision } from "../src/findings.ts";
 
 afterEach(clearRegistry);
 
@@ -14,6 +15,15 @@ test("one extension registers the checkpoint tool and an independent auditor rol
   const handlers: Array<(event: unknown, ctx: ExtensionContext) => unknown> = [];
   let checkpointTool: Parameters<ExtensionAPI["registerTool"]>[0] | undefined;
   const { session, ctx } = makeSession();
+  const branch: SessionEntry[] = [];
+  Object.assign(session.sessionManager, {
+    getBranch: () => branch,
+    appendCustomEntry(customType: string, data: unknown) {
+      const id = `state-${branch.length}`;
+      branch.push({ type: "custom", id, parentId: null, timestamp: "2026-09-26T00:00:00Z", customType, data });
+      return id;
+    },
+  });
   const roles = new Map<string, string>([["advisor", "existing-advisor-model"]]);
   let flushes = 0;
   Object.assign(session.settings, {
@@ -53,31 +63,32 @@ test("one extension registers the checkpoint tool and an independent auditor rol
   expect(flushes).toBe(1);
 
   const snapshotHash = prepareReviewInput(example).snapshotHash;
-  Object.assign(session.sessionManager, { getBranch: (): SessionEntry[] => [{
+  branch.push({
     type: "message",
     message: {
       role: "toolResult",
       toolName: TOOL,
       isError: false,
-      details: { role: ROLE, snapshotHash, model: "review-model" },
+      details: { role: ROLE, snapshotHash, model: "review-model", scopeKey: runtime.reviewGate.scope(ctx).key, findingRevision: findingRevision(branch) },
       content: [{ type: "text", text: "VERDICT: KEEP" }],
     },
-  } as SessionEntry] });
+  } as SessionEntry);
   const result = await checkpointTool!.execute("review-call", example, new AbortController().signal, () => {}, ctx);
   expect(result.content).toContainEqual({ type: "text", text: "VERDICT: KEEP" });
   expect(result.details).toMatchObject({ role: ROLE, reused: true, findingsForwarded: 0 });
 
   // A persisted auditor finding must invalidate the otherwise identical cached review.
-  const prior = session.sessionManager.getBranch();
   const finding: SessionEntry = {
     type: "custom_message", id: "fresh-audit", parentId: null, timestamp: "2026-09-26T00:00:00Z",
     customType: "advisor", content: "Evidence missing", display: true,
     details: { notes: [{ advisor: AUDITOR_NAME, severity: "blocker", note: "Claimed smoke has no run output" }] },
   };
-  Object.assign(session.sessionManager, { getBranch: () => [...prior, finding] });
+  branch.push(finding);
   Object.assign(session.settings, { reloadFromDisk: async () => {} });
   Object.assign(ctx.modelRegistry, { getAvailable: () => [] });
   // No reviewer configured: attempting a new review must fail, never reuse stale KEEP.
   await expect(checkpointTool!.execute("review-call-2", example, new AbortController().signal, () => {}, ctx))
     .rejects.toThrow("Configure modelRoles.orche-advisor");
+  await expect(checkpointTool!.execute("review-call-3", example, new AbortController().signal, () => {}, ctx))
+    .rejects.toThrow("Review already failed for this exact scope");
 });

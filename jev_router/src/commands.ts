@@ -99,6 +99,7 @@ export async function renderStatus(
 				: "none this session",
 		),
 		row("Last TASK route", task ? `${task.route} ${task.confidence.toFixed(2)}` : "none this session"),
+		row("Review assessment", orchestration?.reviewRequired === undefined ? "not assessed" : orchestration.reviewRequired ? "required (see /review-status)" : "optional"),
 	);
 
 	const tiers = [easy, hard, challenge];

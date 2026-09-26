@@ -78,7 +78,8 @@ interface GateFields {
 
 /** One line of `decisions.jsonl`, minus the timestamp added on append. */
 export type DecisionRecord =
-	| (GateFields & { kind: "orchestration"; route: string; latencyMs: number })
+	| (GateFields & { kind: "orchestration"; route: string; latencyMs: number;
+		reviewRequired?: boolean; review?: GateFields })
 	| (GateFields & { kind: "task"; route: string; latencyMs: number; batchSize: number })
 	| { kind: "orchestration" | "task"; route: "ERROR"; timedOut: boolean; items?: number };
 
