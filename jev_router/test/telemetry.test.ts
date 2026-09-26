@@ -21,24 +21,24 @@ describe("telemetry aggregation", () => {
 		const dir = await tempDir();
 		const telemetry = new Telemetry(dir);
 		telemetry.recordOrchestration("DEFAULT", 0.91, 0.82, 12);
-		telemetry.recordOrchestration("SLOW", 0.88, 0.7, 14);
-		telemetry.recordOrchestration("UNCERTAIN", 0.54, 0.08, 20);
+		telemetry.recordOrchestration("ORCHESTRATE", 0.88, 0.7, 14);
+		telemetry.recordOrchestration("DEFAULT", 0.54, 0.08, 20);
 		telemetry.recordTaskBatch(9);
-		telemetry.recordTaskDecision("TASK_DEEP", 0.6, 0.2, false);
+		telemetry.recordTaskDecision("TASK_CHALLENGE", 0.6, 0.2, false);
 		telemetry.recordFailure("task", true);
-		telemetry.recordSpawn("task-deep");
-		telemetry.recordWorkerSettled("call:a", "task-deep", { tokens: 150, costUsd: 0.25, durationMs: 1500, completed: true });
+		telemetry.recordSpawn("task-challenge");
+		telemetry.recordWorkerSettled("call:a", "task-challenge", { tokens: 150, costUsd: 0.25, durationMs: 1500, completed: true });
 		await telemetry.flush();
 
 		const reloaded = new Telemetry(dir);
 		await reloaded.load();
 		const snapshot = reloaded.snapshot();
 
-		expect(snapshot.orchestration).toMatchObject({ requests: 3, DEFAULT: 1, SLOW: 1, UNCERTAIN: 1, latencySumMs: 46 });
+		expect(snapshot.orchestration).toMatchObject({ requests: 3, DEFAULT: 2, ORCHESTRATE: 1, latencySumMs: 46 });
 		expect(snapshot.orchestration.confidence[9]).toBe(1);
 		expect(snapshot.orchestration.confidence[5]).toBe(1);
-		expect(snapshot.task).toMatchObject({ batches: 1, TASK_DEEP: 1, fallbackDeep: 1, errors: 1, timeouts: 1 });
-		expect(snapshot.workers["task-deep"]).toMatchObject({ spawns: 1, results: 1, completed: 1, tokens: 150, costUsd: 0.25 });
+		expect(snapshot.task).toMatchObject({ batches: 1, TASK_CHALLENGE: 1, fallbackChallenge: 1, errors: 1, timeouts: 1 });
+		expect(snapshot.workers["task-challenge"]).toMatchObject({ spawns: 1, results: 1, completed: 1, tokens: 150, costUsd: 0.25 });
 	});
 
 	test("no prompt, task, or credential text is ever stored", async () => {
@@ -77,7 +77,7 @@ describe("telemetry aggregation", () => {
 		const telemetry = new Telemetry(dir);
 		await telemetry.load();
 
-		expect(telemetry.snapshot().orchestration).toMatchObject({ requests: 5, legacyDirect: 3, ORCHESTRATE: 1, UNCERTAIN: 1 });
+		expect(telemetry.snapshot().orchestration).toMatchObject({ requests: 5, legacyDecisions: 4, ORCHESTRATE: 1 });
 	});
 
 	test("v2 split token fields fold into tokens, excluding cacheRead", async () => {
@@ -91,6 +91,17 @@ describe("telemetry aggregation", () => {
 		await telemetry.load();
 
 		expect(telemetry.snapshot().workers["task-deep"]).toMatchObject({ spawns: 2, results: 1, tokens: 150, costUsd: 0.5 });
+	});
+
+	test("retired tier labels remain historical and migration is idempotent", () => {
+		const migrated = reviveSnapshot({
+			version: 3,
+			orchestration: { requests: 7, DEFAULT: 2, SLOW: 3, UNCERTAIN: 2 },
+			task: { TASK_NORMAL: 29, TASK_DEEP: 34, fallbackDeep: 21 },
+		});
+		expect(migrated.orchestration).toMatchObject({ DEFAULT: 2, legacyDecisions: 5 });
+		expect(migrated.task).toMatchObject({ TASK_EASY: 0, TASK_HARD: 0, TASK_CHALLENGE: 0, legacyDecisions: 63, legacyFallbacks: 21 });
+		expect(reviveSnapshot(migrated)).toEqual(migrated);
 	});
 
 	test("a snapshot from a newer plugin version is set aside, not overwritten", async () => {
@@ -111,9 +122,9 @@ describe("telemetry aggregation", () => {
 		const telemetry = new Telemetry(dir);
 		telemetry.appendDecision({
 			kind: "task",
-			route: "TASK_DEEP",
-			top: "TASK_NORMAL",
-			probabilities: { TASK_NORMAL: 0.7, TASK_DEEP: 0.3 },
+			route: "TASK_CHALLENGE",
+			top: "TASK_HARD",
+			probabilities: { TASK_HARD: 0.7, TASK_CHALLENGE: 0.2, TASK_EASY: 0.1 },
 			confidence: 0.7,
 			margin: 0.4,
 			confident: false,
@@ -124,7 +135,7 @@ describe("telemetry aggregation", () => {
 
 		const lines = (await Bun.file(telemetry.decisionsFile).text()).trim().split("\n");
 		expect(lines).toHaveLength(1);
-		expect(JSON.parse(lines[0]!)).toMatchObject({ route: "TASK_DEEP", top: "TASK_NORMAL", probabilities: { TASK_NORMAL: 0.7 } });
+		expect(JSON.parse(lines[0]!)).toMatchObject({ route: "TASK_CHALLENGE", top: "TASK_HARD", probabilities: { TASK_HARD: 0.7 } });
 	});
 
 	test("a corrupt snapshot degrades to empty counters instead of throwing", () => {
@@ -161,12 +172,12 @@ describe("telemetry aggregation", () => {
 		const subagent = Telemetry.shared(dir);
 		expect(subagent).toBe(main);
 
-		main.recordTaskDecision("TASK_NORMAL", 0.9, 0.8, true);
-		subagent.recordTaskDecision("TASK_DEEP", 0.9, 0.8, true);
+		main.recordTaskDecision("TASK_EASY", 0.9, 0.8, true);
+		subagent.recordTaskDecision("TASK_CHALLENGE", 0.9, 0.8, true);
 		await subagent.flush();
 
 		const persisted = reviveSnapshot(await Bun.file(main.file).json());
-		expect(persisted.task).toMatchObject({ TASK_NORMAL: 1, TASK_DEEP: 1 });
+		expect(persisted.task).toMatchObject({ TASK_EASY: 1, TASK_CHALLENGE: 1 });
 		Telemetry.resetSharedForTests();
 	});
 
@@ -191,19 +202,19 @@ describe("worker usage from subagent frames", () => {
 	test("a settled background spawn records its final usage once, even when seen on two buses", async () => {
 		const dir = await tempDir();
 		const telemetry = new Telemetry(dir);
-		const tiers = new Set(["task", "task-deep"]);
+		const tiers = new Set(["task", "task-challenge"]);
 		const main = new EventBus();
 		const child = new EventBus();
 		trackWorkerUsage(main, telemetry, tiers);
 		trackWorkerUsage(child, telemetry, tiers);
 
 		for (const bus of [main, child]) {
-			progress(bus, "task-deep", 0.1);
-			progress(bus, "task-deep", 0.4);
-			bus.emit(SUBAGENT_LIFECYCLE_CHANNEL, { id: "0-W", agent: "task-deep", parentToolCallId: "call-1", status: "completed" });
+			progress(bus, "task-challenge", 0.1);
+			progress(bus, "task-challenge", 0.4);
+			bus.emit(SUBAGENT_LIFECYCLE_CHANNEL, { id: "0-W", agent: "task-challenge", parentToolCallId: "call-1", status: "completed" });
 		}
 
-		expect(telemetry.snapshot().workers["task-deep"]).toMatchObject({
+		expect(telemetry.snapshot().workers["task-challenge"]).toMatchObject({
 			results: 1,
 			completed: 1,
 			tokens: 500,

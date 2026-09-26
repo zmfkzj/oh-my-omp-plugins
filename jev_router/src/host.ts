@@ -8,10 +8,7 @@
  * same check OMP's own primary-only extensions use.
  */
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import type { Model } from "@oh-my-pi/pi-ai";
-import { resolveRoleSelection } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { cfgMagicKeyword, cfgMagicKeywordsEnabled } from "@oh-my-pi/pi-coding-agent/modes/settings";
-import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 /** The live main session when `ctx` belongs to it, otherwise `undefined`. */
@@ -71,19 +68,3 @@ export function resolveRole(ctx: ExtensionContext, role: string): RoleResolution
 	return { role, alias, modelId: `${model.provider}/${model.id}`, label: `${model.provider}/${model.id}` };
 }
 
-export type RoleSelection = {
-	model: Model;
-	thinkingLevel?: ConfiguredThinkingLevel;
-};
-
-/** Resolve `role` through OMP's role selection, including a configured thinking suffix. */
-export function resolveRoleModel(ctx: ExtensionContext, role: string): RoleSelection | undefined {
-	const settings = sessionOf(ctx)?.settings;
-	if (!settings) return undefined;
-	const selection = resolveRoleSelection([role], settings, ctx.modelRegistry.getAvailable());
-	return selection && { model: selection.model, thinkingLevel: selection.thinkingLevel };
-}
-
-export function sameModel(a: Model, b: Model): boolean {
-	return a.provider === b.provider && a.id === b.id;
-}

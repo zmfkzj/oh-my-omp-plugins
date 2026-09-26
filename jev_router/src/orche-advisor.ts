@@ -101,18 +101,18 @@ export function findingsSinceLastReview(branch: readonly SessionEntry[]): Verifi
   const collected: VerificationFinding[] = [];
   for (let index = branch.length - 1; index >= 0; index--) {
     const entry = branch[index];
-    if (entry?.type !== "message") continue;
-    const message = entry.message;
-    if (
-      message.role === "toolResult" &&
-      message.toolName === TOOL &&
-      !message.isError &&
-      (message.details as { role?: string } | undefined)?.role === ROLE
-    )
-      break;
-    if (message.role === "custom" && message.customType === "advisor") {
-      const notes = (message.details as AdvisorMessageDetails | undefined)?.notes;
-      // Unshift the batch whole: notes are already ordered within one advisor message.
+    if (entry?.type === "message") {
+      const message = entry.message;
+      if (
+        message.role === "toolResult" &&
+        message.toolName === TOOL &&
+        !message.isError &&
+        (message.details as { role?: string } | undefined)?.role === ROLE
+      )
+        break;
+    } else if (entry?.type === "custom_message" && entry.customType === "advisor") {
+      const notes = (entry.details as AdvisorMessageDetails | undefined)?.notes;
+      // Persisted session entries are not provider-facing CustomMessages.
       if (Array.isArray(notes)) collected.unshift(...notes);
     }
   }

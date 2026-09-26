@@ -18,8 +18,9 @@ import {
 	requiredTierAgents,
 	type TierAgentSpec,
 } from "./deep-agent.ts";
-import { resolveRole, resolveRoleModel } from "./host.ts";
+import { resolveRole } from "./host.ts";
 import { JevEngine } from "./jev.ts";
+import { buildRoutingContext } from "./routing-context.ts";
 import { RouteLogger } from "./logging.ts";
 import { OrchestrationRouter } from "./orchestration.ts";
 import { GENERIC_TASK_AGENT, TaskRouter } from "./task-routing.ts";
@@ -74,10 +75,21 @@ export class JevRouterRuntime {
 			telemetry: this.telemetry,
 			credential: () => this.apiKey(),
 			config: () => this.#config,
-			resolveRole: resolveRoleModel,
 		};
 		this.orchestration = new OrchestrationRouter(deps);
-		this.task = new TaskRouter({ ...deps, genericTaskIsBundled: () => this.#survey.genericTaskIsBundled });
+		this.task = new TaskRouter({
+			...deps,
+			genericTaskIsBundled: () => this.#survey.genericTaskIsBundled,
+			availableTierAgents: () => new Set(this.#survey.materialized.available),
+			routingContext: () => {
+				if (!this.#ctx) return undefined;
+				const context = buildRoutingContext(this.#ctx.sessionManager.getBranch(), "");
+				return [
+					context.plan ? `Committed plan:\n${context.plan}` : "",
+					...context.recentMessages.map(message => `${message.role}: ${message.text}`),
+				].filter(Boolean).join("\n\n");
+			},
+		});
 	}
 
 	get config(): JevRouterConfig {
@@ -131,28 +143,16 @@ export class JevRouterRuntime {
 		return (await this.credential())?.key;
 	}
 
-	/**
-	 * Startup check that TASK and main-model roles resolve. Missing roles are
-	 * non-fatal, but silently collapse a tier or prevent a main-model switch.
-	 * Identical resolutions are legal and only informational. No role is written.
-	 */
+	/** Check tier roles without changing the primary model or user assignments. */
 	checkTierRoles(ctx: ExtensionContext): void {
-		const normal = resolveRole(ctx, this.#config.normalTaskRole);
-		const deep = resolveRole(ctx, this.#config.deepTaskRole);
-		const mainNormal = this.#config.mainModelRoutingEnabled ? resolveRole(ctx, this.#config.mainNormalRole) : undefined;
-		const mainDeep = this.#config.mainModelRoutingEnabled ? resolveRole(ctx, this.#config.mainDeepRole) : undefined;
-		const unresolved = [normal, deep, mainNormal, mainDeep]
-			.flatMap(role => role && !role.modelId ? [role.alias] : []);
+		const tiers = [this.#config.easyTaskRole, this.#config.hardTaskRole, this.#config.challengeTaskRole]
+			.map(role => resolveRole(ctx, role));
+		const unresolved = tiers.filter(role => !role.modelId).map(role => role.alias);
 		if (unresolved.length > 0) {
-			this.logger.warn(
-				`model role(s) ${unresolved.join(", ")} do not resolve; routing may keep the current model. See /jev-router status.`,
-			);
+			this.logger.warn(`model role(s) ${unresolved.join(", ")} do not resolve. See /jev-router status.`);
 		}
-		if (normal.modelId && normal.modelId === deep.modelId) {
-			this.logger.note(`TASK_NORMAL and TASK_DEEP both resolve to ${normal.label}; tier routing adds no cost difference`);
-		}
-		if (mainNormal?.modelId && mainNormal.modelId === mainDeep?.modelId) {
-			this.logger.note(`MAIN_DEFAULT and MAIN_SLOW both resolve to ${mainNormal.label}; main-model routing adds no cost difference`);
+		if (tiers.every(role => role.modelId) && new Set(tiers.map(role => role.modelId)).size < tiers.length) {
+			this.logger.note("Some worker tiers resolve to the same model; check role assignments for cost differentiation.");
 		}
 	}
 
@@ -169,7 +169,7 @@ export class JevRouterRuntime {
 	 */
 	async surveyAgents(cwd: string, settings?: Settings): Promise<AgentSurvey> {
 		const inherited = settings ? readInheritedAgentBehavior(settings) : {};
-		const specs = requiredTierAgents(this.#config.normalTaskRole, this.#config.deepTaskRole, inherited);
+		const specs = requiredTierAgents(this.#config.easyTaskRole, this.#config.hardTaskRole, this.#config.challengeTaskRole, inherited);
 		const key = JSON.stringify([cwd, this.packageRoot, specs]);
 		const cached = surveyCache.get(key);
 		this.#survey = await (cached ?? this.#runSurvey(cwd, specs, key));
@@ -204,7 +204,7 @@ export class JevRouterRuntime {
 			const { agents } = await discoverAgents(cwd);
 			genericTaskIsBundled = agents.find(agent => agent.name === GENERIC_TASK_AGENT)?.source === "bundled";
 			for (const spec of specs) {
-				if (agents.some(agent => agent.name === spec.name)) discoveredAliases.add(spec.name);
+				if (materialized.available.includes(spec.name) && agents.some(agent => agent.name === spec.name)) discoveredAliases.add(spec.name);
 			}
 		} catch (error) {
 			this.logger.warn(`agent discovery failed: ${this.logger.describeError(error)}`);

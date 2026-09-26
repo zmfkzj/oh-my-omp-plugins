@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
- * Ship a pre-generated `agents/task-deep.md` so a read-only install still has a
- * usable alias before the extension's first `session_start`.
+ * Ship three pre-generated tier agents so a read-only install has usable
+ * aliases before the extension's first `session_start`.
  *
  * At runtime the plugin regenerates this file from the *host* OMP's bundled
  * `task` agent, so a newer OMP self-heals the drift; this build step only
@@ -11,7 +11,7 @@ import { DEFAULT_CONFIG } from "../src/config.ts";
 import { materializeTierAgents, requiredTierAgents } from "../src/deep-agent.ts";
 
 const packageRoot = new URL("..", import.meta.url).pathname;
-const specs = requiredTierAgents(DEFAULT_CONFIG.normalTaskRole, DEFAULT_CONFIG.deepTaskRole);
+const specs = requiredTierAgents(DEFAULT_CONFIG.easyTaskRole, DEFAULT_CONFIG.hardTaskRole, DEFAULT_CONFIG.challengeTaskRole);
 const result = await materializeTierAgents(packageRoot, specs);
 
 if (result.failed.length > 0) {

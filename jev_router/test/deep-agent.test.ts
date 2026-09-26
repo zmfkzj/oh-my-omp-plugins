@@ -7,9 +7,10 @@ import { getBundledAgent, parseAgent } from "@oh-my-pi/pi-coding-agent/task/agen
 import { normalizeConfig } from "../src/config.ts";
 import {
 	agentsDir,
-	DEEP_AGENT_NAME,
+	CHALLENGE_AGENT_NAME,
+	EASY_AGENT_NAME,
+	HARD_AGENT_NAME,
 	materializeTierAgents,
-	NORMAL_AGENT_NAME,
 	readInheritedAgentBehavior,
 	renderTierAgent,
 	requiredTierAgents,
@@ -26,34 +27,28 @@ afterAll(async () => {
 });
 
 describe("tier alias derivation", () => {
-	test("the alias is the bundled task agent with only the model role changed", () => {
+	test("each alias preserves bundled worker behavior but selects its own role", () => {
 		const base = getBundledAgent("task");
 		expect(base).toBeDefined();
 		const config = normalizeConfig(undefined);
-		const rendered = renderTierAgent(base!, requiredTierAgents(config.normalTaskRole, config.deepTaskRole)[0]!);
-
-		// Round-trip through OMP's own frontmatter parser, not a local regex.
-		const parsed = parseAgent(`${DEEP_AGENT_NAME}.md`, rendered, "user");
-		expect(parsed.name).toBe(DEEP_AGENT_NAME);
-		expect(parsed.model).toEqual(["@task_hard"]);
-		expect(parsed.systemPrompt.trim()).toBe(base!.systemPrompt.trim());
-		expect(parsed.spawns).toEqual(base!.spawns);
-		expect(parsed.thinkingLevel).toBe(base!.thinkingLevel);
-		expect(parsed.tools).toEqual(base!.tools);
+		const specs = requiredTierAgents(config.easyTaskRole, config.hardTaskRole, config.challengeTaskRole);
+		expect(specs.map(spec => spec.name)).toEqual([EASY_AGENT_NAME, HARD_AGENT_NAME, CHALLENGE_AGENT_NAME]);
+		for (const spec of specs) {
+			const parsed = parseAgent(`${spec.name}.md`, renderTierAgent(base!, spec), "user");
+			expect(parsed.name).toBe(spec.name);
+			expect(parsed.model).toEqual([`@${spec.role}`]);
+			expect(parsed.systemPrompt.trim()).toBe(base!.systemPrompt.trim());
+			expect(parsed.spawns).toEqual(base!.spawns);
+			expect(parsed.thinkingLevel).toBe(base!.thinkingLevel);
+			expect(parsed.tools).toEqual(base!.tools);
+		}
 	});
 
-	test("the derived model role follows configuration", () => {
-		const base = getBundledAgent("task")!;
-		const rendered = renderTierAgent(base, { name: "task-deep", role: "review", description: "d" });
-		expect(parseAgent("task-deep.md", rendered, "user").model).toEqual(["@review"]);
-	});
-
-	test("only the deep alias is required while the normal tier keeps OMP's own agent", () => {
-		expect(requiredTierAgents("task", "slow").map(spec => spec.name)).toEqual([DEEP_AGENT_NAME]);
-		expect(requiredTierAgents("fast_worker", "slow").map(spec => spec.name)).toEqual([
-			DEEP_AGENT_NAME,
-			NORMAL_AGENT_NAME,
-		]);
+	test("configured roles do not collapse aliases even when equal", () => {
+		const specs = requiredTierAgents("task", "task", "task");
+		expect(specs.map(spec => spec.name)).toEqual([EASY_AGENT_NAME, HARD_AGENT_NAME, CHALLENGE_AGENT_NAME]);
+		const rendered = renderTierAgent(getBundledAgent("task")!, { ...specs[0]!, role: "review" });
+		expect(parseAgent("task-easy.md", rendered, "user").model).toEqual(["@review"]);
 	});
 
 
@@ -65,15 +60,12 @@ describe("tier alias derivation", () => {
 		const inherited = readInheritedAgentBehavior(settings);
 		expect(inherited).toEqual({ prewalk: true, advisor: "deepseek/deepseek-v4-flash" });
 
-		const rendered = renderTierAgent(getBundledAgent("task")!, {
-			name: DEEP_AGENT_NAME,
-			role: "slow",
-			description: "d",
-			...inherited,
-		});
-		const parsed = parseAgent("task-deep.md", rendered, "user");
-		expect(parsed.prewalk).toBe(true);
-		expect(parsed.advisor).toBe("deepseek/deepseek-v4-flash");
+		for (const spec of requiredTierAgents("fast", "slow", "deep", inherited)) {
+			const rendered = renderTierAgent(getBundledAgent("task")!, spec);
+			const parsed = parseAgent(`${spec.name}.md`, rendered, "user");
+			expect(parsed.prewalk).toBe(true);
+			expect(parsed.advisor).toBe("deepseek/deepseek-v4-flash");
+		}
 	});
 
 	test("the plugin never introduces an advisor or prewalk of its own", () => {
@@ -82,7 +74,7 @@ describe("tier alias derivation", () => {
 		const off = readInheritedAgentBehavior(Settings.isolated({ "task.agentAdvisor": { task: "off" } }));
 		expect(off).toEqual({});
 
-		const rendered = renderTierAgent(getBundledAgent("task")!, { name: DEEP_AGENT_NAME, role: "slow", description: "d" });
+		const rendered = renderTierAgent(getBundledAgent("task")!, { name: CHALLENGE_AGENT_NAME, role: "slow", description: "d" });
 		expect(rendered).not.toContain("advisor:");
 		expect(rendered).not.toContain("prewalk:");
 	});
@@ -94,38 +86,39 @@ describe("tier alias derivation", () => {
 });
 
 describe("materialization", () => {
-	test("writes the alias into the package agents dir and is idempotent", async () => {
+	test("writes all three aliases into the package agents dir and is idempotent", async () => {
 		const root = await tempRoot();
-		const specs = requiredTierAgents("task", "slow");
-
+		const specs = requiredTierAgents("task_easy", "task_hard", "task_challenge");
+		const names = [EASY_AGENT_NAME, HARD_AGENT_NAME, CHALLENGE_AGENT_NAME];
 		const first = await materializeTierAgents(root, specs);
-		expect(first.written).toEqual([DEEP_AGENT_NAME]);
-		expect(first.available).toEqual([DEEP_AGENT_NAME]);
-		expect(await Bun.file(path.join(agentsDir(root), `${DEEP_AGENT_NAME}.md`)).exists()).toBe(true);
-
+		expect(first.written).toEqual(names);
+		expect(first.available).toEqual(names);
+		for (const name of names) {
+			expect(await Bun.file(path.join(agentsDir(root), `${name}.md`)).exists()).toBe(true);
+		}
 		const second = await materializeTierAgents(root, specs);
 		expect(second.written).toEqual([]);
-		expect(second.available).toEqual([DEEP_AGENT_NAME]);
+		expect(second.available).toEqual(names);
 	});
 
 	test("a role change rewrites the alias", async () => {
 		const root = await tempRoot();
-		await materializeTierAgents(root, requiredTierAgents("task", "slow"));
-		const rewritten = await materializeTierAgents(root, requiredTierAgents("task", "task_hard"));
-
-		expect(rewritten.written).toEqual([DEEP_AGENT_NAME]);
-		const content = await Bun.file(path.join(agentsDir(root), `${DEEP_AGENT_NAME}.md`)).text();
-		expect(parseAgent("task-deep.md", content, "user").model).toEqual(["@task_hard"]);
+		await materializeTierAgents(root, requiredTierAgents("task_easy", "task_hard", "slow"));
+		const rewritten = await materializeTierAgents(root, requiredTierAgents("task_easy", "task_hard", "task_challenge"));
+		expect(rewritten.written).toEqual([CHALLENGE_AGENT_NAME]);
+		const content = await Bun.file(path.join(agentsDir(root), `${CHALLENGE_AGENT_NAME}.md`)).text();
+		expect(parseAgent("task-challenge.md", content, "user").model).toEqual(["@task_challenge"]);
 	});
 
 	test("every artifact lives inside the package, so uninstall removes it", async () => {
 		const root = await tempRoot();
-		await materializeTierAgents(root, requiredTierAgents("normal_worker", "slow"));
+		await materializeTierAgents(root, requiredTierAgents("easy", "hard", "challenge"));
 		expect(agentsDir(root).startsWith(root)).toBe(true);
 		const entries = [...new Bun.Glob("**/*").scanSync(root)];
 		expect(entries.sort()).toEqual([
-			path.join("agents", `${DEEP_AGENT_NAME}.md`),
-			path.join("agents", `${NORMAL_AGENT_NAME}.md`),
+			path.join("agents", `${CHALLENGE_AGENT_NAME}.md`),
+			path.join("agents", `${EASY_AGENT_NAME}.md`),
+			path.join("agents", `${HARD_AGENT_NAME}.md`),
 		]);
 	});
 });

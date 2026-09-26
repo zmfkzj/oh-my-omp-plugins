@@ -1,63 +1,36 @@
 /**
- * Front-door orchestration router.
- *
- * One Jev choice per user request decides DEFAULT, SLOW, or ORCHESTRATE.
- * `before_agent_start` makes the decision and switches the main model before
- * dispatch (the agent loop captures its model before the `context` hook).
- * Policy-preparation retries reuse the decision for the same prompt. At
- * `context`, an ORCHESTRATE decision injects OMP's native hidden notice unless
- * the user's explicit orchestrate keyword already did; UNCERTAIN adds a short
- * hint. The user's prompt is never modified, and notices are not persisted.
- * At settled `agent_end`, a temporary model switch is restored unless another
- * actor changed the model during the turn.
+ * Front-door routing chooses only whether to attach native orchestration guidance.
+ * A successful todo init/append can promote a direct turn after its committed
+ * plan reveals independent work; provider context notices are never persisted.
  */
 import { renderOrchestrateNotice } from "@oh-my-pi/pi-coding-agent/modes/magic-keywords";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AgentSession, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import type { Model } from "@oh-my-pi/pi-ai";
-import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import type { ToolResultEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import type { JevRouterConfig } from "./config.ts";
-import { mainSessionOf, orchestrateKeywordEnabled, sameModel, type RoleSelection } from "./host.ts";
-import { PRIOR_REQUEST_COUNT, type JevDecider, type OrchestrationRoute } from "./jev.ts";
+import { mainSessionOf, orchestrateKeywordEnabled } from "./host.ts";
+import type { JevDecider, OrchestrationRoute } from "./jev.ts";
 import type { RouteLogger } from "./logging.ts";
+import { buildRoutingContext, formatTodoPlan, isTodoPlan, latestCommittedTodoPlan, visibleText } from "./routing-context.ts";
 import type { Telemetry } from "./telemetry.ts";
 
 /** OMP's own notice type; reusing it keeps renderers and other extensions working. */
 export const ORCHESTRATE_NOTICE_TYPE = "orchestrate-notice";
-export const UNCERTAIN_NOTICE_TYPE = "jev-router-orchestration-uncertain";
 
-/**
- * Deliberately short: this is the cheap substitute for a second routing call,
- * not a planning prompt. It must not read as an instruction to orchestrate.
- */
-export const UNCERTAIN_NOTICE = `<system-notice>
-Jev could not confidently determine whether native orchestration is worthwhile for this request.
-
-While scoping — not as a separate step, and without an extra planning round-trip — decide whether
-independent delegation would materially reduce context duplication or enable genuinely parallel
-work. If it would, delegate through the normal task mechanism. Otherwise execute directly.
-</system-notice>`;
-
-export type OrchestrationOutcome = OrchestrationRoute | "UNCERTAIN" | "SKIP" | "ERROR";
+export type OrchestrationOutcome = OrchestrationRoute | "SKIP" | "ERROR";
 
 export interface OrchestrationRecord {
 	outcome: OrchestrationOutcome;
 	confidence?: number;
 	margin?: number;
 	reason?: string;
-	model?: string;
 	at: number;
 }
 
 /**
- * Whether OMP already attached its own orchestrate notice to the turn whose
- * user message is last in `messages`.
- *
- * Magic-keyword notices are prepended, so they land in the contiguous run of
- * hidden custom messages directly before that user message, alongside the
- * todo/task preludes and attachment companions. Scanning only that run keeps an
- * older turn's notice — which, with native keyword use, stays in history — from
- * being mistaken for this turn's.
+ * Native keyword notices are prepended immediately before the current user's
+ * message. A historical notice belongs to its own earlier user turn.
  */
 export function turnHasNativeOrchestrateNotice(messages: readonly AgentMessage[]): boolean {
 	let index = messages.length - 1;
@@ -71,14 +44,33 @@ export function turnHasNativeOrchestrateNotice(messages: readonly AgentMessage[]
 	return false;
 }
 
-/** Index at which a turn-scoped notice mirrors OMP's own placement. */
-export function noticeInsertIndex(messages: readonly AgentMessage[]): number {
-	let index = messages.length - 1;
-	while (index >= 0 && messages[index]?.role !== "user") index--;
-	return index < 0 ? messages.length : index;
+function turnHasOwnNotice(messages: readonly AgentMessage[], notice: AgentMessage): boolean {
+	return messages.some(message => message === notice || (message.role === "custom" &&
+		notice.role === "custom" && message.customType === ORCHESTRATE_NOTICE_TYPE &&
+		message.timestamp === notice.timestamp && message.content === notice.content));
 }
 
-type Gate = { ok: true; session: AgentSession; orchestrationAllowed: boolean } | { ok: false; reason: string };
+/** Initial notices precede the current user; promotions follow their own todo result. */
+export function noticeInsertIndex(messages: readonly AgentMessage[], todoToolCallId?: string): number {
+	let userIndex = messages.length - 1;
+	while (userIndex >= 0 && messages[userIndex]?.role !== "user") userIndex--;
+	if (todoToolCallId) {
+		for (let index = userIndex + 1; index < messages.length; index++) {
+			const message = messages[index];
+			if (message?.role === "toolResult" && message.toolName === "todo" &&
+				message.toolCallId === todoToolCallId) {
+				// Keep the producing assistant's tool-result group contiguous.
+				let after = index + 1;
+				while (messages[after]?.role === "toolResult") after++;
+				return after;
+			}
+		}
+		return -1; // Wait for the originating todo result to reach provider context.
+	}
+	return userIndex < 0 ? messages.length : userIndex;
+}
+
+type Gate = { ok: true; session: AgentSession } | { ok: false; reason: string };
 
 /** Everything that can be decided from the prompt alone, before any network work. */
 export function gateRequest(ctx: ExtensionContext, prompt: string, config: JevRouterConfig): Gate {
@@ -97,7 +89,7 @@ export function gateRequest(ctx: ExtensionContext, prompt: string, config: JevRo
 	const taskAvailable = session.getEnabledToolNames().includes("task");
 	const keywordEnabled = orchestrateKeywordEnabled(session);
 	const orchestrationAllowed = config.orchestrationRoutingEnabled && taskAvailable && keywordEnabled;
-	if (!orchestrationAllowed && !config.mainModelRoutingEnabled) {
+	if (!orchestrationAllowed) {
 		const reason = !config.orchestrationRoutingEnabled
 			? "orchestration-routing-disabled"
 			: !taskAvailable
@@ -105,7 +97,7 @@ export function gateRequest(ctx: ExtensionContext, prompt: string, config: JevRo
 				: "orchestrate-keyword-disabled";
 		return { ok: false, reason };
 	}
-	return { ok: true, session, orchestrationAllowed };
+	return { ok: true, session };
 }
 
 export interface OrchestrationRouterDeps {
@@ -114,28 +106,20 @@ export interface OrchestrationRouterDeps {
 	telemetry: Telemetry;
 	credential: () => Promise<string | undefined>;
 	config: () => JevRouterConfig;
-	resolveRole: (ctx: ExtensionContext, role: string) => RoleSelection | undefined;
 }
 
 interface TurnState {
 	prompt: string;
 	session: AgentSession;
-	orchestrationAllowed: boolean;
 	explicitLogged: boolean;
-	record?: OrchestrationRecord;
 	notice?: AgentMessage;
+	noticeAnchor?: string;
 	pending?: Promise<void>;
+	seenPlans: Set<string>;
 }
 
 export class OrchestrationRouter {
 	#turn: TurnState | undefined;
-	#applied: {
-		session: AgentSession;
-		from: Model;
-		fromThinking: AgentSession["thinkingLevel"];
-		to: Model;
-		normalRole: string;
-	} | undefined;
 	#last: OrchestrationRecord | undefined;
 	readonly #deps: OrchestrationRouterDeps;
 
@@ -147,28 +131,69 @@ export class OrchestrationRouter {
 		return this.#last;
 	}
 
-	/** Decide before dispatch; policy retries with the same prompt await the same decision. */
+	/** Decide before dispatch; policy retries with the same prompt reuse the decision. */
 	async beginTurn(ctx: ExtensionContext, prompt: string): Promise<void> {
 		const gate = gateRequest(ctx, prompt, this.#deps.config());
 		if (!gate.ok) {
 			this.#turn = undefined;
+			this.#last = { outcome: "SKIP", reason: gate.reason, at: Date.now() };
 			this.#deps.logger.route("jev.orchestration", { route: "SKIP", reason: gate.reason });
 			return;
 		}
-		if (this.#turn?.prompt === prompt) {
+		if (this.#turn?.prompt === prompt && this.#turn.session === gate.session) {
 			await this.#turn.pending;
 			return;
 		}
-		const turn: TurnState = { prompt, session: gate.session, orchestrationAllowed: gate.orchestrationAllowed, explicitLogged: false };
+		const priorPlan = latestCommittedTodoPlan(gate.session.sessionManager.getBranch());
+		const turn: TurnState = {
+			prompt, session: gate.session,
+			explicitLogged: false, seenPlans: new Set(priorPlan ? [JSON.stringify(priorPlan)] : []),
+		};
 		this.#turn = turn;
 		turn.pending = this.#decide(ctx, turn);
 		await turn.pending;
 	}
 
-	/** Called when the agent loop settles: the next request routes fresh. */
-	async endTurn(current: Model | undefined): Promise<void> {
+	/** Called when the agent loop settles: never change the user's chosen model. */
+	endTurn(): void {
 		this.#turn = undefined;
-		await this.#restore(current);
+	}
+
+	/** Reconsider only successful committed plan creation/expansion, once per new plan. */
+	async onTodoResult(ctx: ExtensionContext, event: ToolResultEvent): Promise<void> {
+		const turn = this.#turn;
+		if (!turn || turn.notice || turn.explicitLogged || turn.session !== mainSessionOf(ctx) ||
+			!gateRequest(ctx, turn.prompt, this.#deps.config()).ok ||
+			event.toolName !== "todo" || event.isError ||
+			(event.input.op !== "init" && event.input.op !== "append")) return;
+		const details = event.details as { op?: unknown; phases?: unknown } | undefined;
+		if (details?.op !== event.input.op || !isTodoPlan(details.phases)) return;
+		const branch = turn.session.sessionManager.getBranch();
+		// Match the assistant's actual tool call to this user's turn. A late result
+		// from a prior turn must not promote the next request, even in one session.
+		let userIndex = branch.length - 1;
+		while (userIndex >= 0) {
+			const entry = branch[userIndex];
+			if (entry?.type === "message" && entry.message.role === "user") break;
+			userIndex--;
+		}
+		const currentUser = branch[userIndex];
+		if (currentUser?.type !== "message" || currentUser.message.role !== "user" ||
+			visibleText(currentUser.message.content) !== turn.prompt.trim()) return;
+		const hasCall = branch.slice(userIndex + 1).some(entry => entry.type === "message" &&
+			entry.message.role === "assistant" && entry.message.content.some(part =>
+				part.type === "toolCall" && part.id === event.toolCallId && part.name === "todo"));
+		if (!hasCall) return;
+		const phases = details.phases as TodoPhase[];
+		const fingerprint = JSON.stringify(phases);
+		if (turn.seenPlans.has(fingerprint)) return;
+		turn.seenPlans.add(fingerprint);
+		turn.pending = (turn.pending ?? Promise.resolve()).then(async () => {
+			if (this.#turn !== turn || turn.notice || turn.explicitLogged ||
+				!gateRequest(ctx, turn.prompt, this.#deps.config()).ok) return;
+			await this.#decide(ctx, turn, phases, event.toolCallId);
+		});
+		await turn.pending;
 	}
 
 	/** Attach the turn's decided notice to each provider request, if needed. */
@@ -176,6 +201,7 @@ export class OrchestrationRouter {
 		const turn = this.#turn;
 		if (!turn || !mainSessionOf(ctx)) return undefined;
 
+		if (turn.notice && turnHasOwnNotice(messages, turn.notice)) return undefined;
 		if (turnHasNativeOrchestrateNotice(messages)) {
 			if (!turn.explicitLogged) {
 				this.#deps.logger.route("jev.orchestration", { route: "SKIP", reason: "explicit-orchestrate" });
@@ -184,31 +210,37 @@ export class OrchestrationRouter {
 			return undefined;
 		}
 		if (!turn.notice) return undefined;
-
+		const index = noticeInsertIndex(messages, turn.noticeAnchor);
+		if (index < 0) return undefined;
 		const next = [...messages];
-		next.splice(noticeInsertIndex(next), 0, turn.notice);
+		next.splice(index, 0, turn.notice);
 		return next;
 	}
 
-	async #decide(ctx: ExtensionContext, turn: TurnState): Promise<void> {
+	async #decide(ctx: ExtensionContext, turn: TurnState, phases?: readonly TodoPhase[], todoToolCallId?: string): Promise<void> {
+		if (this.#turn !== turn) return;
 		const config = this.#deps.config();
 		const apiKey = await this.#deps.credential();
+		if (this.#turn !== turn) return;
 		if (!apiKey) {
 			this.#deps.logger.route("jev.orchestration", { route: "SKIP", reason: "credential-missing" });
-			turn.record = { outcome: "SKIP", reason: "credential-missing", at: Date.now() };
+			this.#last = { outcome: "SKIP", reason: "credential-missing", at: Date.now() };
 			return;
 		}
 
 		try {
+			const context = buildRoutingContext(turn.session.sessionManager.getBranch(), turn.prompt);
+			if (phases) context.plan = formatTodoPlan(phases);
 			const decision = await this.#deps.engine.decideOrchestration(
 				turn.prompt,
-				priorUserRequests(turn.session.sessionManager.getBranch(), turn.prompt, PRIOR_REQUEST_COUNT),
+				context,
 				{ apiKey, model: config.jevModel, timeoutMs: config.routingTimeoutMs },
 				{ minConfidence: config.orchestrationMinConfidence, minMargin: config.orchestrationMinMargin },
 				config.maxRoutingInputChars,
 			);
-			const outcome: OrchestrationRoute | "UNCERTAIN" = decision.confident ? decision.top : "UNCERTAIN";
-			const model = await this.#applyMainModel(ctx, turn, outcome);
+			if (this.#turn !== turn || (phases && (turn.explicitLogged ||
+				!gateRequest(ctx, turn.prompt, this.#deps.config()).ok))) return;
+			const outcome: OrchestrationRoute = decision.confident ? decision.top : "DEFAULT";
 			this.#deps.telemetry.recordOrchestration(outcome, decision.confidence, decision.margin, decision.latencyMs);
 			this.#deps.telemetry.appendDecision({
 				kind: "orchestration",
@@ -219,111 +251,37 @@ export class OrchestrationRouter {
 				margin: decision.margin,
 				confident: decision.confident,
 				latencyMs: decision.latencyMs,
-				model,
 			});
 			this.#deps.logger.route("jev.orchestration", {
 				route: outcome,
 				confidence: decision.confidence,
 				margin: decision.margin,
 				latencyMs: decision.latencyMs,
-				model,
 			});
-			turn.record = { outcome, confidence: decision.confidence, margin: decision.margin, model, at: Date.now() };
-			this.#last = turn.record;
-			if (turn.orchestrationAllowed) turn.notice = this.#buildNotice(outcome, turn.session);
+			this.#last = { outcome, confidence: decision.confidence, margin: decision.margin, at: Date.now() };
+			if (outcome === "ORCHESTRATE") {
+				turn.notice = this.#buildNotice(turn.session);
+				turn.noticeAnchor = todoToolCallId;
+			}
 		} catch (error) {
-			// Failure leaves the model and native orchestration behavior untouched.
+			if (this.#turn !== turn) return;
 			const reason = this.#deps.logger.describeError(error);
 			const timedOut = /timeout|abort/i.test(reason);
 			this.#deps.telemetry.recordFailure("orchestration", timedOut);
 			this.#deps.telemetry.appendDecision({ kind: "orchestration", route: "ERROR", timedOut });
 			this.#deps.logger.route("jev.orchestration", { route: "ERROR", reason });
-			turn.record = { outcome: "ERROR", reason, at: Date.now() };
-			this.#last = turn.record;
+			this.#last = { outcome: "ERROR", reason, at: Date.now() };
 		}
 	}
 
-	async #applyMainModel(ctx: ExtensionContext, turn: TurnState, outcome: OrchestrationRoute | "UNCERTAIN"): Promise<string> {
-		const config = this.#deps.config();
-		if (!config.mainModelRoutingEnabled) return "skip:routing-disabled";
-		const wantDeep = outcome === "SLOW" || outcome === "UNCERTAIN";
-		const defaults = this.#deps.resolveRole(ctx, config.mainNormalRole);
-		if (!defaults) return "skip:default-role-unresolved";
-		const current = ctx.model;
-		if (!current) return "skip:no-current-model";
-		// OMP's `--model` rewrites the default role at runtime; matching its new
-		// value alone would misclassify an explicit CLI choice as the baseline.
-		if (turn.session.settings.getModelRoleProvenance(config.mainNormalRole) === "runtime") return "skip:explicit-model";
-		const baseline = this.#applied && sameModel(current, this.#applied.to) ? this.#applied.from : current;
-		if (!sameModel(baseline, defaults.model)) return "skip:explicit-model";
-		if (!wantDeep) {
-			if (this.#applied) await this.#restore(current);
-			return "kept";
-		}
-		const deep = this.#deps.resolveRole(ctx, config.mainDeepRole);
-		if (!deep) return "skip:deep-role-unresolved";
-		if (sameModel(deep.model, defaults.model)) return "skip:same-model";
-		if (this.#applied && sameModel(current, deep.model)) return `@${config.mainDeepRole}`;
-
-		const fromThinking = turn.session.thinkingLevel;
-		try {
-			await turn.session.setModelTemporary(deep.model, deep.thinkingLevel, { ephemeral: true });
-		} catch (error) {
-			this.#deps.logger.warn(this.#deps.logger.describeError(error));
-			return "skip:model-auth-missing";
-		}
-		this.#applied = { session: turn.session, from: baseline, fromThinking, to: deep.model, normalRole: config.mainNormalRole };
-		return `@${config.mainDeepRole}`;
-	}
-	async #restore(current: Model | undefined): Promise<void> {
-		const applied = this.#applied;
-		if (!applied) return;
-		this.#applied = undefined;
-		if (
-			applied.session.settings.getModelRoleProvenance(applied.normalRole) === "runtime" ||
-			!current || !sameModel(current, applied.to)
-		) {
-			this.#deps.logger.note("main model left as is: changed during the turn");
-			return;
-		}
-		try {
-			await applied.session.setModelTemporary(applied.from, applied.fromThinking, { ephemeral: true });
-		} catch (error) {
-			this.#deps.logger.warn(this.#deps.logger.describeError(error));
-		}
-	}
-
-	#buildNotice(outcome: OrchestrationRoute | "UNCERTAIN", session: AgentSession): AgentMessage | undefined {
-		if (outcome === "DEFAULT" || outcome === "SLOW") return undefined;
-		const content =
-			outcome === "ORCHESTRATE"
-				? renderOrchestrateNotice({ tools: session.getEnabledToolNames() })
-				: UNCERTAIN_NOTICE;
+	#buildNotice(session: AgentSession): AgentMessage {
 		return {
 			role: "custom",
-			customType: outcome === "ORCHESTRATE" ? ORCHESTRATE_NOTICE_TYPE : UNCERTAIN_NOTICE_TYPE,
-			content,
+			customType: ORCHESTRATE_NOTICE_TYPE,
+			content: renderOrchestrateNotice({ tools: session.getEnabledToolNames() }),
 			display: false,
 			attribution: "user",
 			timestamp: Date.now(),
 		} as AgentMessage;
 	}
-}
-
-/** Recent real user requests, oldest first; the current prompt is not prior context. */
-export function priorUserRequests(branch: readonly SessionEntry[], prompt: string, count: number): string[] {
-	const prior: string[] = [];
-	const currentPrompt = prompt.trim();
-	for (let index = branch.length - 1; index >= 0 && prior.length < count; index--) {
-		const entry = branch[index];
-		if (entry?.type !== "message" || entry.message.role !== "user") continue;
-		const content = entry.message.content;
-		const text = typeof content === "string"
-			? content
-			: content.filter(part => part.type === "text").map(part => part.text).join("");
-		const trimmed = text.trim();
-		if (!trimmed || trimmed === currentPrompt || trimmed.startsWith("/") || trimmed.startsWith("<system-")) continue;
-		prior.push(text);
-	}
-	return prior.reverse();
 }

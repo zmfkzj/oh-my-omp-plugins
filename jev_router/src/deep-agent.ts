@@ -24,15 +24,13 @@ import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 /** The bundled generic worker whose per-agent settings the aliases inherit. */
 const GENERIC_TASK_AGENT_NAME = "task";
 
-/** Agent name used for the deep-reasoning tier. */
-export const DEEP_AGENT_NAME = "task-deep";
-/** Agent name used for the normal tier, materialized only for a non-default `normalTaskRole`. */
-export const NORMAL_AGENT_NAME = "task-normal";
+/** Distinct agent aliases for the three generic-worker model roles. */
+export const EASY_AGENT_NAME = "task-easy";
+export const HARD_AGENT_NAME = "task-hard";
+export const CHALLENGE_AGENT_NAME = "task-challenge";
 
-const DEEP_DESCRIPTION =
-	"Deep-reasoning tier of the generic task worker, selected automatically by omp-jev-router. Do not request it directly; dispatch `task` and let the router pick the tier.";
-const NORMAL_DESCRIPTION =
-	"Normal tier of the generic task worker, selected automatically by omp-jev-router. Do not request it directly; dispatch `task` and let the router pick the tier.";
+const tierDescription = (tier: string) =>
+	`${tier} tier of the generic task worker, selected automatically by omp-jev-router. Do not request it directly; dispatch \`task\` and let the router pick the tier.`;
 
 export interface TierAgentSpec {
 	name: string;
@@ -50,9 +48,9 @@ export interface TierAgentSpec {
 }
 
 export interface MaterializeResult {
-	/** Alias names that exist on disk and are safe to route to. */
+	/** Alias names whose on-disk definitions match the requested configuration. */
 	available: string[];
-	/** Alias names that could not be written (read-only install and no shipped copy). */
+	/** Alias names that could not be written or whose shipped copy is stale. */
 	failed: string[];
 	/** Names whose on-disk content was (re)written this run. */
 	written: string[];
@@ -123,9 +121,8 @@ export async function materializeTierAgents(
 			result.available.push(spec.name);
 			result.written.push(spec.name);
 		} catch {
-			// Read-only install: a shipped copy still routes correctly, a missing one does not.
-			if (current === undefined) result.failed.push(spec.name);
-			else result.available.push(spec.name);
+			// An outdated shipped copy is not safe if it cannot be rewritten.
+			result.failed.push(spec.name);
 		}
 	}
 	return result;
@@ -140,19 +137,18 @@ export interface InheritedAgentBehavior {
 	advisor?: boolean | string;
 }
 
-/** Aliases required by a configuration. `normalTaskRole: "task"` needs no normal alias. */
+/** All three model tiers have distinct spawnable aliases, even when roles coincide. */
 export function requiredTierAgents(
-	normalTaskRole: string,
-	deepTaskRole: string,
+	easyTaskRole: string,
+	hardTaskRole: string,
+	challengeTaskRole: string,
 	inherited: InheritedAgentBehavior = {},
 ): TierAgentSpec[] {
-	const specs: TierAgentSpec[] = [
-		{ name: DEEP_AGENT_NAME, role: deepTaskRole, description: DEEP_DESCRIPTION, ...inherited },
+	return [
+		{ name: EASY_AGENT_NAME, role: easyTaskRole, description: tierDescription("Easy"), ...inherited },
+		{ name: HARD_AGENT_NAME, role: hardTaskRole, description: tierDescription("Hard"), ...inherited },
+		{ name: CHALLENGE_AGENT_NAME, role: challengeTaskRole, description: tierDescription("Challenge"), ...inherited },
 	];
-	if (normalTaskRole !== "task") {
-		specs.push({ name: NORMAL_AGENT_NAME, role: normalTaskRole, description: NORMAL_DESCRIPTION, ...inherited });
-	}
-	return specs;
 }
 
 /**

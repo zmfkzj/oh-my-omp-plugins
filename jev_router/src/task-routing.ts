@@ -1,12 +1,9 @@
 /**
  * TASK tier router.
  *
- * OMP decides SMOL vs TASK; this router never revisits that. It only looks at
- * spawns that already resolved to the *generic* bundled `task` worker and picks
- * the reasoning tier: keep `@task`, or move to `@task_hard` via the derived
- * `task-deep` alias. Specialized agents (`sonic`, `scout`, `reviewer`,
- * `security-reviewer`, project/user/plugin agents, `^`-tagged model pseudonyms)
- * pass through untouched, as does any explicitly named agent.
+ * OMP decides whether to spawn a generic worker; this router only selects
+ * its easy, hard, or challenge model role via derived worker aliases.
+ * Specialists, explicit agents, and custom generic overrides pass untouched.
  *
  * Two facts make this exact rather than heuristic:
  *
@@ -25,9 +22,9 @@
  */
 import type { ExtensionAPI, ToolCallEventResult } from "@oh-my-pi/pi-coding-agent";
 import type { JevRouterConfig } from "./config.ts";
-import { DEEP_AGENT_NAME, NORMAL_AGENT_NAME } from "./deep-agent.ts";
+import { CHALLENGE_AGENT_NAME, EASY_AGENT_NAME, HARD_AGENT_NAME } from "./deep-agent.ts";
 import { spawnableTaskAgents } from "./host.ts";
-import type { JevDecider, TaskRoute } from "./jev.ts";
+import { clip, type JevDecider, type TaskRoute } from "./jev.ts";
 import type { RouteLogger } from "./logging.ts";
 import type { Telemetry } from "./telemetry.ts";
 
@@ -92,6 +89,10 @@ export interface TaskRouterDeps {
 	config: () => JevRouterConfig;
 	/** False when a project/user/plugin agent shadows the bundled `task` definition. */
 	genericTaskIsBundled: () => boolean;
+	/** Optional bounded task context from the active branch (including its plan). */
+	routingContext?: () => string | undefined;
+	/** Successfully materialized aliases; excludes stale read-only definitions. */
+	availableTierAgents?: () => ReadonlySet<string>;
 }
 
 export class TaskRouter {
@@ -142,26 +143,26 @@ export class TaskRouter {
 			return undefined;
 		}
 
-		// Routing to an agent the live spawn policy does not advertise would fail
-		// preflight, so an unavailable alias means "stay native", never "try it".
+		// An unavailable or stale alias is never sent to spawn preflight.
 		const spawnable = spawnableTaskAgents(pi);
-		if (!spawnable.has(DEEP_AGENT_NAME)) {
-			this.#deps.logger.route("jev.task", { route: "SKIP", reason: "deep-alias-unspawnable" });
+		const available = this.#deps.availableTierAgents?.();
+		const targets: Record<TaskRoute, string> = {
+			TASK_EASY: EASY_AGENT_NAME,
+			TASK_HARD: HARD_AGENT_NAME,
+			TASK_CHALLENGE: CHALLENGE_AGENT_NAME,
+		};
+		if (!spawnable.has(CHALLENGE_AGENT_NAME) || (available && !available.has(CHALLENGE_AGENT_NAME))) {
+			this.#deps.logger.route("jev.task", { route: "SKIP", reason: "challenge-alias-unspawnable" });
 			return undefined;
 		}
-		const normalAgent =
-			config.normalTaskRole === GENERIC_TASK_AGENT
-				? GENERIC_TASK_AGENT
-				: spawnable.has(NORMAL_AGENT_NAME)
-					? NORMAL_AGENT_NAME
-					: GENERIC_TASK_AGENT;
 
 		const routes = await this.#classify(routable, call.context, config);
 		let changed = false;
 		const items = call.items.map((item, index) => {
 			const route = routes.get(index);
 			if (!route) return item;
-			const target = route === "TASK_DEEP" ? DEEP_AGENT_NAME : normalAgent;
+			const target = targets[route];
+			if (!spawnable.has(target) || (available && !available.has(target))) return item;
 			this.#deps.telemetry.recordSpawn(target);
 			if (target === item.agent) return item;
 			changed = true;
@@ -172,38 +173,48 @@ export class TaskRouter {
 		return { input: call.batch ? { ...input, tasks: items } : (items[0] ?? input) };
 	}
 
-	/** One Jev request for the whole call; any failure degrades every item to TASK_DEEP. */
+	/** One Jev request for the whole call; failures degrade every item to TASK_CHALLENGE. */
 	async #classify(
 		routable: readonly RoutableItem[],
 		sharedContext: string | undefined,
 		config: JevRouterConfig,
 	): Promise<Map<number, TaskRoute>> {
 		const routes = new Map<number, TaskRoute>();
-		const apiKey = await this.#deps.credential();
-		if (!apiKey) {
-			this.#deps.logger.route("jev.task", {
-				route: "TASK_DEEP",
-				reason: "credential-missing",
-				items: routable.length,
-			});
-			for (const item of routable) routes.set(item.index, "TASK_DEEP");
-			return routes;
-		}
-
 		try {
+			const apiKey = await this.#deps.credential();
+			if (!apiKey) {
+				this.#deps.logger.route("jev.task", {
+					route: "TASK_CHALLENGE",
+					reason: "credential-missing",
+					items: routable.length,
+				});
+				for (const item of routable) routes.set(item.index, "TASK_CHALLENGE");
+				return routes;
+			}
+
+			const extraContext = this.#deps.routingContext?.();
+			const sharedBudget = Math.floor(config.maxRoutingInputChars / 3);
+			const halfBudget = Math.max(0, Math.floor((sharedBudget - 2) / 2));
+			const context = extraContext
+				? sharedContext
+					? `${clip(sharedContext, halfBudget)}\n\n${clip(extraContext, halfBudget)}`
+					: extraContext
+				: sharedContext;
 			const batch = await this.#deps.engine.decideTaskTiers(
 				routable.map(item => ({ id: `t${item.index}`, instruction: item.instruction })),
-				sharedContext,
+				context,
 				{ apiKey, model: config.jevModel, timeoutMs: config.routingTimeoutMs },
 				{ minConfidence: config.taskMinConfidence, minMargin: config.taskMinMargin },
 				config.maxRoutingInputChars,
 			);
 			this.#deps.telemetry.recordTaskBatch(batch.latencyMs);
 			for (const decision of batch.decisions) {
+				if (!/^t\d+$/.test(decision.id)) continue;
 				const index = Number(decision.id.slice(1));
+				if (!routable.some(item => item.index === index)) continue;
 				// Uncertainty fails quality-safe: a wrong cheap worker costs a retry,
 				// which is more expensive than one stronger run.
-				const route: TaskRoute = decision.confident ? decision.top : "TASK_DEEP";
+				const route: TaskRoute = decision.confident ? decision.top : "TASK_CHALLENGE";
 				routes.set(index, route);
 				this.#deps.telemetry.recordTaskDecision(route, decision.confidence, decision.margin, decision.confident);
 				this.#deps.telemetry.appendDecision({
@@ -233,7 +244,7 @@ export class TaskRouter {
 				});
 			}
 			for (const item of routable) {
-				if (!routes.has(item.index)) routes.set(item.index, "TASK_DEEP");
+				if (!routes.has(item.index)) routes.set(item.index, "TASK_CHALLENGE");
 			}
 			return routes;
 		} catch (error) {
@@ -241,9 +252,9 @@ export class TaskRouter {
 			const timedOut = /timeout|abort/i.test(reason);
 			this.#deps.telemetry.recordFailure("task", timedOut);
 			this.#deps.telemetry.appendDecision({ kind: "task", route: "ERROR", timedOut, items: routable.length });
-			this.#deps.logger.route("jev.task", { route: "TASK_DEEP", reason, items: routable.length });
-			this.#last = { route: "TASK_DEEP", confidence: 0, margin: 0, confident: false, at: Date.now() };
-			for (const item of routable) routes.set(item.index, "TASK_DEEP");
+			this.#deps.logger.route("jev.task", { route: "TASK_CHALLENGE", reason, items: routable.length });
+			this.#last = { route: "TASK_CHALLENGE", confidence: 0, margin: 0, confident: false, at: Date.now() };
+			for (const item of routable) routes.set(item.index, "TASK_CHALLENGE");
 			return routes;
 		}
 	}

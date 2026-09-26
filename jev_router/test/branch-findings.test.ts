@@ -6,9 +6,15 @@ import { ROLE, TOOL, type VerificationFinding } from "../src/advisor-review.ts";
 
 function advisorNotes(...notes: VerificationFinding[]): SessionEntry {
   return {
-    type: "message",
-    message: { role: "custom", customType: "advisor", details: { notes } },
-  } as unknown as SessionEntry;
+    type: "custom_message",
+    id: crypto.randomUUID(),
+    parentId: null,
+    timestamp: "2026-09-26T00:00:00.000Z",
+    customType: "advisor",
+    content: "Auditor findings",
+    display: true,
+    details: { notes },
+  };
 }
 
 function review(isError = false): SessionEntry {

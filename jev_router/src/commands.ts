@@ -12,11 +12,10 @@ import {
 	TYPESAFE_ENV_VAR,
 	validateCredential,
 } from "./credentials.ts";
-import { DEEP_AGENT_NAME, NORMAL_AGENT_NAME } from "./deep-agent.ts";
+import { EASY_AGENT_NAME, HARD_AGENT_NAME, CHALLENGE_AGENT_NAME } from "./deep-agent.ts";
 import { resolveRole, spawnableTaskAgents } from "./host.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import type { JevRouterRuntime } from "./runtime.ts";
-import { GENERIC_TASK_AGENT } from "./task-routing.ts";
 
 export const COMMAND_NAME = "jev-router";
 const SUBCOMMANDS = ["setup", "status", "test", "stats", "reset"] as const;
@@ -31,15 +30,16 @@ function row(label: string, value: string): string {
 /** Fixed probes for `/jev-router test`; they exercise both routers end to end. */
 const TEST_REQUEST =
 	"Rename the `retryCount` field to `attempts` in the HTTP client and update its two call sites.";
-const TEST_DEEP_REQUEST =
-	"Users intermittently see stale balances after a concurrent transfer. Find the root cause across the ledger and cache layers and decide how to make reads consistent.";
+const TEST_PARALLEL_REQUEST =
+	"Implement three independently specified features in disjoint subsystems: CLI export, database retention, and dashboard filtering. Each has its own tests and no shared interfaces; coordinate independent workers and integrate their results.";
 const TEST_SUBTASKS = [
-	{ id: "t0", instruction: "Add a `--json` flag to the existing `status` CLI command that prints the same fields as JSON." },
+	{ id: "t0", instruction: "Rename the local variable retryCount to attempts in one function without changing behavior." },
 	{
 		id: "t1",
 		instruction:
 			"Users intermittently see stale balances after a concurrent transfer. Find the root cause across the ledger and cache layers and decide how to make reads consistent.",
 	},
+	{ id: "t2", instruction: "Implement paginated CLI output using the existing endpoint and pagination contract, including regression coverage." },
 ];
 
 function formatCredential(runtime: JevRouterRuntime, stored: boolean, source: string | undefined): string {
@@ -56,10 +56,9 @@ export async function renderStatus(
 ): Promise<string> {
 	const config = runtime.config;
 	const credential = await runtime.credential();
-	const normal = resolveRole(ctx, config.normalTaskRole);
-	const deep = resolveRole(ctx, config.deepTaskRole);
-	const mainNormal = resolveRole(ctx, config.mainNormalRole);
-	const mainDeep = resolveRole(ctx, config.mainDeepRole);
+	const easy = resolveRole(ctx, config.easyTaskRole);
+	const hard = resolveRole(ctx, config.hardTaskRole);
+	const challenge = resolveRole(ctx, config.challengeTaskRole);
 	const survey = runtime.survey;
 	// Spawnability, not mere existence: this is what the router actually gates on.
 	const spawnable = spawnableTaskAgents(pi);
@@ -75,21 +74,19 @@ export async function renderStatus(
 		row("Credential", formatCredential(runtime, hasStoredCredential(ctx), credential?.source)),
 		"",
 		row("Orchestration routing", config.orchestrationRoutingEnabled ? "enabled" : "disabled"),
-		row("Main model routing", config.mainModelRoutingEnabled ? "enabled" : "disabled"),
-		row("MAIN_DEFAULT", `${mainNormal.alias} → ${mainNormal.label}`),
-		row("MAIN_SLOW", `${mainDeep.alias} → ${mainDeep.label}`),
+		row("Primary model", "unchanged — no model switching"),
 		row("Model", config.jevModel || "jev-latest (default)"),
 		row("Gate", `confidence ≥ ${config.orchestrationMinConfidence}, margin ≥ ${config.orchestrationMinMargin}`),
 		"",
 		row("TASK tier routing", config.taskRoutingEnabled ? "enabled" : "disabled"),
-		row("TASK_NORMAL", `${normal.alias} → ${normal.label}`),
-		row("TASK_DEEP", `${deep.alias} → ${deep.label}`),
+		row("TASK_EASY", `${easy.alias} → ${easy.label}`),
+		row("TASK_HARD", `${hard.alias} → ${hard.label}`),
+		row("TASK_CHALLENGE", `${challenge.alias} → ${challenge.label}`),
 		row("Gate", `confidence ≥ ${config.taskMinConfidence}, margin ≥ ${config.taskMinMargin}`),
-		row("Tier agent", aliasState(DEEP_AGENT_NAME)),
+		row("Easy tier agent", aliasState(EASY_AGENT_NAME)),
+		row("Hard tier agent", aliasState(HARD_AGENT_NAME)),
+		row("Challenge tier agent", aliasState(CHALLENGE_AGENT_NAME)),
 	];
-	if (config.normalTaskRole !== GENERIC_TASK_AGENT) {
-		lines.push(row("Normal tier agent", aliasState(NORMAL_AGENT_NAME)));
-	}
 
 	const orchestration = runtime.orchestration.lastDecision;
 	const task = runtime.task.lastDecision;
@@ -98,27 +95,17 @@ export async function renderStatus(
 		row(
 			"Last orchestration",
 			orchestration
-				? `${orchestration.outcome}${orchestration.confidence === undefined ? "" : ` ${orchestration.confidence.toFixed(2)}`}${orchestration.model ? ` model=${orchestration.model}` : ""}`
+				? `${orchestration.outcome}${orchestration.confidence === undefined ? "" : ` ${orchestration.confidence.toFixed(2)}`}`
 				: "none this session",
 		),
 		row("Last TASK route", task ? `${task.route} ${task.confidence.toFixed(2)}` : "none this session"),
 	);
 
-	if (normal.modelId && normal.modelId === deep.modelId) {
-		lines.push(
-			"",
-			"TASK_NORMAL and TASK_DEEP currently resolve to the same model.",
-			"Tier routing is active but provides no model-cost differentiation.",
-		);
+	const tiers = [easy, hard, challenge];
+	if (tiers.every(role => role.modelId) && new Set(tiers.map(role => role.modelId)).size < tiers.length) {
+		lines.push("", "Some worker tiers resolve to the same model; check role assignments for cost differentiation.");
 	}
-	if (config.mainModelRoutingEnabled && mainNormal.modelId && mainNormal.modelId === mainDeep.modelId) {
-		lines.push(
-			"",
-			"MAIN_DEFAULT and MAIN_SLOW currently resolve to the same model. Main-model routing is active but provides no model-cost differentiation.",
-		);
-	}
-	const unresolved = [normal, deep, ...(config.mainModelRoutingEnabled ? [mainNormal, mainDeep] : [])]
-		.filter(role => !role.modelId).map(role => role.alias);
+	const unresolved = tiers.filter(role => !role.modelId).map(role => role.alias);
 	if (unresolved.length > 0) {
 		lines.push(
 			"",
@@ -147,21 +134,22 @@ export function renderStats(runtime: JevRouterRuntime): string {
 		buckets.map((count, index) => `${(index / 10).toFixed(1)}:${count}`).join(" ");
 
 	const lines = [
-		row("Routed user turns", String(orchestration.requests)),
-		...(orchestration.legacyDirect > 0 ? [row("  DIRECT (v1, migrated)", String(orchestration.legacyDirect))] : []),
+		row("Orchestration decisions", String(orchestration.requests)),
+		...(orchestration.legacyDecisions > 0 ? [row("  retired labels", String(orchestration.legacyDecisions))] : []),
 		row("  DEFAULT", String(orchestration.DEFAULT)),
-		row("  SLOW", String(orchestration.SLOW)),
 		row("  ORCHESTRATE", String(orchestration.ORCHESTRATE)),
-		row("  UNCERTAIN", String(orchestration.UNCERTAIN)),
 		row("  errors / timeouts", `${orchestration.errors} / ${orchestration.timeouts}`),
 		row("  avg latency", avg(orchestration.latencySumMs, orchestration.latencyCount)),
 		row("  confidence", histogram(orchestration.confidence)),
 		row("  margin", histogram(orchestration.margin)),
 		"",
 		row("TASK batches", String(task.batches)),
-		row("  TASK_NORMAL", String(task.TASK_NORMAL)),
-		row("  TASK_DEEP", String(task.TASK_DEEP)),
-		row("  gate fallbacks", String(task.fallbackDeep)),
+		row("  TASK_EASY", String(task.TASK_EASY)),
+		row("  TASK_HARD", String(task.TASK_HARD)),
+		row("  TASK_CHALLENGE", String(task.TASK_CHALLENGE)),
+		row("  gate fallbacks", String(task.fallbackChallenge)),
+		...(task.legacyDecisions > 0 ? [row("  retired labels", String(task.legacyDecisions))] : []),
+		...(task.legacyFallbacks > 0 ? [row("  retired fallbacks", String(task.legacyFallbacks))] : []),
 		row("  errors / timeouts", `${task.errors} / ${task.timeouts}`),
 		row("  avg latency", avg(task.latencySumMs, task.latencyCount)),
 		row("  confidence", histogram(task.confidence)),
@@ -253,12 +241,12 @@ async function runTest(runtime: JevRouterRuntime): Promise<string> {
 
 	for (const [index, request, expected] of [
 		[1, TEST_REQUEST, "DEFAULT — a localized two-call-site rename"],
-		[2, TEST_DEEP_REQUEST, "SLOW — root-cause plus consistency reasoning, one sequential body of work"],
+		[2, TEST_PARALLEL_REQUEST, "ORCHESTRATE — independent subsystem workstreams"],
 	] as const) {
 		try {
 			const decision = await runtime.engine.decideOrchestration(
 				request,
-				[],
+				{ recentMessages: [] },
 				options,
 				{ minConfidence: config.orchestrationMinConfidence, minMargin: config.orchestrationMinMargin },
 				config.maxRoutingInputChars,
@@ -266,7 +254,7 @@ async function runTest(runtime: JevRouterRuntime): Promise<string> {
 			lines.push(
 				row(
 					`Front-door probe ${index}/2`,
-					`${decision.confident ? decision.top : "UNCERTAIN"} confidence=${decision.confidence.toFixed(2)} margin=${decision.margin.toFixed(2)} ${Math.round(decision.latencyMs)}ms`,
+					`${decision.confident ? decision.top : "DEFAULT (gate)"} confidence=${decision.confidence.toFixed(2)} margin=${decision.margin.toFixed(2)} ${Math.round(decision.latencyMs)}ms`,
 				),
 				row("  (expected)", expected),
 			);
@@ -287,12 +275,12 @@ async function runTest(runtime: JevRouterRuntime): Promise<string> {
 			lines.push(
 				row(
 					`TASK probe ${index + 1}`,
-					`${decision.confident ? decision.top : "TASK_DEEP (gate)"} confidence=${decision.confidence.toFixed(2)} margin=${decision.margin.toFixed(2)}`,
+					`${decision.confident ? decision.top : "TASK_CHALLENGE (gate)"} confidence=${decision.confidence.toFixed(2)} margin=${decision.margin.toFixed(2)}`,
 				),
 			);
 		}
 		lines.push(
-			row("  (expected)", "1 = TASK_NORMAL (clear spec), 2 = TASK_DEEP (root-cause + consistency)"),
+			row("  (expected)", "1 = TASK_EASY (mechanical), 2 = TASK_CHALLENGE (root cause), 3 = TASK_HARD (implementation)"),
 			row("  batch latency", `${Math.round(batch.latencyMs)}ms for ${batch.decisions.length} decisions in 1 request`),
 		);
 	} catch (error) {

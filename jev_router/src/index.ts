@@ -1,10 +1,8 @@
 /**
  * omp-jev-router — two bounded routing decisions for OMP.
  *
- *   1. Front door: DEFAULT, SLOW, or OMP's native ORCHESTRATE contract
- *      for this user request.
- *   2. Tier: once OMP has chosen its generic `task` worker, should that spawn
- *      resolve through `@task` or through `@task_hard`?
+ *   1. DEFAULT or native ORCHESTRATE; the primary model never changes.
+ *   2. EASY, HARD or CHALLENGE for generic `task` workers.
  *
  * OMP's own SMOL vs TASK decision, its specialized agents, and every explicit
  * user choice are left exactly as they are.
@@ -17,7 +15,7 @@ import { TYPESAFE_PROVIDER } from "./credentials.ts";
 import { mainSessionOf, sessionOf } from "./host.ts";
 import { JevRouterRuntime } from "./runtime.ts";
 import { GENERIC_TASK_AGENT } from "./task-routing.ts";
-import { DEEP_AGENT_NAME, NORMAL_AGENT_NAME } from "./deep-agent.ts";
+import { EASY_AGENT_NAME, HARD_AGENT_NAME, CHALLENGE_AGENT_NAME } from "./deep-agent.ts";
 import { trackWorkerUsage } from "./worker-usage.ts";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
@@ -36,9 +34,15 @@ export function registerJevRouter(pi: ExtensionAPI, packageRoot: string): JevRou
 		const settings = mainSessionOf(ctx)?.settings;
 		if (settings) {
 			let changed = false;
-			if (runtime.config.deepTaskRole === "task_hard" && settings.getModelRole("task_hard") === undefined) {
-				settings.setModelRole("task_hard", "@slow");
-				changed = true;
+			for (const [role, fallback] of [
+				[runtime.config.easyTaskRole, "@smol"],
+				[runtime.config.hardTaskRole, "@task"],
+				[runtime.config.challengeTaskRole, "@slow"],
+			] as const) {
+				if (settings.getModelRole(role) === undefined) {
+					settings.setModelRole(role, fallback);
+					changed = true;
+				}
 			}
 			if (settings.getModelRole(AUDITOR_ROLE) === undefined) {
 				settings.setModelRole(AUDITOR_ROLE, "@smol");
@@ -51,15 +55,13 @@ export function registerJevRouter(pi: ExtensionAPI, packageRoot: string): JevRou
 		await runtime.surveyAgents(ctx.cwd, sessionOf(ctx)?.settings);
 		runtime.checkTierRoles(ctx);
 	});
-	registerOrcheAdvisor(pi);
 	const stopUsageTracking = trackWorkerUsage(
 		pi.events,
 		runtime.telemetry,
-		new Set([GENERIC_TASK_AGENT, NORMAL_AGENT_NAME, DEEP_AGENT_NAME]),
+		new Set([GENERIC_TASK_AGENT, EASY_AGENT_NAME, HARD_AGENT_NAME, CHALLENGE_AGENT_NAME]),
 	);
 
-	// One Jev call per prompt, memoized across policy-preparation retries.
-	// The model must be set here: agent-loop.ts captures it before `context`.
+	// Initial classification sees bounded visible history and the committed plan.
 	pi.on("before_agent_start", async (event, ctx) => {
 		runtime.bindContext(ctx);
 		await runtime.orchestration.beginTurn(ctx, event.prompt);
@@ -72,9 +74,15 @@ export function registerJevRouter(pi: ExtensionAPI, packageRoot: string): JevRou
 		return messages ? { messages } : undefined;
 	});
 
-	// A settled turn restores the model unless another actor changed it.
-	pi.on("agent_end", async (event, ctx) => {
-		if (event.willContinue !== true) await runtime.orchestration.endTurn(ctx.model);
+	pi.on("agent_end", (event) => {
+		if (event.willContinue !== true) runtime.orchestration.endTurn();
+	});
+
+	// Reconsider orchestration after a successful plan commit, never model selection.
+	pi.on("tool_result", async (event, ctx) => {
+		if (event.toolName !== "todo") return;
+		runtime.bindContext(ctx);
+		await runtime.orchestration.onTodoResult(ctx, event);
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
@@ -92,6 +100,8 @@ export function registerJevRouter(pi: ExtensionAPI, packageRoot: string): JevRou
 		stopUsageTracking();
 		await runtime.telemetry.flush();
 	});
+	// Run after our context hook so new orchestration notices get review guidance immediately.
+	registerOrcheAdvisor(pi);
 
 	return runtime;
 }

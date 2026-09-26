@@ -5,7 +5,7 @@ import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-ent
 import example from "../examples/initial-plan.json";
 import { prepareReviewInput, ROLE, TOOL } from "../src/advisor-review.ts";
 import { registerJevRouter } from "../src/index.ts";
-import { VERIFICATION_AUDITOR } from "../src/verification-auditor.ts";
+import { AUDITOR_NAME, VERIFICATION_AUDITOR } from "../src/verification-auditor.ts";
 import { clearRegistry, makeSession, registerAsMain } from "./harness.ts";
 
 afterEach(clearRegistry);
@@ -66,4 +66,18 @@ test("one extension registers the checkpoint tool and an independent auditor rol
   const result = await checkpointTool!.execute("review-call", example, new AbortController().signal, () => {}, ctx);
   expect(result.content).toContainEqual({ type: "text", text: "VERDICT: KEEP" });
   expect(result.details).toMatchObject({ role: ROLE, reused: true, findingsForwarded: 0 });
+
+  // A persisted auditor finding must invalidate the otherwise identical cached review.
+  const prior = session.sessionManager.getBranch();
+  const finding: SessionEntry = {
+    type: "custom_message", id: "fresh-audit", parentId: null, timestamp: "2026-09-26T00:00:00Z",
+    customType: "advisor", content: "Evidence missing", display: true,
+    details: { notes: [{ advisor: AUDITOR_NAME, severity: "blocker", note: "Claimed smoke has no run output" }] },
+  };
+  Object.assign(session.sessionManager, { getBranch: () => [...prior, finding] });
+  Object.assign(session.settings, { reloadFromDisk: async () => {} });
+  Object.assign(ctx.modelRegistry, { getAvailable: () => [] });
+  // No reviewer configured: attempting a new review must fail, never reuse stale KEEP.
+  await expect(checkpointTool!.execute("review-call-2", example, new AbortController().signal, () => {}, ctx))
+    .rejects.toThrow("Configure modelRoles.orche-advisor");
 });

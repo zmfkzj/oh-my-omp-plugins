@@ -18,6 +18,7 @@ import type {
 	JevSubtask,
 	OrchestrationDecision,
 	OrchestrationRoute,
+	RoutingContext,
 	TaskTierBatch,
 	TaskRoute,
 } from "../src/jev.ts";
@@ -96,7 +97,7 @@ export function clearRegistry(): void {
 }
 
 /** Minimal `ExtensionAPI` exposing the tool catalogue and logger the routers use. */
-export function makeApi(taskAgents: string[] = ["scout", "reviewer", "security-reviewer", "task", "sonic", "task-deep"]): {
+export function makeApi(taskAgents: string[] = ["scout", "reviewer", "security-reviewer", "task", "sonic", "task-easy", "task-hard", "task-challenge"]): {
 	pi: ExtensionAPI;
 	logs: string[];
 } {
@@ -132,7 +133,8 @@ export class ScriptedDecider implements JevDecider {
 	taskCalls = 0;
 	lastSubtasks: readonly JevSubtask[] = [];
 	lastOptions: EngineOptions | undefined;
-	lastPriorRequests: readonly string[] = [];
+	lastContext: RoutingContext = { recentMessages: [] };
+	lastSharedContext: string | undefined;
 	#orchestrationQueue: (ScriptedOrchestration | Error)[];
 
 	constructor(
@@ -144,14 +146,14 @@ export class ScriptedDecider implements JevDecider {
 
 	async decideOrchestration(
 		_request: string,
-		priorRequests: readonly string[],
+		context: RoutingContext,
 		options: EngineOptions,
 		gates: GateThresholds,
 		_maxChars: number,
 	): Promise<OrchestrationDecision> {
 		this.orchestrationCalls++;
 		this.lastOptions = options;
-		this.lastPriorRequests = priorRequests;
+		this.lastContext = context;
 		const next =
 			this.#orchestrationQueue.length > 1 ? this.#orchestrationQueue.shift()! : this.#orchestrationQueue[0]!;
 		if (next instanceof Error) throw next;
@@ -168,20 +170,21 @@ export class ScriptedDecider implements JevDecider {
 
 	async decideTaskTiers(
 		subtasks: readonly JevSubtask[],
-		_sharedContext: string | undefined,
+		sharedContext: string | undefined,
 		options: EngineOptions,
 		gates: GateThresholds,
 		_maxChars: number,
 	): Promise<TaskTierBatch> {
 		this.taskCalls++;
 		this.lastSubtasks = subtasks;
+		this.lastSharedContext = sharedContext;
 		this.lastOptions = options;
 		if (this.tiers instanceof Error) throw this.tiers;
 		const table = this.tiers;
 		return {
 			latencyMs: 9,
 			decisions: subtasks.map(subtask => {
-				const answer = table[subtask.id] ?? { top: "TASK_NORMAL" as TaskRoute, confidence: 0.95, margin: 0.9 };
+				const answer = table[subtask.id] ?? { top: "TASK_HARD" as TaskRoute, confidence: 0.95, margin: 0.9 };
 				return {
 					id: subtask.id,
 					top: answer.top,

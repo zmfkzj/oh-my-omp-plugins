@@ -10,8 +10,7 @@
  *   gate outcome, latency. The pre-gate `top` and probabilities let any other
  *   gate be replayed exactly offline; the aggregate histograms cannot.
  *
- * Worker usage is attributed by agent name, which is exactly the tier the
- * router selected (`task` = normal, `task-deep` = deep). It is read from OMP's
+ * Worker usage is attributed by selected tier agent name and read from OMP's
  * subagent progress/lifecycle frames, which fire for sync and background
  * spawns alike (see `worker-usage.ts`). `ctx.sessionManager.getUsageStatistics()`
  * is a single session-wide total with no per-role breakdown, so it cannot
@@ -21,7 +20,7 @@ import { appendFile, rename } from "node:fs/promises";
 import path from "node:path";
 
 export const HISTOGRAM_BUCKETS = 10;
-export const TELEMETRY_VERSION = 3;
+export const TELEMETRY_VERSION = 4;
 
 export interface RouteCounters {
 	requests: number;
@@ -60,13 +59,11 @@ export interface TelemetrySnapshot {
 	updatedAt: number;
 	orchestration: RouteCounters & {
 		DEFAULT: number;
-		SLOW: number;
 		ORCHESTRATE: number;
-		UNCERTAIN: number;
-		/** v1 `DIRECT` decisions (no notice, no model switch), carried over by migration. */
-		legacyDirect: number;
+		/** Retired DIRECT/SLOW/UNCERTAIN labels, retained only as historical totals. */
+		legacyDecisions: number;
 	};
-	task: RouteCounters & { batches: number; TASK_NORMAL: number; TASK_DEEP: number; fallbackDeep: number };
+	task: RouteCounters & { batches: number; TASK_EASY: number; TASK_HARD: number; TASK_CHALLENGE: number; fallbackChallenge: number; legacyDecisions: number; legacyFallbacks: number };
 	workers: Record<string, WorkerCounters>;
 }
 
@@ -81,7 +78,7 @@ interface GateFields {
 
 /** One line of `decisions.jsonl`, minus the timestamp added on append. */
 export type DecisionRecord =
-	| (GateFields & { kind: "orchestration"; route: string; latencyMs: number; model: string })
+	| (GateFields & { kind: "orchestration"; route: string; latencyMs: number })
 	| (GateFields & { kind: "task"; route: string; latencyMs: number; batchSize: number })
 	| { kind: "orchestration" | "task"; route: "ERROR"; timedOut: boolean; items?: number };
 
@@ -105,8 +102,8 @@ export function emptySnapshot(): TelemetrySnapshot {
 	return {
 		version: TELEMETRY_VERSION,
 		updatedAt: 0,
-		orchestration: { ...emptyRouteCounters(), DEFAULT: 0, SLOW: 0, ORCHESTRATE: 0, UNCERTAIN: 0, legacyDirect: 0 },
-		task: { ...emptyRouteCounters(), batches: 0, TASK_NORMAL: 0, TASK_DEEP: 0, fallbackDeep: 0 },
+		orchestration: { ...emptyRouteCounters(), DEFAULT: 0, ORCHESTRATE: 0, legacyDecisions: 0 },
+		task: { ...emptyRouteCounters(), batches: 0, TASK_EASY: 0, TASK_HARD: 0, TASK_CHALLENGE: 0, fallbackChallenge: 0, legacyDecisions: 0, legacyFallbacks: 0 },
 		workers: {},
 	};
 }
@@ -172,8 +169,15 @@ export function reviveSnapshot(raw: unknown): TelemetrySnapshot {
 	reviveRoute(snapshot.orchestration, record.orchestration);
 	reviveRoute(snapshot.task, record.task);
 	if (typeof record.orchestration === "object" && record.orchestration !== null) {
-		// v1 named the no-notice route `DIRECT`; v2 dropped it on load.
-		snapshot.orchestration.legacyDirect += finite((record.orchestration as Record<string, unknown>).DIRECT) ?? 0;
+		const old = record.orchestration as Record<string, unknown>;
+		for (const label of ["DIRECT", "legacyDirect", "SLOW", "UNCERTAIN"]) {
+			snapshot.orchestration.legacyDecisions += finite(old[label]) ?? 0;
+		}
+	}
+	if (typeof record.task === "object" && record.task !== null) {
+		const old = record.task as Record<string, unknown>;
+		snapshot.task.legacyDecisions += (finite(old.TASK_NORMAL) ?? 0) + (finite(old.TASK_DEEP) ?? 0);
+		snapshot.task.legacyFallbacks += finite(old.fallbackDeep) ?? 0;
 	}
 	const updatedAt = finite(record.updatedAt);
 	if (updatedAt !== undefined) snapshot.updatedAt = updatedAt;
@@ -284,7 +288,7 @@ export class Telemetry {
 		this.#timer.unref?.();
 	}
 
-	recordOrchestration(route: "DEFAULT" | "SLOW" | "ORCHESTRATE" | "UNCERTAIN", confidence: number, margin: number, latencyMs: number): void {
+	recordOrchestration(route: "DEFAULT" | "ORCHESTRATE", confidence: number, margin: number, latencyMs: number): void {
 		if (!this.#enabled) return;
 		const bucket = this.#snapshot.orchestration;
 		bucket.requests++;
@@ -305,11 +309,11 @@ export class Telemetry {
 		this.#touch();
 	}
 
-	recordTaskDecision(route: "TASK_NORMAL" | "TASK_DEEP", confidence: number, margin: number, confident: boolean): void {
+	recordTaskDecision(route: "TASK_EASY" | "TASK_HARD" | "TASK_CHALLENGE", confidence: number, margin: number, confident: boolean): void {
 		if (!this.#enabled) return;
 		const bucket = this.#snapshot.task;
 		bucket[route]++;
-		if (!confident) bucket.fallbackDeep++;
+		if (!confident) bucket.fallbackChallenge++;
 		bucket.confidence[bucketOf(confidence)]!++;
 		bucket.margin[bucketOf(margin)]!++;
 		this.#touch();

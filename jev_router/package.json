@@ -1,7 +1,7 @@
 {
   "name": "omp-jev-router",
   "version": "1.0.0",
-  "description": "Routes main-session models, native orchestration, and TASK tiers with Jev; includes checkpoint reviews and independent verification.",
+  "description": "Keeps the primary model fixed while routing orchestration and three worker tiers with Jev; includes checkpoint reviews and independent verification.",
   "license": "UNLICENSED",
   "type": "module",
   "files": [
@@ -36,65 +36,55 @@
       "orchestrationRoutingEnabled": {
         "type": "boolean",
         "default": true,
-        "description": "Decide per user request whether to activate OMP's native orchestrate contract."
-      },
-      "mainModelRoutingEnabled": {
-        "type": "boolean",
-        "default": true,
-        "description": "Switch the main session model per user request between mainNormalRole and mainDeepRole."
-      },
-      "mainNormalRole": {
-        "type": "string",
-        "default": "default",
-        "description": "Model role the main agent normally runs on; routing engages only while the session is on this role's model."
-      },
-      "mainDeepRole": {
-        "type": "string",
-        "default": "slow",
-        "description": "Model role a SLOW or unconfident decision switches the main agent to for that turn."
+        "description": "Decide whether to activate native orchestration at request start and after a committed todo plan change; never changes the primary model."
       },
       "orchestrationMinConfidence": {
         "type": "number",
         "default": 0.6,
         "min": 0,
         "max": 1,
-        "description": "max(probabilities) a front-door decision must reach; below it the turn runs on the deep role with the uncertain hint."
+        "description": "Minimum confidence for orchestration; below the gate keep DEFAULT and the current primary model."
       },
       "orchestrationMinMargin": {
         "type": "number",
         "default": 0.2,
         "min": 0,
         "max": 1,
-        "description": "top1 - top2 a front-door decision must reach; below it the turn runs on the deep role with the uncertain hint."
+        "description": "Minimum top1 - top2 margin for orchestration; below the gate keep DEFAULT."
       },
       "taskRoutingEnabled": {
         "type": "boolean",
         "default": true,
-        "description": "Pick @task vs @task_hard for generic task spawns."
+        "description": "Pick task_easy, task_hard or task_challenge for generic task spawns."
       },
       "taskMinConfidence": {
         "type": "number",
         "default": 0.75,
         "min": 0,
         "max": 1,
-        "description": "max(probabilities) a tier decision must reach; below it the spawn goes deep."
+        "description": "Minimum tier confidence; uncertainty selects task_challenge."
       },
       "taskMinMargin": {
         "type": "number",
         "default": 0.2,
         "min": 0,
         "max": 1,
-        "description": "top1 - top2 a tier decision must reach; below it the spawn goes deep."
+        "description": "Minimum tier probability margin; uncertainty selects task_challenge."
       },
-      "normalTaskRole": {
+      "easyTaskRole": {
         "type": "string",
-        "default": "task",
-        "description": "Model role for TASK_NORMAL. 'task' leaves OMP's bundled agent untouched."
+        "default": "task_easy",
+        "description": "Model role for mechanical, low-risk TASK_EASY work."
       },
-      "deepTaskRole": {
+      "hardTaskRole": {
         "type": "string",
         "default": "task_hard",
-        "description": "Model role for TASK_DEEP."
+        "description": "Model role for substantive TASK_HARD implementation."
+      },
+      "challengeTaskRole": {
+        "type": "string",
+        "default": "task_challenge",
+        "description": "Model role for TASK_CHALLENGE reasoning and uncertain task decisions."
       },
       "routingTimeoutMs": {
         "type": "number",
@@ -105,10 +95,10 @@
       },
       "maxRoutingInputChars": {
         "type": "number",
-        "default": 4000,
+        "default": 12000,
         "min": 200,
         "max": 40000,
-        "description": "Upper bound on the text sent to Jev per decision."
+        "description": "Combined character budget for task text, visible conversation and committed plan sent to Jev (excluding JSON framing and fixed classifier instructions)."
       },
       "telemetryEnabled": {
         "type": "boolean",

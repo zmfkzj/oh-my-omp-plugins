@@ -10,10 +10,10 @@ import type { ToolCallEventResult } from "@oh-my-pi/pi-coding-agent";
 
 function build(
 	tiers: Record<string, { top: TaskRoute; confidence: number; margin: number }> | Error,
-	options: { agents?: string[]; config?: Partial<JevRouterConfig>; bundled?: boolean; apiKey?: string | undefined } = {},
+	options: { agents?: string[]; available?: string[]; config?: Partial<JevRouterConfig>; bundled?: boolean; apiKey?: string | undefined; routingContext?: () => string | undefined } = {},
 ) {
 	const decider = new ScriptedDecider({ top: "DEFAULT", confidence: 1, margin: 1, confident: true }, tiers);
-	const { pi } = makeApi(options.agents);
+	const { pi } = makeApi(options.agents ?? ["task", "sonic", "scout", "task-easy", "task-hard", "task-challenge"]);
 	const telemetry = new Telemetry("/tmp/jev-router-test-state");
 	telemetry.setEnabled(false);
 	const config = { ...normalizeConfig(undefined), ...options.config };
@@ -24,6 +24,8 @@ function build(
 		credential: async () => ("apiKey" in options ? options.apiKey : "ts_test_key"),
 		config: () => config,
 		genericTaskIsBundled: () => options.bundled ?? true,
+		routingContext: options.routingContext,
+		availableTierAgents: options.available ? () => new Set(options.available) : undefined,
 	});
 	return { router, pi, decider };
 }
@@ -68,29 +70,24 @@ describe("task input normalization", () => {
 });
 
 describe("TASK tier routing", () => {
-	test("a well-specified implementation stays on @task and rewrites nothing", async () => {
-		const { router, pi, decider } = build({ t0: { top: "TASK_NORMAL", confidence: 0.88, margin: 0.76 } });
-
-		const result = await router.route(pi, "call-1", batch({ agent: "task", task: "Add a --json flag." }));
-
-		expect(result).toBeUndefined();
-		expect(decider.taskCalls).toBe(1);
-		expect(router.lastDecision?.route).toBe("TASK_NORMAL");
-	});
-
-	test("a deep-reasoning subtask is rerouted to the task-deep alias", async () => {
-		const { router, pi } = build({ t0: { top: "TASK_DEEP", confidence: 0.86, margin: 0.72 } });
-
-		const result = await router.route(pi, "call-2", batch({ agent: "task", task: "Find the race condition." }));
-
-		expect(revised(result)).toMatchObject({
-			context: "Shared background.",
-			tasks: [{ agent: "task-deep", task: "Find the race condition." }],
+	test("easy, hard, and challenge choose distinct agent roles", async () => {
+		const { router, pi, decider } = build({
+			t0: { top: "TASK_EASY", confidence: 0.88, margin: 0.76 },
+			t1: { top: "TASK_HARD", confidence: 0.9, margin: 0.8 },
+			t2: { top: "TASK_CHALLENGE", confidence: 0.86, margin: 0.72 },
 		});
+		const result = await router.route(pi, "call-1", batch(
+			{ agent: "task", task: "Add a --json flag." },
+			{ agent: "task", task: "Investigate complex performance." },
+			{ agent: "task", task: "Find the race condition." },
+		));
+		expect(revisedAgents(result)).toEqual(["task-easy", "task-hard", "task-challenge"]);
+		expect(decider.taskCalls).toBe(1);
+		expect(router.lastDecision?.route).toBe("TASK_CHALLENGE");
 	});
 
 	test("every non-routing field survives the rewrite", async () => {
-		const { router, pi } = build({ t0: { top: "TASK_DEEP", confidence: 0.9, margin: 0.8 } });
+		const { router, pi } = build({ t0: { top: "TASK_CHALLENGE", confidence: 0.9, margin: 0.8 } });
 		const item = {
 			name: "Prober",
 			agent: "task",
@@ -106,15 +103,15 @@ describe("TASK tier routing", () => {
 
 		expect((revised(result).tasks as Record<string, unknown>[])[0]).toEqual({
 			...item,
-			agent: "task-deep",
+			agent: "task-challenge",
 		});
 	});
 
 	test("a mixed batch is classified in a single Jev request", async () => {
 		const { router, pi, decider } = build({
-			t0: { top: "TASK_NORMAL", confidence: 0.9, margin: 0.8 },
-			t1: { top: "TASK_DEEP", confidence: 0.9, margin: 0.8 },
-			t2: { top: "TASK_NORMAL", confidence: 0.9, margin: 0.8 },
+			t0: { top: "TASK_EASY", confidence: 0.9, margin: 0.8 },
+			t1: { top: "TASK_CHALLENGE", confidence: 0.9, margin: 0.8 },
+			t2: { top: "TASK_HARD", confidence: 0.9, margin: 0.8 },
 		});
 
 		const result = await router.route(
@@ -128,15 +125,11 @@ describe("TASK tier routing", () => {
 		);
 
 		expect(decider.taskCalls).toBe(1);
-		expect(revisedAgents(result)).toEqual([
-			"task",
-			"task-deep",
-			"task",
-		]);
+		expect(revisedAgents(result)).toEqual(["task-easy", "task-challenge", "task-hard"]);
 	});
 
 	test("specialized and custom agents in a batch are never rewritten", async () => {
-		const { router, pi, decider } = build({ t1: { top: "TASK_DEEP", confidence: 0.9, margin: 0.8 } });
+		const { router, pi, decider } = build({ t1: { top: "TASK_CHALLENGE", confidence: 0.9, margin: 0.8 } });
 
 		const result = await router.route(
 			pi,
@@ -148,7 +141,7 @@ describe("TASK tier routing", () => {
 			),
 		);
 
-		expect(revisedAgents(result)).toEqual(["sonic", "task-deep", "my-custom-agent"]);
+		expect(revisedAgents(result)).toEqual(["sonic", "task-challenge", "my-custom-agent"]);
 		// Only the generic item was ever shown to Jev.
 		expect(decider.lastSubtasks.map(subtask => subtask.id)).toEqual(["t1"]);
 	});
@@ -160,16 +153,16 @@ describe("TASK tier routing", () => {
 		expect(decider.taskCalls).toBe(0);
 	});
 
-	test("a low-confidence tier decision fails quality-safe to the deep tier", async () => {
-		const { router, pi } = build({ t0: { top: "TASK_NORMAL", confidence: 0.6, margin: 0.2 } });
+	test("a low-confidence easy decision fails quality-safe to challenge", async () => {
+		const { router, pi } = build({ t0: { top: "TASK_EASY", confidence: 0.6, margin: 0.2 } });
 
 		const result = await router.route(pi, "call-7", batch({ agent: "task", task: "Ambiguous work." }));
 
-		expect(revisedAgents(result)[0]).toBe("task-deep");
+		expect(revisedAgents(result)[0]).toBe("task-challenge");
 		expect(router.lastDecision?.confident).toBe(false);
 	});
 
-	test("a Jev failure routes the whole call to the deep tier", async () => {
+	test("a Jev failure routes the whole call to challenge", async () => {
 		const { router, pi } = build(new Error("HTTP 429 rate limited"));
 
 		const result = await router.route(
@@ -178,23 +171,61 @@ describe("TASK tier routing", () => {
 			batch({ agent: "task", task: "One." }, { agent: "task", task: "Two." }),
 		);
 
-		expect(revisedAgents(result)).toEqual([
-			"task-deep",
-			"task-deep",
-		]);
+		expect(revisedAgents(result)).toEqual(["task-challenge", "task-challenge"]);
 	});
 
-	test("a missing credential routes to the deep tier without calling Jev", async () => {
+	test("a missing credential routes to challenge without calling Jev", async () => {
 		const { router, pi, decider } = build({}, { apiKey: undefined });
 
 		const result = await router.route(pi, "call-9", batch({ agent: "task", task: "Work." }));
 
-		expect(revisedAgents(result)[0]).toBe("task-deep");
+		expect(revisedAgents(result)[0]).toBe("task-challenge");
 		expect(decider.taskCalls).toBe(0);
+	});
+	test("omitted classifier results select challenge without weakening returned tiers", async () => {
+		const { router, pi, decider } = build({});
+		decider.decideTaskTiers = async () => ({
+			latencyMs: 7,
+			decisions: [{
+				id: "t0", top: "TASK_HARD", confidence: 0.9, margin: 0.8, confident: true,
+				probabilities: { TASK_HARD: 0.9 },
+			}],
+		});
+		const result = await router.route(pi, "missing-result", batch(
+			{ agent: "task", task: "Change index." },
+			{ agent: "task", task: "Investigate ambiguity." },
+		));
+		expect(revisedAgents(result)).toEqual(["task-hard", "task-challenge"]);
+	});
+
+	test("additional branch context augments the original shared task context", async () => {
+		const { router, pi, decider } = build({ t0: { top: "TASK_EASY", confidence: 0.9, margin: 0.8 } }, {
+			routingContext: () => "Active plan: migrate schema first.",
+		});
+		const input = { ...batch({ agent: "task", task: "Update the migration." }), marker: "untouched" };
+		const result = await router.route(pi, "branch-context", input);
+		expect(decider.lastSharedContext).toBe("Shared background.\n\nActive plan: migrate schema first.");
+		expect(revised(result)).toEqual({ ...input, tasks: [{ agent: "task-easy", task: "Update the migration." }] });
+	});
+
+	test("unspawnable easy and hard aliases leave their items native", async () => {
+		const { router, pi, decider } = build({
+			t0: { top: "TASK_EASY", confidence: 0.9, margin: 0.8 },
+			t1: { top: "TASK_HARD", confidence: 0.9, margin: 0.8 },
+			t2: { top: "TASK_CHALLENGE", confidence: 0.9, margin: 0.8 },
+		}, { agents: ["task", "task-challenge"] });
+		const input = batch(
+			{ agent: "task", task: "Simple." },
+			{ agent: "task", task: "Complex." },
+			{ agent: "task", task: "Critical." },
+		);
+		const result = await router.route(pi, "unspawnable-tiers", input);
+		expect(decider.taskCalls).toBe(1);
+		expect(revisedAgents(result)).toEqual(["task", "task", "task-challenge"]);
 	});
 
 	test("the same tool call is classified once even if the event fires twice", async () => {
-		const { router, pi, decider } = build({ t0: { top: "TASK_DEEP", confidence: 0.9, margin: 0.8 } });
+		const { router, pi, decider } = build({ t0: { top: "TASK_CHALLENGE", confidence: 0.9, margin: 0.8 } });
 		const input = batch({ agent: "task", task: "Reason about it." });
 
 		const first = await router.route(pi, "call-10", input);
@@ -204,8 +235,8 @@ describe("TASK tier routing", () => {
 		expect(second).toBe(first);
 	});
 
-	test("an unspawnable task-deep alias leaves the call native", async () => {
-		const { router, pi, decider } = build({ t0: { top: "TASK_DEEP", confidence: 0.9, margin: 0.8 } }, {
+	test("an unspawnable challenge alias leaves the call native without consulting Jev", async () => {
+		const { router, pi, decider } = build({ t0: { top: "TASK_CHALLENGE", confidence: 0.9, margin: 0.8 } }, {
 			agents: ["task", "scout"],
 		});
 
@@ -213,8 +244,16 @@ describe("TASK tier routing", () => {
 		expect(decider.taskCalls).toBe(0);
 	});
 
+	test("a stale read-only alias is not targeted even when advertised by OMP", async () => {
+		const { router, pi, decider } = build({ t0: { top: "TASK_EASY", confidence: 0.9, margin: 0.8 } }, {
+			available: ["task-hard", "task-challenge"],
+		});
+		expect(await router.route(pi, "stale-easy", batch({ agent: "task", task: "Work." }))).toBeUndefined();
+		expect(decider.taskCalls).toBe(1);
+	});
+
 	test("a shadowed generic `task` agent disables tier routing", async () => {
-		const { router, pi, decider } = build({ t0: { top: "TASK_DEEP", confidence: 0.9, margin: 0.8 } }, {
+		const { router, pi, decider } = build({ t0: { top: "TASK_CHALLENGE", confidence: 0.9, margin: 0.8 } }, {
 			bundled: false,
 		});
 
@@ -223,7 +262,7 @@ describe("TASK tier routing", () => {
 	});
 
 	test("routing can be switched off without touching OMP", async () => {
-		const { router, pi, decider } = build({ t0: { top: "TASK_DEEP", confidence: 0.9, margin: 0.8 } }, {
+		const { router, pi, decider } = build({ t0: { top: "TASK_CHALLENGE", confidence: 0.9, margin: 0.8 } }, {
 			config: { taskRoutingEnabled: false },
 		});
 
@@ -232,10 +271,10 @@ describe("TASK tier routing", () => {
 	});
 
 	test("the flat (non-batch) shape is routed too", async () => {
-		const { router, pi } = build({ t0: { top: "TASK_DEEP", confidence: 0.9, margin: 0.8 } });
+		const { router, pi } = build({ t0: { top: "TASK_CHALLENGE", confidence: 0.9, margin: 0.8 } });
 
 		const result = await router.route(pi, "call-14", { agent: "task", task: "Reason hard.", name: "Solo" });
 
-		expect(revised(result)).toEqual({ agent: "task-deep", task: "Reason hard.", name: "Solo" });
+		expect(revised(result)).toEqual({ agent: "task-challenge", task: "Reason hard.", name: "Solo" });
 	});
 });

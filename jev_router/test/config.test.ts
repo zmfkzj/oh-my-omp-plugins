@@ -18,15 +18,15 @@ describe("configuration normalization", () => {
 	});
 
 	test("garbage values fall back to defaults rather than breaking routing", () => {
-		const config = normalizeConfig({ taskMinConfidence: "nonsense", deepTaskRole: "not a role!", enabled: 7 });
+		const config = normalizeConfig({ taskMinConfidence: "nonsense", challengeTaskRole: "not a role!", enabled: 7 });
 		expect(config.taskMinConfidence).toBe(DEFAULT_CONFIG.taskMinConfidence);
-		expect(config.deepTaskRole).toBe(DEFAULT_CONFIG.deepTaskRole);
+		expect(config.challengeTaskRole).toBe(DEFAULT_CONFIG.challengeTaskRole);
 		expect(config.enabled).toBe(true);
 	});
 
 	test("roles accept bare and @-prefixed names and are stored bare", () => {
-		expect(normalizeConfig({ deepTaskRole: "@review" }).deepTaskRole).toBe("review");
-		expect(normalizeConfig({ normalTaskRole: "fast_worker" }).normalTaskRole).toBe("fast_worker");
+		expect(normalizeConfig({ challengeTaskRole: "@review" }).challengeTaskRole).toBe("review");
+		expect(normalizeConfig({ easyTaskRole: "fast_worker" }).easyTaskRole).toBe("fast_worker");
 	});
 
 	test("typed parsing rejects a non-boolean for a boolean key", () => {
@@ -34,6 +34,6 @@ describe("configuration normalization", () => {
 		expect(parseConfigValue("enabled", "yes")).toBeUndefined();
 		expect(parseConfigValue("taskMinConfidence", "0.85")).toBe(0.85);
 		expect(parseConfigValue("taskMinConfidence", "high")).toBeUndefined();
-		expect(parseConfigValue("deepTaskRole", " review ")).toBe("review");
+		expect(parseConfigValue("hardTaskRole", " review ")).toBe("review");
 	});
 });
