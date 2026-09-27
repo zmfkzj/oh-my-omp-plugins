@@ -45,10 +45,13 @@ Primary → native `task` call (task text carries the work contract)
 
 ### Orchestration (`before_agent_start` + `tool_result` + `context`)
 
-Initial classification runs at `before_agent_start`. Policy-preparation retries
-reuse the decision. Jev sees the current request, recent visible user/assistant
-messages, the earliest user goal still on the active branch, and the latest
-committed todo plan. It never receives hidden thinking or raw tool-result bodies.
+Initial classification runs at `before_agent_start`, before the input is
+persisted. Policy-preparation retries reuse the decision only while the last
+committed user entry is unchanged. A new user input is classified again even
+when its text matches the previous request. Jev sees the current request,
+recent visible user/assistant messages, the earliest user goal still on the
+active branch, and the latest committed todo plan. It never receives hidden
+thinking or raw tool-result bodies.
 
 - **DEFAULT** injects the plugin's light DEFAULT guidance (when `task` is
   enabled): work directly, delegate one unit only when a separate context helps.
@@ -64,12 +67,19 @@ A successful `todo init` or `todo append` reconsiders a changed committed plan.
 An already-orchestrated turn keeps its route without another routing call.
 Task and phase completion do not request advice. Failed writes, views,
 identical plans and late prior-turn results do not trigger spurious promotions.
-Agent-attributed steering does not start a new turn and cannot hide the current
-turn's todo results. User-attributed steering refreshes the turn through
-`before_agent_start`; results from the previous turn remain ineligible.
+Agent-attributed steering does not start a new turn, move policy notices, or
+hide the current turn's todo results. Promoted guidance remains behind its
+originating tool-result group while that group is retained, including after
+agent steering. User-attributed steering refreshes the turn through
+`before_agent_start`, even for repeated text; results from the previous turn
+remain ineligible.
 
 Initial notices stay before the current user message. A todo-triggered notice is
 anchored after that result's contiguous tool-result group, preserving the earlier prefix.
+After the result has appeared in provider context, compaction may remove it; the
+same notice is then restored before the retained current user message, or at the
+end of context if that message was also compacted away. Until the result first
+appears, the notice still waits for it.
 The advisor hook adds optional plan-advice guidance on the same provider request.
 No tool-call or worker-spawn hook requests review or blocks unreviewed execution.
 

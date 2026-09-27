@@ -34,13 +34,18 @@ export function policyModeOf(message: AgentMessage | undefined): PolicyMode | un
 	return MODES.find(candidate => candidate === mode);
 }
 
+/** Agent steering continues the current request; only user input starts another turn. */
+export function isTurnUserMessage(message: AgentMessage | undefined): boolean {
+	return message?.role === "user" && !(message.steering === true && message.attribution === "agent");
+}
+
 /**
  * First index of the current user's turn: keyword notices are queued as custom
  * messages immediately before that user message. `-1` when no user message exists.
  */
 export function currentTurnStart(messages: readonly AgentMessage[]): number {
 	let index = messages.length - 1;
-	while (index >= 0 && messages[index]?.role !== "user") index--;
+	while (index >= 0 && !isTurnUserMessage(messages[index])) index--;
 	if (index < 0) return -1;
 	while (index > 0 && messages[index - 1]?.role === "custom") index--;
 	return index;

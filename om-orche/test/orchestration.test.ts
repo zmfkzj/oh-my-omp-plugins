@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ToolResultEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { normalizeConfig } from "../src/config.ts";
 import { RouteLogger } from "../src/logging.ts";
@@ -132,7 +133,8 @@ describe("binary front-door routing", () => {
 	test("explicit native orchestrate is replaced in place; a replay cannot duplicate any notice", async () => {
 		const { router, ctx } = build(new ScriptedDecider(ORCHESTRATE));
 		await router.beginTurn(ctx, PROMPT);
-		const replaced = await router.applyToContext(ctx, [notice(), user(PROMPT)]);
+		const steering = { ...user("Worker A is available."), steering: true, attribution: "agent" } as AgentMessage;
+		const replaced = await router.applyToContext(ctx, [notice(), user(PROMPT), steering]);
 		expect(modes(replaced)).toEqual(["orchestrate"]);
 		expect(policyModeOf(replaced?.[0])).toBe("orchestrate");
 		expect(customCount(replaced, NATIVE_ORCHESTRATE_NOTICE_TYPE)).toBe(0);
@@ -143,11 +145,12 @@ describe("binary front-door routing", () => {
 		expect(await router.applyToContext(ctx, injected!)).toBeUndefined();
 	});
 
-	test("an initial decision keeps its pre-user anchor after todo activity", async () => {
+	test("an initial decision keeps its pre-user anchor after todo activity and agent steering", async () => {
 		const { router, ctx } = build(new ScriptedDecider(ORCHESTRATE));
 		await router.beginTurn(ctx, PROMPT);
 		const messages = [user(PROMPT), toolCall("todo-1"),
-			toolResultMessage("todo-1")];
+			toolResultMessage("todo-1"),
+			{ ...user("Worker A is available."), steering: true, attribution: "agent" } as AgentMessage];
 		const applied = await router.applyToContext(ctx, messages);
 		expect(policyModeOf(applied?.[0])).toBe("orchestrate");
 	});
@@ -160,6 +163,33 @@ describe("binary front-door routing", () => {
 		expect(decider.orchestrationCalls).toBe(1);
 		router.endTurn();
 		expect(await router.applyToContext(ctx, [user(PROMPT)])).toBeUndefined();
+	});
+
+	test("same-text user steering starts a new turn, but preparation retries reuse its route", async () => {
+		const decider = new ScriptedDecider([ORCHESTRATE, DEFAULT]);
+		const { router, ctx, branch } = build(decider);
+		// OMP prepares policy before persisting the input, including on retries.
+		await router.beginTurn(ctx, PROMPT);
+		await router.beginTurn(ctx, PROMPT);
+		expect(decider.orchestrationCalls).toBe(1);
+		const first = user(PROMPT);
+		const workflow = workflowNotice();
+		branch.push(entry(first), entry(toolCall("old-todo")));
+		expect(modes(await router.applyToContext(ctx, [workflow, first]))).toEqual(["workflow"]);
+
+		// A real user steer invokes before_agent_start before its message is delivered.
+		await router.beginTurn(ctx, PROMPT);
+		await router.beginTurn(ctx, PROMPT);
+		expect(decider.orchestrationCalls).toBe(2);
+		expect(router.lastDecision?.outcome).toBe("DEFAULT");
+		const steering = { ...user(PROMPT), steering: true, attribution: "user" } as AgentMessage;
+		branch.push(entry(steering));
+		const applied = await router.applyToContext(ctx, [workflow, first, assistant("working"), steering]);
+		expect(modes(applied)).toEqual(["default"]);
+		expect(applied?.[0]).toBe(workflow);
+		expect(policyModeOf(applied?.[3])).toBe("default");
+		await router.onTodoResult(ctx, todoResult(plan("Late old plan"), "init", "old-todo"));
+		expect(decider.orchestrationCalls).toBe(2);
 	});
 
 	test("subagents, plan mode, a disabled router and synthetic prompts are not classified", async () => {
@@ -232,7 +262,8 @@ describe("policy precedence", () => {
 			const { router, ctx } = build(new ScriptedDecider(route));
 			await router.beginTurn(ctx, PROMPT);
 			const workflow = workflowNotice(5);
-			const messages = [assistant("previous"), ...(explicit ? [notice(5)] : []), workflow, user(PROMPT)];
+			const messages = [assistant("previous"), ...(explicit ? [notice(5)] : []), workflow, user(PROMPT),
+				{ ...user("Worker A is available."), steering: true, attribution: "agent" } as AgentMessage];
 			const applied = await router.applyToContext(ctx, messages);
 			expect(modes(applied)).toEqual(["workflow"]);
 			expect(customCount(applied, NATIVE_ORCHESTRATE_NOTICE_TYPE)).toBe(0);
@@ -315,6 +346,65 @@ describe("committed todo promotion", () => {
 			toolResultMessage("todo-2")];
 		const applied = await router.applyToContext(ctx, messages);
 		expect(policyModeOf(applied?.[3])).toBe("orchestrate");
+	});
+
+	test("agent steering keeps promoted guidance behind the complete originating result group", async () => {
+		const decider = new ScriptedDecider([DEFAULT, ORCHESTRATE]);
+		const { router, ctx, branch } = build(decider);
+		await router.beginTurn(ctx, PROMPT);
+		const request = user(PROMPT);
+		const call = toolCall("todo-1");
+		const result = toolResultMessage("todo-1");
+		const siblingResult = { ...toolResultMessage("read-1"), toolName: "read" } as AgentMessage;
+		const steering = { ...user("Worker A is available."), steering: true, attribution: "agent" } as AgentMessage;
+		branch.push(entry(request), entry(call));
+		await router.onTodoResult(ctx, todoResult(plan("Change parser", "Update independent API")));
+		branch.push(entry(result), entry(siblingResult), entry(steering));
+		const persisted = [request, call, result, siblingResult, steering];
+		const applied = await router.applyToContext(ctx, persisted);
+		expect(modes(applied)).toEqual(["orchestrate"]);
+		expect(applied?.slice(0, 4)).toEqual(persisted.slice(0, 4));
+		expect(policyModeOf(applied?.[4])).toBe("orchestrate");
+		expect(applied?.[5]).toBe(steering);
+		// Every provider request starts from persisted messages, not the previous hook's copy.
+		expect(await router.applyToContext(ctx, [...persisted, assistant("continuing")]))
+			.toEqual([...applied!, assistant("continuing")]);
+		expect(decider.orchestrationCalls).toBe(2);
+	});
+
+	test("promoted guidance survives compaction of its originating todo result", async () => {
+		const request = entry(user(PROMPT));
+		const call = { ...entry(toolCall("todo-1")), parentId: request.id };
+		const result = { ...entry(toolResultMessage("todo-1")), parentId: call.id };
+		const continuation = { ...entry(assistant("Continuing the implementation.")), parentId: result.id };
+		const branch = [request, call];
+		const decider = new ScriptedDecider([DEFAULT, ORCHESTRATE]);
+		const { router, ctx } = build(decider, { session: { branch } });
+		await router.beginTurn(ctx, PROMPT);
+		await router.onTodoResult(ctx, todoResult(plan("Change parser", "Update independent API")));
+		// A prepared notice is not yet delivered: wait until its result reaches context.
+		expect(await router.applyToContext(ctx, buildSessionContext(branch).messages)).toBeUndefined();
+		branch.push(result, continuation);
+		const before = await router.applyToContext(ctx, buildSessionContext(branch).messages);
+		expect(modes(before)).toEqual(["orchestrate"]);
+		const policy = before!.find(message => policyModeOf(message) === "orchestrate")!;
+
+		branch.push({
+			type: "compaction", id: "compaction", parentId: continuation.id, timestamp: "2026-01-02",
+			summary: "Parser and API work is in progress.", tokensBefore: 100_000,
+			firstKeptEntryId: continuation.id,
+		});
+		const compacted = buildSessionContext(branch).messages;
+		expect(compacted.map(message => message.role)).toEqual(["compactionSummary", "assistant"]);
+		const restored = await router.applyToContext(ctx, compacted);
+		expect(restored).toEqual([...compacted, policy]);
+		expect(modes(restored)).toEqual(["orchestrate"]);
+		// Rebuilding provider context must neither lose nor duplicate the restored notice.
+		expect(await router.applyToContext(ctx, buildSessionContext(branch).messages)).toEqual(restored!);
+		expect(await router.applyToContext(ctx, restored!)).toBeUndefined();
+		expect(decider.orchestrationCalls).toBe(2);
+		router.endTurn();
+		expect(await router.applyToContext(ctx, compacted)).toBeUndefined();
 	});
 
 	test("a live master switch stops todo reclassification", async () => {

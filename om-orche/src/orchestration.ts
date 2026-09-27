@@ -23,6 +23,7 @@ import type { RouteLogger } from "./logging.ts";
 import {
 	buildPolicyNotice,
 	currentTurnNotices,
+	isTurnUserMessage,
 	NATIVE_ORCHESTRATE_NOTICE_TYPE,
 	NATIVE_WORKFLOW_NOTICE_TYPE,
 	policyModeOf,
@@ -50,7 +51,7 @@ function noticeKey(message: AgentMessage): string | undefined {
 /** Initial notices precede the current user; promotions follow their own todo result. */
 export function noticeInsertIndex(messages: readonly AgentMessage[], todoToolCallId?: string): number {
 	let userIndex = messages.length - 1;
-	while (userIndex >= 0 && messages[userIndex]?.role !== "user") userIndex--;
+	while (userIndex >= 0 && !isTurnUserMessage(messages[userIndex])) userIndex--;
 	if (todoToolCallId) {
 		for (let index = userIndex + 1; index < messages.length; index++) {
 			const message = messages[index];
@@ -78,8 +79,7 @@ function turnOwnsTodoCall(session: AgentSession, prompt: string, toolCallId: str
 	let userIndex = branch.length - 1;
 	while (userIndex >= 0) {
 		const entry = branch[userIndex];
-		if (entry?.type === "message" && entry.message.role === "user" &&
-			!(entry.message.steering === true && entry.message.attribution === "agent")) break;
+		if (entry?.type === "message" && isTurnUserMessage(entry.message)) break;
 		userIndex--;
 	}
 	const currentUser = branch[userIndex];
@@ -130,6 +130,8 @@ export interface OrchestrationRouterDeps {
 interface TurnState {
 	prompt: string;
 	session: AgentSession;
+	/** Last committed user entry before preparation; retries precede delivery of the new input. */
+	preparedAfterUserId: string | undefined;
 	/** OMP's explicit orchestrate notice was seen in this turn; the route is then final. */
 	explicitLogged: boolean;
 	/** Keys of this turn's native orchestrate notices, replaced wherever they appear. */
@@ -140,6 +142,8 @@ interface TurnState {
 	orchestrated: boolean;
 	/** The todo call whose committed plan promoted the turn; absent for an initial route. */
 	noticeAnchor?: string;
+	/** The promotion result reached provider context; compaction must not make us await it again. */
+	noticeAnchorSeen: boolean;
 	/** One stable notice per policy mode, created on first use and reused on every request. */
 	notices: Partial<Record<PolicyMode, AgentMessage>>;
 	pending?: Promise<void>;
@@ -159,7 +163,7 @@ export class OrchestrationRouter {
 		return this.#last;
 	}
 
-	/** Decide before dispatch; policy retries with the same prompt reuse the decision. */
+	/** Decide before delivery; reuse only retries prepared after the same committed user entry. */
 	async beginTurn(ctx: ExtensionContext, prompt: string): Promise<void> {
 		const gate = gateRequest(ctx, prompt, this.#deps.config());
 		if (!gate.ok) {
@@ -168,14 +172,19 @@ export class OrchestrationRouter {
 			this.#deps.logger.route("jev.orchestration", { route: "SKIP", reason: gate.reason });
 			return;
 		}
-		if (this.#turn?.prompt === prompt && this.#turn.session === gate.session) {
+		const branch = gate.session.sessionManager.getBranch();
+		const preparedAfterUserId = branch.findLast(entry =>
+			entry.type === "message" && isTurnUserMessage(entry.message))?.id;
+		if (this.#turn?.prompt === prompt && this.#turn.session === gate.session &&
+			this.#turn.preparedAfterUserId === preparedAfterUserId) {
 			await this.#turn.pending;
 			return;
 		}
-		const priorPlan = latestCommittedTodoPlan(gate.session.sessionManager.getBranch());
+		const priorPlan = latestCommittedTodoPlan(branch);
 		const turn: TurnState = {
-			prompt, session: gate.session,
+			prompt, session: gate.session, preparedAfterUserId,
 			explicitLogged: false, natives: [], workflow: false, orchestrated: false, notices: {},
+			noticeAnchorSeen: false,
 			seenPlans: new Set(priorPlan ? [JSON.stringify(priorPlan)] : []),
 		};
 		this.#turn = turn;
@@ -280,7 +289,10 @@ export class OrchestrationRouter {
 		if (notice && !placed) {
 			// A promotion stays behind its todo result; every other notice precedes the current user.
 			const anchor = mode === "orchestrate" && !turn.explicitLogged ? turn.noticeAnchor : undefined;
-			const index = noticeInsertIndex(next, anchor);
+			let index = noticeInsertIndex(next, anchor);
+			if (anchor && index >= 0) turn.noticeAnchorSeen = true;
+			// Once delivered, restore the stable policy even if compaction removed its result.
+			if (index < 0 && turn.noticeAnchorSeen) index = noticeInsertIndex(next);
 			if (index >= 0) {
 				next.splice(index, 0, notice);
 				changed = true;
