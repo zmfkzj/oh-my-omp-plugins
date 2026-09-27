@@ -152,11 +152,12 @@ export type ReviewFailureKind =
   | "output_truncated"
   | "provider_error"
   | "invalid_structure"
+  | "review_rejected"
   | "unexpected_tool_call";
 
 export interface ReviewAttemptDetails {
   attempt: 1 | 2;
-  mode: "configured" | "no-reasoning";
+  mode: "configured" | "no-reasoning" | "provider-retry";
   api: string;
   provider: string;
   model: string;
@@ -675,15 +676,15 @@ export async function runReview(
     AssistantMessage,
     "content" | "usage" | "stopReason" | "api" | "provider" | "model" | "errorMessage"
   >;
-  async function completeAttempt(attempt: 1 | 2): Promise<AttemptResult> {
+  async function completeAttempt(attempt: 1 | 2, mode: ReviewAttemptDetails["mode"] = "configured"): Promise<AttemptResult> {
     requestSignal.throwIfAborted();
     let result: AttemptResult;
     try {
       result = await completion(model, context, {
         apiKey,
-        sessionId: attempt === 1 ? requestId : `${requestId}:no-reasoning`,
+        sessionId: attempt === 1 ? requestId : `${requestId}:${mode}`,
         signal: requestSignal,
-        ...(attempt === 1
+        ...(mode !== "no-reasoning"
           ? {
               reasoning:
                 thinkingLevel === "auto" || thinkingLevel === "off" || thinkingLevel === "inherit"
@@ -717,7 +718,7 @@ export async function runReview(
     const errorMessage = sanitizeErrorMessage(result.errorMessage, apiKey);
     attempts.push({
       attempt,
-      mode: attempt === 1 ? "configured" : "no-reasoning",
+      mode,
       api: result.api,
       provider: result.provider,
       model: result.model,
@@ -730,7 +731,9 @@ export async function runReview(
 
   let result = await completeAttempt(1);
   if (result.stopReason === "length" && !result.content.some((part) => part.type === "toolCall")) {
-    result = await completeAttempt(2);
+    result = await completeAttempt(2, "no-reasoning");
+  } else if (result.stopReason === "error") {
+    result = await completeAttempt(2, "provider-retry");
   }
   const text = result.content
     .filter((part) => part.type === "text")
@@ -749,6 +752,8 @@ export async function runReview(
     failureKind = "output_truncated";
   } else if (result.stopReason !== "stop" || !hasReviewStructure(text)) {
     failureKind = "invalid_structure";
+  } else if (/^VERDICT: (REPLAN|ESCALATE)\b/.test(text)) {
+    failureKind = "review_rejected";
   }
   const usage = attempts.reduce((total, attempt) => mergeUsage(total, attempt.usage), {} as Usage);
   const details: ReviewResult["details"] = {
@@ -770,9 +775,10 @@ export async function runReview(
 
   if (failureKind) {
     const failures: Record<ReviewFailureKind, string> = {
-      output_truncated: `Orche-Advisor output was truncated at the 4096-token output limit after ${attempts.length} attempts, including a retry with reasoning disabled. No review is available. Choose a different model or retry at a later checkpoint.`,
+      review_rejected: `${text}\n\nExecution remains blocked. Address the verdict and submit the revised plan for review.`,
+      output_truncated: `Orche-Advisor output was truncated at the 4096-token output limit after ${attempts.length} attempts. No review is available. Choose a different model before trying again; no waiver is needed to review the same scope.`,
       provider_error:
-        "Orche-Advisor encountered a provider/runtime error. No review is available. Check provider availability, credentials, and attempt diagnostics before trying again.",
+        "Orche-Advisor encountered a provider/runtime error. No review is available. Check provider availability, credentials, and attempt diagnostics before trying again. The same scope remains reviewable without a waiver; execution still requires approval.",
       unexpected_tool_call:
         "Orche-Advisor returned an unexpected tool call, but reviews must be text-only. No review is available. Check the configured model's support for tool-free responses.",
       invalid_structure:

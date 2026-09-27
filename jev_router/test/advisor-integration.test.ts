@@ -91,8 +91,15 @@ test("one extension registers the checkpoint tool and an independent auditor rol
   // No reviewer configured: attempting a new review must fail, never reuse stale KEEP.
   await expect(checkpointTool!.execute("review-call-2", example, new AbortController().signal, () => {}, ctx))
     .rejects.toThrow("Configure modelRoles.orche-advisor");
+  const unavailableScope = runtime.reviewGate.scope(ctx);
+  expect(unavailableScope).toMatchObject({ failed: false, unavailable: true, satisfied: false });
+  let reloaded = false;
+  Object.assign(session.settings, { reloadFromDisk: async () => { reloaded = true; } });
   await expect(checkpointTool!.execute("review-call-3", example, new AbortController().signal, () => {}, ctx))
-    .rejects.toThrow("Review already failed for this exact scope");
+    .rejects.toThrow("Configure modelRoles.orche-advisor");
+  expect(reloaded).toBe(true);
+  expect(runtime.reviewGate.scope(ctx).key).toBe(unavailableScope.key);
+  expect(runtime.reviewGate.beforeTool(ctx, "edit", {})?.block).toBe(true);
 });
 
 test("new required work cannot reuse an identical old snapshot and erase its risk", async () => {

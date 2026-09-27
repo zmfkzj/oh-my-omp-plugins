@@ -3,7 +3,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext, ToolCallEventResult } from "@oh-my-pi/pi-coding-agent";
 import type { BeforeSubagentSpawnEvent, BeforeSubagentSpawnEventResult, ToolResultEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
-import type { Checkpoint } from "./advisor-review.ts";
+import type { Checkpoint, ReviewFailureKind } from "./advisor-review.ts";
 import { mainSessionOf } from "./host.ts";
 import { latestCommittedTodoPlan, visibleText } from "./routing-context.ts";
 import { findingRevision } from "./findings.ts";
@@ -76,6 +76,7 @@ export interface ReviewScope {
   dispatchSummary: string[];
   satisfied: boolean;
   failed: boolean;
+  unavailable: boolean;
 }
 const CHECKPOINTS: readonly string[] = ["initial-plan", "fan-out", "repeated-failure", "replan", "phase-boundary", "scope-expansion", "escalation"];
 
@@ -129,15 +130,21 @@ export class ReviewGate {
     const key = hash({ version: 3, workId: state.workId, planHash, generation: state.generation, dispatches: state.dispatches.map(d => d.key).sort(), revision });
     let satisfied = false;
     let failed = false;
+    let unavailable = false;
     for (let i = branch.length - 1; i >= 0; i--) {
       const e = branch[i];
       if (e?.type !== "custom" || !record(e.data) || e.data.scopeKey !== key) continue;
       if (e.customType === RECEIPT && e.data.success === true) { satisfied = true; break; }
       if (e.customType === WAIVER && e.data.author === "user" && typeof e.data.reason === "string") { satisfied = true; break; }
-      if (e.customType === FAILURE) { failed = true; break; }
+      if (e.customType === FAILURE) {
+        // Historical untyped failures meant no usable review, not rejection.
+        failed = e.data.failureKind === "review_rejected";
+        unavailable = !failed;
+        break;
+      }
     }
     return { key, requestHash, workId: state.workId, planHash, findingRevision: revision, checkpoint: state.checkpoint,
-      required: state.required, reason: state.reason, dispatchSummary: state.dispatches.map(d => d.summary), satisfied, failed };
+      required: state.required, reason: state.reason, dispatchSummary: state.dispatches.map(d => d.summary), satisfied, failed, unavailable };
   }
   noteDecision(ctx: ExtensionContext, required: boolean, checkpoint: Checkpoint, reason: string, request: string, workScope?: string): boolean | undefined {
     if (!this.enabled() || !mainSessionOf(ctx)) return;
@@ -203,7 +210,8 @@ export class ReviewGate {
   }
   private denial(scope: ReviewScope): ToolCallEventResult {
     return { block: true, reason: `Review required BEFORE execution (${scope.checkpoint}); scope ${scope.key}. ${scope.reason} ` +
-      (scope.failed ? "The last review failed. Report that failure; do not loop on retries. " : "") +
+      (scope.failed ? "The plan was rejected. Address the verdict and revise the plan before review. " :
+        scope.unavailable ? "The reviewer was unavailable, not a rejection. Restore the reviewer and call orche_advisor again on this same scope; no retry authorization or waiver is needed. " : "") +
       `Call orche_advisor with checkpoint '${scope.checkpoint}' and the seven-field snapshot, read its result, then retry the same operation. ` +
       "A changed plan, dispatch, or finding state needs a fresh review. Only the user can waive via /review-waive <scope-key> <reason>." };
   }
@@ -295,24 +303,25 @@ export class ReviewGate {
     const scope = this.scope(ctx);
     return scope.required && !scope.satisfied ? this.denial(scope) : undefined;
   }
-  complete(ctx: ExtensionContext, captured: ReviewScope, success: boolean, requestId?: string): void {
+  complete(ctx: ExtensionContext, captured: ReviewScope, success: boolean, requestId?: string, failureKind: ReviewFailureKind = "review_rejected"): void {
     const state = this.requirement(this.branch(ctx), captured.requestHash);
     // A late result cannot clear or promote another task's state.
     if (this.scope(ctx).key === captured.key && state.workId === captured.workId) {
       this.persist(ctx, STATE, { ...state, required: true, promptReview: !success });
     }
     this.persist(ctx, success ? RECEIPT : FAILURE, { scopeKey: captured.key, success, requestId, checkpoint: captured.checkpoint,
-      planHash: captured.planHash, findingRevision: captured.findingRevision, at: Date.now() });
+      planHash: captured.planHash, findingRevision: captured.findingRevision, ...(success ? {} : { failureKind }), at: Date.now() });
   }
   guidance(ctx: ExtensionContext): string | undefined {
     if (!this.enabled() || !mainSessionOf(ctx)) return undefined;
     const scope = this.scope(ctx);
-    if (!scope.failed && this.requirement(this.branch(ctx), scope.requestHash).promptReview === false) return undefined;
+    if (!scope.failed && !scope.unavailable && this.requirement(this.branch(ctx), scope.requestHash).promptReview === false) return undefined;
     if (!scope.required || scope.satisfied) return undefined;
     return `<system-notice>Mandatory orchestration review pending: ${scope.checkpoint}. ${scope.reason}\n` +
       "Read-only scoping and todo planning may continue; implementation and worker dispatch are blocked until a successful scope-bound orche_advisor review. " +
       "For a worker batch, submit task once to stage its exact scope (blocked before execution), then review and retry unchanged; alternatively pass the planned dispatch to orche_advisor. " +
-      `Scope: ${scope.key}. ${scope.failed ? "Previous review failed: report the error, do not repeatedly retry." : ""}</system-notice>`;
+      `Scope: ${scope.key}. ${scope.failed ? "The plan was rejected: address the verdict and revise the plan before review." :
+        scope.unavailable ? "Reviewer unavailable: diagnose the error, then review this same scope again without a waiver. Do not loop while the error remains unchanged." : ""}</system-notice>`;
   }
   applyGuidance(ctx: ExtensionContext, messages: AgentMessage[]): AgentMessage[] | undefined {
     const content = this.guidance(ctx);

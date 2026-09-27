@@ -134,14 +134,25 @@ Arbitrary Luau, shell/eval execution and unknown devices remain gated.
 The new receipt identity intentionally does not accept old-format receipts; an
 existing session may need one fresh review before subsequent mutation.
 
-Failure is not permission. After a failed review, an unchanged scope cannot make
-another paid review automatically. The user can authorize one new attempt with
-`/review-retry <scope-key> <reason>` or waive review with
-`/review-waive <scope-key> <reason>`. `/review-status` shows the current full key.
-These slash commands are not model-callable tools. A waiver covers only that
-scope and never resolves findings or claims verification passed.
-Failed review status remains visible until the user authorizes retry/waiver or
-the task scope changes. Failure guidance must not be cleared as if review succeeded.
+Failure is not permission, but an unavailable reviewer is not a rejected plan:
+
+- A provider completion error gets one automatic retry with the configured model
+  and reasoning settings. Truncation instead retries without reasoning. A call
+  makes at most two completion attempts total; cancellation is not retried.
+- Provider/runtime, configuration and malformed-output failures keep execution
+  blocked but leave the same scope reviewable. Diagnose the error and review
+  again after recovery; neither `/review-retry` nor a waiver is required, and
+  recovery does not rotate the scope key. Do not loop on an unchanged outage.
+  Historical untyped failure records also remain reviewable after reload.
+- `REPLAN` and `ESCALATE` are substantive rejections, not approval. Address the
+  verdict and revise the committed plan before re-review; an unchanged rejected
+  scope cannot make another paid review automatically. `KEEP`/`ADJUST` permit
+  the reviewed scope, with material plan changes still requiring fresh review.
+- `/review-retry <scope-key> <reason>` authorizes an unchanged rejected scope's
+  new attempt. `/review-waive <scope-key> <reason>` explicitly waives review.
+  `/review-status` shows the full key and unavailable/rejected state.
+  These commands are user-only. Waivers never resolve findings or claim that
+  verification passed. A lasting reviewer outage cannot authorize execution.
 
 ### Durable finding ledger
 
@@ -302,7 +313,7 @@ plugin leaves your account credential exactly where you put it.
 | `/jev-router stats` | Aggregated counts, latencies, distributions, worker cost. |
 | `/jev-router reset` | Clear telemetry and stored configuration. |
 | `/review-status` | Current required-review scope, receipt and failure state. |
-| `/review-retry <key> <reason>` | User-authorized new attempt after a failed review. |
+| `/review-retry <key> <reason>` | User-authorized new attempt for an unchanged rejected plan; not needed for infrastructure recovery. |
 | `/review-waive <key> <reason>` | Explicit user waiver for exactly that scope. |
 
 `status` output:

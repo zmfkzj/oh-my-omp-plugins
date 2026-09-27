@@ -257,13 +257,43 @@ describe("scope-bound review enforcement", () => {
     expect(gate.beforeTool(ctx, "edit", {})?.block).toBe(true);
     expect(gate.guidance(ctx)).toBeDefined();
   });
-  test("failed review retains failure guidance without reopening automatic retries", () => {
-    const { gate, ctx } = fixture();
+  test("rejection blocks execution until the committed plan is revised and approved", () => {
+    const { gate, ctx, branch } = fixture();
     gate.noteDecision(ctx, true, "initial-plan", "review-required", goal);
-    gate.beforeTool(ctx, "edit", {});
-    gate.complete(ctx, gate.scope(ctx), false);
-    expect(gate.scope(ctx)).toMatchObject({ failed: true, satisfied: false });
-    expect(gate.guidance(ctx)).toContain("Previous review failed");
+    const rejected = gate.scope(ctx);
+    gate.complete(ctx, rejected, false, "rejected", "review_rejected");
+    expect(gate.scope(ctx)).toMatchObject({ failed: true, unavailable: false, satisfied: false });
+    expect(gate.beforeTool(ctx, "edit", {})?.block).toBe(true);
+    addPlan(branch, ["Address the rejected compensation design"]);
+    expect(gate.scope(ctx)).toMatchObject({ failed: false, satisfied: false });
+    expect(gate.beforeTool(ctx, "edit", {})?.block).toBe(true);
+    gate.complete(ctx, gate.scope(ctx), true);
+    expect(gate.beforeTool(ctx, "edit", {})).toBeUndefined();
+  });
+  test("unavailable review survives reload and continuation without poisoning the scope", () => {
+    const { gate, ctx, branch } = fixture();
+    gate.noteDecision(ctx, true, "initial-plan", "review-required", goal);
+    const scope = gate.scope(ctx);
+    gate.complete(ctx, scope, false, "outage", "provider_error");
+    const resumed = new ReviewGate();
+    resumed.noteDecision(ctx, true, "initial-plan", "review-required", "Continue", "CONTINUE");
+    expect(resumed.scope(ctx)).toMatchObject({ key: scope.key, failed: false, unavailable: true, satisfied: false });
+    expect(resumed.beforeTool(ctx, "edit", {})?.block).toBe(true);
+    expect(resumed.beforeTool(ctx, "orche_advisor", {})).toBeUndefined();
+    resumed.complete(ctx, resumed.scope(ctx), true);
+    expect(resumed.scope(ctx)).toMatchObject({ key: scope.key, satisfied: true, unavailable: false });
+    expect(resumed.beforeTool(ctx, "edit", {})).toBeUndefined();
+    addFinding(branch);
+    expect(resumed.beforeTool(ctx, "edit", {})?.block).toBe(true);
+  });
+  test("historical untyped infrastructure failure remains reviewable, never approved", () => {
+    const { gate, ctx, branch } = fixture();
+    gate.noteDecision(ctx, true, "initial-plan", "review-required", goal);
+    const scope = gate.scope(ctx);
+    branch.push({ type: "custom", id: "old-failure", parentId: null, timestamp: "2026-09-27T00:00:00Z",
+      customType: "jev-review-failure", data: { scopeKey: scope.key, success: false } });
+    expect(new ReviewGate().scope(ctx)).toMatchObject({ key: scope.key, failed: false, unavailable: true, satisfied: false });
+    expect(gate.beforeTool(ctx, "edit", {})?.block).toBe(true);
   });
   test("waiving new risk uses the same scope key as its first execution", async () => {
     const { gate, ctx, branch } = fixture();

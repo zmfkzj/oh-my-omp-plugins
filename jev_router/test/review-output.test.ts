@@ -217,24 +217,46 @@ describe("review completion boundary", () => {
     expect(calls).toHaveLength(1);
   });
 
-  test("reports a provider error without retrying or displaying partial model output", async () => {
+  test("recovers a transient provider error once without changing reasoning", async () => {
     const { completion, calls } = completionSequence(
-      response({
-        stopReason: "error",
-        errorMessage: "Provider unavailable",
-        content: [{ type: "text", text: rawOutput }],
-      }),
+      response({ stopReason: "error", content: [{ type: "text", text: rawOutput }] }),
+      response(),
     );
     const result = await review(completion);
-
-    expectFailure(result, "provider_error");
-    expect(result.details.attempts).toMatchObject([
-      { stopReason: "error", errorMessage: "Provider unavailable" },
-    ]);
-    expect(calls).toHaveLength(1);
+    expect(result.isError).toBe(false);
+    expect(result.text).not.toContain(rawOutput);
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.[2]).toMatchObject({ reasoning: "high" });
+    expect(result.details.usage.cost.total).toBe(1);
+    expect(result.details.attempts[1]?.mode).toBe("provider-retry");
   });
 
-  test("reports a rejected completion without retrying or exposing raw runtime errors", async () => {
+  for (const verdict of ["REPLAN", "ESCALATE"]) {
+    test(`${verdict} denies permission without retrying or hiding reviewer feedback`, async () => {
+      const text = structuredReview.replace("KEEP", verdict);
+      const { completion, calls } = completionSequence(response({ content: [{ type: "text", text }] }));
+      const result = await review(completion);
+      expect(result.isError).toBe(true);
+      expect(result.details.failureKind).toBe("review_rejected");
+      expect(result.text).toContain(text);
+      expect(calls).toHaveLength(1);
+    });
+  }
+
+  test("cancellation does not retry a provider call", async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const completion: Completion = async () => {
+      calls++;
+      controller.abort();
+      return response({ stopReason: "error" });
+    };
+    await expect(runReview(prepared, selection, { getApiKey: async () => "key" },
+      controller.signal, completion)).rejects.toThrow();
+    expect(calls).toBe(1);
+  });
+
+  test("bounds persistent runtime failure at two attempts and redacts credentials", async () => {
     const errorMarker = "PRIVATE_COMPLETION_REJECTION";
     let calls = 0;
     const completion: Completion = async () => {
@@ -244,8 +266,8 @@ describe("review completion boundary", () => {
     const result = await review(completion);
 
     expectFailure(result, "provider_error");
-    expect(calls).toBe(1);
-    expect(result.details.attempts).toHaveLength(1);
+    expect(calls).toBe(2);
+    expect(result.details.attempts).toHaveLength(2);
     expect(result.details.attempts[0]?.stopReason).toBe("error");
     const errorMessage = result.details.attempts[0]?.errorMessage;
     expect(errorMessage).toContain(errorMarker);
