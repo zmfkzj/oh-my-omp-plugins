@@ -20,8 +20,9 @@
  * "no sample" instead of a thrown listener.
  */
 import type { SubagentLifecyclePayload, SubagentProgressPayload } from "@oh-my-pi/pi-coding-agent";
-import { GENERIC_TASK_AGENT } from "./task-contract.ts";
 import type { Telemetry } from "./telemetry.ts";
+
+const GENERIC_TASK_AGENT = "task";
 
 export const SUBAGENT_PROGRESS_CHANNEL = "task:subagent:progress";
 export const SUBAGENT_LIFECYCLE_CHANNEL = "task:subagent:lifecycle";

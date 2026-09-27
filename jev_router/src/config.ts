@@ -1,18 +1,18 @@
 /**
  * Plugin configuration.
  *
- * Storage is OMP's own per-plugin settings map (the `settings["omp-jev-router"]`
+ * Storage is OMP's own per-plugin settings map (the `settings["om-orche"]`
  * record inside `omp-plugins.lock.json`), read through
  * `getPluginSettings(name, cwd)` and written through `PluginManager`. That map is
  * deleted by `omp plugin uninstall`, so no configuration outlives the plugin.
  *
  * Users edit it with the native CLI:
- *   omp plugin config set omp-jev-router orchestrationMinConfidence 0.7
+ *   omp plugin config set om-orche orchestrationMinConfidence 0.7
  */
 import { getPluginSettings } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/loader";
 import { PluginManager } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/manager";
 
-export const PLUGIN_NAME = "omp-jev-router";
+export const PLUGIN_NAME = "om-orche";
 
 export interface JevRouterConfig {
 	enabled: boolean;

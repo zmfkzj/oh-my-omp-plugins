@@ -172,7 +172,7 @@ interface GateFields {
 
 /** One line of `decisions.jsonl`, minus the timestamp, policy, and epoch added on append. */
 export type DecisionRecord =
-	| (GateFields & { kind: "orchestration"; route: string; latencyMs: number; reviewRequired?: boolean; review?: GateFields })
+	| (GateFields & { kind: "orchestration"; route: string; latencyMs: number })
 	| { kind: "orchestration"; route: "ERROR"; timedOut: boolean };
 
 /** What has been counted for one worker this epoch, whichever bus reported it. */

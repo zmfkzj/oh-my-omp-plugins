@@ -1,10 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
 import { z } from "zod";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { ExtensionAPI, ExtensionContext, ToolResultEvent } from "@oh-my-pi/pi-coding-agent";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import example from "../examples/initial-plan.json";
-import { prepareReviewInput, runReview, ROLE, TOOL, type ReviewSelection } from "../src/advisor-review.ts";
+import { runReview, ROLE, TOOL, type ReviewSelection } from "../src/advisor-review.ts";
 import { registerJevRouter } from "../src/index.ts";
 import { AUDITOR_NAME, VERIFICATION_AUDITOR } from "../src/verification-auditor.ts";
 import { ORCHESTRATE_GUIDANCE, registerOrcheAdvisor } from "../src/orche-advisor.ts";
@@ -13,32 +14,21 @@ import {
   NATIVE_WORKFLOW_NOTICE_TYPE,
   policyModeOf,
 } from "../src/orchestration-policy.ts";
-import { ReviewGate } from "../src/review-gate.ts";
-import { clearRegistry, makeApi, makeSession, registerAsMain, ScriptedDecider } from "./harness.ts";
+import { clearRegistry, makeSession, registerAsMain, ScriptedDecider } from "./harness.ts";
 import type { ScriptedOrchestration } from "./harness.ts";
-import { findingRevision } from "../src/findings.ts";
-import { prepareDispatch } from "../src/task-contract.ts";
-
-/** A gate validating declarations against the live native `task` schema, as the runtime wires it. */
-function liveGate(): ReviewGate {
-  return new ReviewGate(() => true, input => prepareDispatch(makeApi().pi, input));
-}
 
 afterEach(clearRegistry);
 
-test("one extension registers the checkpoint tool and an independent auditor role", async () => {
-  const handlers: Array<(event: unknown, ctx: ExtensionContext) => unknown> = [];
-  let checkpointTool: Parameters<ExtensionAPI["registerTool"]>[0] | undefined;
+type Tool = Parameters<ExtensionAPI["registerTool"]>[0];
+type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
+
+test("one extension registers the advice tool and an independent auditor role, without review commands", async () => {
+  const handlers: Handler[] = [];
+  const commands: string[] = [];
+  let adviceTool: Tool | undefined;
   const { session, ctx } = makeSession();
   const branch: SessionEntry[] = [];
-  Object.assign(session.sessionManager, {
-    getBranch: () => branch,
-    appendCustomEntry(customType: string, data: unknown) {
-      const id = `state-${branch.length}`;
-      branch.push({ type: "custom", id, parentId: null, timestamp: "2026-09-26T00:00:00Z", customType, data });
-      return id;
-    },
-  });
+  Object.assign(session.sessionManager, { getBranch: () => branch });
   const roles = new Map<string, string>([["advisor", "existing-advisor-model"]]);
   let flushes = 0;
   Object.assign(session.settings, {
@@ -53,9 +43,9 @@ test("one extension registers the checkpoint tool and an independent auditor rol
     logger: { debug() {}, warn() {}, info() {}, error() {} },
     setLabel() {},
     events: { on: () => () => {} },
-    registerCommand() {},
-    registerTool(tool: Parameters<ExtensionAPI["registerTool"]>[0]) { checkpointTool = tool; },
-    on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) {
+    registerCommand(name: string) { commands.push(name); },
+    registerTool(tool: Tool) { if (tool.name === TOOL) adviceTool = tool; },
+    on(event: string, handler: Handler) {
       if (event === "session_start") handlers.push(handler);
     },
   } as unknown as ExtensionAPI;
@@ -64,7 +54,7 @@ test("one extension registers the checkpoint tool and an independent auditor rol
   runtime.telemetry.load = async () => {};
 
   for (const handler of handlers) await handler({}, ctx);
-  expect(checkpointTool?.name).toBe(TOOL);
+  expect(adviceTool?.name).toBe(TOOL);
   expect(roles.get("verification-auditor")).toBe("@smol");
   expect(VERIFICATION_AUDITOR.model).toBe("@verification-auditor");
   expect(roles.get("advisor")).toBe("existing-advisor-model");
@@ -74,232 +64,134 @@ test("one extension registers the checkpoint tool and an independent auditor rol
   for (const handler of handlers) await handler({}, ctx);
   expect(roles.get("verification-auditor")).toBe("custom-auditor-model");
   expect(flushes).toBe(1);
+  expect(commands.filter(name => /review|waive|approv/i.test(name))).toEqual([]);
 
-  const snapshotHash = prepareReviewInput(example).snapshotHash;
-  branch.push({
-    type: "message",
-    message: {
-      role: "toolResult",
-      toolName: TOOL,
-      isError: false,
-      details: { role: ROLE, snapshotHash, model: "review-model", scopeKey: runtime.reviewGate.scope(ctx).key, findingRevision: findingRevision(branch) },
-      content: [{ type: "text", text: "VERDICT: KEEP" }],
-    },
-  } as SessionEntry);
-  const result = await checkpointTool!.execute("review-call", example, new AbortController().signal, () => {}, ctx);
-  expect(result.content).toContainEqual({ type: "text", text: "VERDICT: KEEP" });
-  expect(result.details).toMatchObject({ role: ROLE, reused: true, findingsForwarded: 0 });
+  // The schema accepts only the checkpoint and seven-field snapshot: no dispatch staging.
+  const schema = adviceTool!.parameters as unknown as z.ZodType;
+  expect(schema.safeParse(example).success).toBe(true);
+  expect(schema.safeParse({ ...example, dispatch: null }).success).toBe(false);
 
-  // A persisted auditor finding must invalidate the otherwise identical cached review.
-  const finding: SessionEntry = {
-    type: "custom_message", id: "fresh-audit", parentId: null, timestamp: "2026-09-26T00:00:00Z",
-    customType: "advisor", content: "Evidence missing", display: true,
-    details: { notes: [{ advisor: AUDITOR_NAME, severity: "blocker", note: "Claimed smoke has no run output" }] },
-  };
-  branch.push(finding);
-  Object.assign(session.settings, { reloadFromDisk: async () => {} });
-  Object.assign(ctx.modelRegistry, { getAvailable: () => [] });
-  // No reviewer configured: attempting a new review must fail, never reuse stale KEEP.
-  await expect(checkpointTool!.execute("review-call-2", example, new AbortController().signal, () => {}, ctx))
-    .rejects.toThrow("Configure modelRoles.orche-advisor");
-  const unavailableScope = runtime.reviewGate.scope(ctx);
-  expect(unavailableScope).toMatchObject({ failed: false, unavailable: true, satisfied: false });
+  // No configured advisor model is an actual failure, surfaced as such after a settings reload.
   let reloaded = false;
   Object.assign(session.settings, { reloadFromDisk: async () => { reloaded = true; } });
-  await expect(checkpointTool!.execute("review-call-3", example, new AbortController().signal, () => {}, ctx))
+  Object.assign(ctx.modelRegistry, { getAvailable: () => [] });
+  await expect(adviceTool!.execute("advice", example, new AbortController().signal, () => {}, ctx))
     .rejects.toThrow("Configure modelRoles.orche-advisor");
   expect(reloaded).toBe(true);
-  expect(runtime.reviewGate.scope(ctx).key).toBe(unavailableScope.key);
-  expect(runtime.reviewGate.beforeTool(ctx, "edit", {})?.block).toBe(true);
 });
 
-test("new required work cannot reuse an identical old snapshot and erase its risk", async () => {
-  const branch: SessionEntry[] = [{
-    type: "message", id: "old-user", parentId: null, timestamp: "2026-09-27T00:00:00Z",
-    message: { role: "user", content: "Old release plan", timestamp: 0 },
-  }];
-  const { session, ctx } = makeSession({ branch });
-  Object.assign(session.sessionManager, {
-    appendCustomEntry(customType: string, data: unknown) {
-      const id = `state-${branch.length}`;
-      branch.push({ type: "custom", id, parentId: null, timestamp: "2026-09-27T01:00:00Z", customType, data });
-      return id;
-    },
-  });
-  registerAsMain(session);
-  const gate = new ReviewGate();
-  gate.noteDecision(ctx, true, "initial-plan", "review-required", "Old release plan");
-  gate.beforeTool(ctx, "edit", {});
-  const oldScope = gate.scope(ctx);
-  gate.complete(ctx, oldScope, true);
-  branch.push({
-    type: "message", id: "cached-review", parentId: null, timestamp: "2026-09-27T01:01:00Z",
-    message: { role: "toolResult", toolCallId: "prior", toolName: TOOL, isError: false, timestamp: 1,
-      content: [{ type: "text", text: "VERDICT: KEEP" }],
-      details: { role: ROLE, snapshotHash: prepareReviewInput(example).snapshotHash, scopeKey: oldScope.key, findingRevision: findingRevision(branch), model: "old-model" } },
-  });
-  branch.push({ type: "message", id: "new-user", parentId: null, timestamp: "2026-09-27T02:00:00Z",
-    message: { role: "user", content: "New payment migration", timestamp: 2 } });
-  gate.noteDecision(ctx, true, "initial-plan", "review-required", "New payment migration");
-  let reviewer: Parameters<ExtensionAPI["registerTool"]>[0] | undefined;
-  registerOrcheAdvisor({
-    zod: z, on() {},
-    registerTool(tool: Parameters<ExtensionAPI["registerTool"]>[0]) { reviewer = tool; },
-  } as unknown as ExtensionAPI, gate);
-  Object.assign(session.settings, { reloadFromDisk: async () => {} });
-  Object.assign(ctx.modelRegistry, { getAvailable: () => [] });
-  // A new review requires a configured model; stale cache reuse would incorrectly succeed.
-  await expect(reviewer!.execute("new-review", example, new AbortController().signal, () => {}, ctx))
-    .rejects.toThrow("Configure modelRoles.orche-advisor");
-  expect(gate.beforeTool(ctx, "edit", {})?.block).toBe(true);
-});
+const MODEL = { id: "review-fixture", provider: "openai", api: "openai-completions",
+  name: "Review fixture", reasoning: false, input: ["text"], contextWindow: 100000, maxTokens: 4096,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } as ReviewSelection["model"];
 
-test("tool retains omitted dispatch, withdraws explicitly, and re-reviews a revised rejected plan", async () => {
-  const branch: SessionEntry[] = [];
-  const { session, ctx } = makeSession({ branch });
-  Object.assign(session.sessionManager, {
-    appendCustomEntry(customType: string, data: unknown) {
-      const id = `state-${branch.length}`;
-      branch.push({ type: "custom", id, parentId: null, timestamp: "2026-09-27T00:00:00Z", customType, data });
-      return id;
-    },
-  });
-  registerAsMain(session);
-  const gate = liveGate();
-  gate.stageDispatch(ctx, { context: "Preview feature", tasks: [{ task: "Implement preview", name: "Preview" }] });
-  const staged = gate.scope(ctx);
-  gate.complete(ctx, staged, false, "rejection", "review_rejected");
-  let reviewer: Parameters<ExtensionAPI["registerTool"]>[0] | undefined;
-  registerOrcheAdvisor({ zod: z, on() {},
-    registerTool(tool: Parameters<ExtensionAPI["registerTool"]>[0]) { reviewer = tool; },
-  } as unknown as ExtensionAPI, gate);
-  Object.assign(session.settings, { reloadFromDisk: async () => {} });
-  Object.assign(ctx.modelRegistry, { getAvailable: () => [] });
-  const execute = (params: unknown) => reviewer!.execute("review", params as typeof example,
-    new AbortController().signal, () => {}, ctx);
-  await expect(execute(example)).rejects.toThrow("This exact plan was rejected");
-  expect(gate.scope(ctx).key).toBe(staged.key);
-  // Exercise the public schema as well as the handler: null must reach staging.
-  const withdrawnInput = (reviewer!.parameters as unknown as z.ZodType).parse({ ...example, dispatch: null });
-  await expect(execute(withdrawnInput)).rejects.toThrow("Configure modelRoles.orche-advisor");
-  const withdrawn = gate.scope(ctx);
-  expect(withdrawn).toMatchObject({ failed: false, unavailable: true, dispatchSummary: [], satisfied: false });
-  expect(withdrawn.key).not.toBe(staged.key);
-  expect(gate.beforeTool(ctx, "edit", {})?.block).toBe(true);
-  gate.complete(ctx, withdrawn, false, "parent-rejected", "review_rejected");
-  await expect(execute(withdrawnInput)).rejects.toThrow("This exact plan was rejected");
-  // A semantic committed-plan revision changes the scope, unlike snapshot prose.
-  branch.push({ type: "custom", id: "revised-plan", parentId: null, timestamp: "2026-09-27T01:00:00Z",
-    customType: "user_todo_edit", data: { phases: [{ name: "Integration",
-      tasks: [{ content: "Address rejected integration ordering", status: "pending" }] }] } });
-  await expect(execute(example)).rejects.toThrow("Configure modelRoles.orche-advisor");
-  expect(gate.scope(ctx)).toMatchObject({ failed: false, unavailable: true, satisfied: false });
-  expect(gate.scope(ctx).key).not.toBe(withdrawn.key);
-});
+type Completion = NonNullable<Parameters<typeof runReview>[4]>;
 
-function reviewExecutionFixture(verdict: "KEEP" | "REPLAN" = "KEEP") {
-  const branch: SessionEntry[] = [];
+function verdictText(verdict: string): string {
+  return `VERDICT: ${verdict}\n\nISSUES:\n- None\n\nORCHESTRATION CHANGES:\n- None\n\nAVOID:\n- None`;
+}
+
+function completionOf(verdict: string): Completion {
+  return async () => ({
+    role: "assistant", api: MODEL.api, provider: MODEL.provider, model: MODEL.id, timestamp: 0,
+    stopReason: "stop", content: [{ type: "text", text: verdictText(verdict) }],
+    usage: { input: 3, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 5,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+  } as AssistantMessage);
+}
+
+/**
+ * The advice tool on a primary session with a configured model and a scripted provider. Any
+ * custom entry the tool writes lands in `customEntries`, so hidden approval state is observable.
+ */
+function adviceFixture(branch: SessionEntry[] = []) {
   const { session, ctx } = makeSession({ branch });
-  const storage = { failUsage: false, modelCalls: 0 };
+  const state = { completion: completionOf("KEEP"), modelCalls: 0, usage: [] as unknown[], customEntries: [] as string[] };
   Object.assign(session.sessionManager, {
     getLeafId: () => branch.at(-1)?.id ?? null,
-    appendCustomEntry(customType: string, data: unknown) {
-      const id = `state-${branch.length}`;
-      branch.push({ type: "custom", id, parentId: null, timestamp: "2026-09-27T00:00:00Z", customType, data });
-      return id;
-    },
-    appendModelUsage() {
-      if (storage.failUsage) throw new Error("Usage storage unavailable");
-      return undefined;
-    },
+    appendCustomEntry(customType: string) { state.customEntries.push(customType); return undefined; },
+    appendModelUsage(entry: unknown) { state.usage.push(entry); return undefined; },
   });
   registerAsMain(session);
-  const model = { id: "review-fixture", provider: "openai", api: "openai-completions",
-    name: "Review fixture", reasoning: false, input: ["text"], contextWindow: 100000, maxTokens: 4096,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } as ReviewSelection["model"];
-  session.settings.setModelRole(ROLE, `${model.provider}/${model.id}`);
+  session.settings.setModelRole(ROLE, `${MODEL.provider}/${MODEL.id}`);
   Object.assign(session.settings, { reloadFromDisk: async () => {} });
-  Object.assign(ctx.modelRegistry, { getAvailable: () => [model], getApiKey: async () => "fixture-key" });
-  const gate = liveGate();
-  gate.noteDecision(ctx, true, "initial-plan", "Review required", "Integration");
-  let tool!: Parameters<ExtensionAPI["registerTool"]>[0];
-  registerOrcheAdvisor({ zod: z, on() {},
-    registerTool(registered: Parameters<ExtensionAPI["registerTool"]>[0]) { tool = registered; },
-  } as unknown as ExtensionAPI, gate, (prepared, selection, registry, signal) =>
-    runReview(prepared, selection, registry, signal, async () => {
-      storage.modelCalls++;
-      return {
-        role: "assistant", api: model.api, provider: model.provider, model: model.id, timestamp: 0,
-        stopReason: "stop", content: [{ type: "text", text: `VERDICT: ${verdict}\n\nISSUES:\n- None\n\nORCHESTRATION CHANGES:\n- None\n\nAVOID:\n- None` }],
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-      };
+  Object.assign(ctx.modelRegistry, { getAvailable: () => [MODEL], getApiKey: async () => "fixture-key" });
+  let tool!: Tool;
+  registerOrcheAdvisor({ zod: z, on() {}, registerTool(registered: Tool) { tool = registered; } } as unknown as ExtensionAPI,
+    (prepared, selection, registry, signal) => runReview(prepared, selection, registry, signal, (...args) => {
+      state.modelCalls++;
+      return state.completion(...args);
     }));
-  return { branch, session, ctx, gate, tool, storage };
+  let calls = 0;
+  /** Execute once and persist the result as the host would, so later calls see it on the branch. */
+  const advise = async () => {
+    const id = `advice-${++calls}`;
+    const result = await tool.execute(id, example, new AbortController().signal, () => {}, ctx);
+    branch.push({ type: "message", id, parentId: branch.at(-1)?.id ?? null, timestamp: "2026-09-28T00:00:00Z",
+      message: { role: "toolResult", toolCallId: id, toolName: TOOL, content: result.content,
+        details: result.details, isError: result.isError === true, timestamp: calls } } as SessionEntry);
+    return result;
+  };
+  return { session, ctx, branch, tool, state, advise };
 }
 
-test("failed review bookkeeping withholds approval and recovers on the same scope", async () => {
-  const { ctx, gate, tool, storage } = reviewExecutionFixture();
-  const scope = gate.scope(ctx);
-  storage.failUsage = true;
-  await expect(tool.execute("failed", example, new AbortController().signal, () => {}, ctx))
-    .rejects.toThrow("Usage storage unavailable");
-  expect(gate.scope(ctx)).toMatchObject({ key: scope.key, satisfied: false, unavailable: true });
-  expect(gate.beforeTool(ctx, "edit", {})?.block).toBe(true);
-  storage.failUsage = false;
-  const result = await tool.execute("recovered", example, new AbortController().signal, () => {}, ctx);
-  expect(result.isError).not.toBe(true);
-  expect(storage.modelCalls).toBe(2);
-  expect(gate.scope(ctx)).toMatchObject({ key: scope.key, satisfied: true });
-  expect(gate.beforeTool(ctx, "edit", {})).toBeUndefined();
+test("every explicit call requests fresh advice on the submitted plan, even when unchanged", async () => {
+  const { state, advise } = adviceFixture();
+  const first = await advise();
+  const second = await advise();
+  expect(first.isError).not.toBe(true);
+  expect(second.isError).not.toBe(true);
+  expect(second.content[0]).toMatchObject({ type: "text" });
+  expect((second.content[0] as { text: string }).text.startsWith(verdictText("KEEP"))).toBe(true);
+  expect(state.modelCalls).toBe(2);
+  expect(state.usage).toHaveLength(2);
+  expect(state.customEntries).toEqual([]);
 });
 
-test("bookkeeping failure cannot downgrade an actual rejection to an unavailable review", async () => {
-  const { ctx, gate, tool, storage } = reviewExecutionFixture("REPLAN");
-  storage.failUsage = true;
-  await expect(tool.execute("rejected", example, new AbortController().signal, () => {}, ctx))
-    .rejects.toThrow("Usage storage unavailable");
-  expect(gate.scope(ctx)).toMatchObject({ satisfied: false, failed: true, unavailable: false });
-  storage.failUsage = false;
-  await expect(tool.execute("unchanged", example, new AbortController().signal, () => {}, ctx))
-    .rejects.toThrow("This exact plan was rejected");
-  expect(storage.modelCalls).toBe(1);
-});
-
-for (const dispatch of [null, { context: "Contract replacement", tasks: [{ name: "Replacement", task: "Replace existing contract" }] }]) {
-  test(`oversized snapshot cannot ${dispatch === null ? "withdraw" : "replace"} an approved dispatch`, async () => {
-    const { ctx, gate, tool, branch, storage } = reviewExecutionFixture();
-    gate.stageDispatch(ctx, { context: "Original contract", tasks: [{ name: "Original", task: "Preserve this contract" }] });
-    gate.complete(ctx, gate.scope(ctx), true);
-    const before = gate.scope(ctx);
-    const entries = branch.length;
-    const snapshot = Object.fromEntries(Object.keys(example.snapshot).map(key => [key, "x".repeat(1500)]));
-    const input = (tool.parameters as unknown as z.ZodType).parse({ checkpoint: "replan", dispatch, snapshot });
-    await expect(tool.execute("invalid", input, new AbortController().signal, () => {}, ctx)).rejects.toThrow("8000");
-    expect(gate.scope(ctx)).toEqual(before);
-    expect(branch.length).toBe(entries);
-    expect(storage.modelCalls).toBe(0);
+for (const verdict of ["REPLAN", "ESCALATE"]) {
+  test(`${verdict} is advice returned as a successful result, with no recorded state`, async () => {
+    const { state, advise } = adviceFixture();
+    state.completion = completionOf(verdict);
+    const result = await advise();
+    expect(result.isError).not.toBe(true);
+    expect((result.content[0] as { text: string }).text.startsWith(verdictText(verdict))).toBe(true);
+    expect(result.details).not.toHaveProperty("failureKind");
+    expect(state.customEntries).toEqual([]);
   });
 }
 
-test("legacy aggregate summaries require restaging or withdrawal before a review", async () => {
-  const { ctx, gate, tool, branch, storage } = reviewExecutionFixture();
-  const state = branch.findLast(entry => entry.type === "custom" && entry.customType === "jev-review-requirement");
-  if (!state || state.type !== "custom") throw new Error("Missing requirement");
-  Object.assign(state.data as object, { dispatches: [{ key: "old-batch", summary: "Worker1: truncated batch" }] });
-  await expect(tool.execute("legacy", example, new AbortController().signal, () => {}, ctx))
-    .rejects.toThrow("Legacy dispatch summaries");
-  expect(storage.modelCalls).toBe(0);
-  const result = await tool.execute("parent-review", { ...example, dispatch: null },
-    new AbortController().signal, () => {}, ctx);
-  expect(result.isError).not.toBe(true);
-  expect(gate.scope(ctx)).toMatchObject({ dispatchComplete: true, dispatchSummary: [], satisfied: true });
+test("a provider failure is an actual error with its usage accounted, and advice recovers without state", async () => {
+  const { state, advise } = adviceFixture();
+  state.completion = async () => { throw new Error("upstream unavailable"); };
+  const failed = await advise();
+  expect(failed.isError).toBe(true);
+  expect(failed.details).toMatchObject({ failureKind: "provider_error" });
+  expect(state.modelCalls).toBe(2);
+  expect(state.usage).toHaveLength(2);
+  state.completion = completionOf("KEEP");
+  expect((await advise()).isError).not.toBe(true);
+  expect(state.modelCalls).toBe(3);
+  expect(state.customEntries).toEqual([]);
+});
+
+test("advice is primary-only and one request runs at a time", async () => {
+  const { ctx, tool, state } = adviceFixture();
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const keep = completionOf("KEEP");
+  state.completion = async (...args) => { await held; return keep(...args); };
+  const execute = () => tool.execute("advice", example, new AbortController().signal, () => {}, ctx);
+  const running = execute();
+  await expect(execute()).rejects.toThrow("already running");
+  release();
+  expect((await running).isError).not.toBe(true);
+  expect((await execute()).isError).not.toBe(true);
+  clearRegistry();
+  await expect(execute()).rejects.toThrow("primary orchestrator");
 });
 
 const PROMPT = "Refactor the ingestion pipeline.";
 const DEFAULT_ROUTE: ScriptedOrchestration = { top: "DEFAULT", confidence: 0.92, margin: 0.84, confident: true };
 const ORCHESTRATE_ROUTE: ScriptedOrchestration = { top: "ORCHESTRATE", confidence: 0.92, margin: 0.84, confident: true };
-type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 
 function user(text: string): AgentMessage {
   return { role: "user", content: [{ type: "text", text }], timestamp: 0 } as AgentMessage;
@@ -323,8 +215,7 @@ function ofType(messages: AgentMessage[], customType: string): AgentMessage[] {
 }
 
 /** The whole plugin as OMP loads it, with a scripted Jev decision and no network or disk writes. */
-function registeredPlugin(route: ScriptedOrchestration, enabled = true) {
-  const branch: SessionEntry[] = [];
+function registeredPlugin(route: ScriptedOrchestration, enabled = true, branch: SessionEntry[] = []) {
   const { session, ctx } = makeSession({ branch });
   Object.assign(session.sessionManager, {
     appendCustomEntry(customType: string, data: unknown) {
@@ -354,9 +245,14 @@ function registeredPlugin(route: ScriptedOrchestration, enabled = true) {
   const decider = new ScriptedDecider(route);
   Object.assign(runtime.engine, { decideOrchestration: decider.decideOrchestration.bind(decider) });
   return {
-    async attemptMutation() {
+    branch, session, ctx, runtime,
+    async toolResult(event: ToolResultEvent) {
+      for (const handler of handlers.get("tool_result") ?? []) await handler(event, ctx);
+    },
+    /** The first blocking `tool_call` result, if any hook would deny this call. */
+    async attempt(toolName: string, input: Record<string, unknown> = {}) {
       for (const handler of handlers.get("tool_call") ?? []) {
-        const result = await handler({ type: "tool_call", toolName: "edit", toolCallId: "pending-edit", input: {} }, ctx);
+        const result = await handler({ type: "tool_call", toolName, toolCallId: `pending-${toolName}`, input }, ctx);
         if (result) return result;
       }
       return undefined;
@@ -378,6 +274,62 @@ function registeredPlugin(route: ScriptedOrchestration, enabled = true) {
   };
 }
 
+/** Records an earlier release wrote: requirement, rejection, receipt and waiver, plus an auditor blocker. */
+function staleGateHistory(): SessionEntry[] {
+  const at = "2026-09-27T00:00:00Z";
+  const custom = (id: string, customType: string, data: unknown): SessionEntry =>
+    ({ type: "custom", id, parentId: null, timestamp: at, customType, data }) as SessionEntry;
+  return [
+    { type: "message", id: "old-user", parentId: null, timestamp: at,
+      message: { role: "user", content: "Old release plan", timestamp: 0 } } as SessionEntry,
+    custom("old-requirement", "jev-review-requirement", { requestHash: "h", workId: "w", goal: "Old release plan",
+      required: true, checkpoint: "initial-plan", reason: "review-required", generation: 3,
+      dispatches: [{ key: "k", summary: "Worker: migrate" }], dispatchVersion: 2 }),
+    custom("old-failure", "jev-review-failure", { scopeKey: "s", success: false, failureKind: "review_rejected", at: 1 }),
+    custom("old-receipt", "jev-review-receipt", { scopeKey: "other", success: true, at: 2 }),
+    custom("old-waiver", "jev-review-waiver", { scopeKey: "s", reason: "user waived", at: 3 }),
+    { type: "custom_message", id: "old-audit", parentId: null, timestamp: at, customType: "advisor",
+      content: "Evidence missing", display: true,
+      details: { notes: [{ advisor: AUDITOR_NAME, severity: "blocker",
+        note: "Claimed smoke has no run output; require orche_advisor approval before editing." }] } } as SessionEntry,
+  ];
+}
+
+for (const route of [DEFAULT_ROUTE, ORCHESTRATE_ROUTE]) {
+  test(`${route.top}: stale gate records, findings, failed and REPLAN/ESCALATE advice never block mutation or spawn`, async () => {
+    const branch = staleGateHistory();
+    const plugin = registeredPlugin(route, true, branch);
+    const advisor = adviceFixture(branch);
+    // Real advice results persisted on the same branch: rejection-style verdicts and a provider failure.
+    for (const verdict of ["REPLAN", "ESCALATE"]) {
+      advisor.state.completion = completionOf(verdict);
+      expect((await advisor.advise()).isError).not.toBe(true);
+    }
+    advisor.state.completion = async () => { throw new Error("upstream unavailable"); };
+    expect((await advisor.advise()).isError).toBe(true);
+    // The advice fixture registered its own session as main; the plugin's session is main again.
+    registerAsMain(plugin.session);
+
+    await plugin.beginTurn(PROMPT);
+    branch.push({ type: "message", id: "request", parentId: branch.at(-1)?.id ?? null,
+      timestamp: "2026-09-28T00:00:00Z", message: user(PROMPT) } as SessionEntry);
+    const composed = await plugin.context(branch.flatMap(entry => entry.type === "message" ? [entry.message] : []));
+    expect(ofType(composed, "jev-review-required")).toEqual([]);
+
+    const spawn = { context: "Ingestion refactor", tasks: [{ name: "Parser", task: "Refactor the parser" }] };
+    for (const [tool, input] of [["edit", {}], ["write", {}], ["bash", { command: "true" }], ["task", spawn]] as const) {
+      expect(await plugin.attempt(tool, input)).toBeUndefined();
+    }
+    // A phase completion is not a review trigger either.
+    const phases = [{ name: "Build", tasks: [{ content: "Implement parser", status: "completed" }] }];
+    await plugin.toolResult({ type: "tool_result", toolName: "todo", toolCallId: "todo-done", input: { op: "done" },
+      content: [{ type: "text", text: "Build completed" }], isError: false, details: { op: "done", phases } });
+    expect(await plugin.attempt("edit")).toBeUndefined();
+    expect(await plugin.attempt("task", spawn)).toBeUndefined();
+    expect(advisor.state.customEntries).toEqual([]);
+  });
+}
+
 test("explicit and automatic orchestration compose one policy notice with Advisor guidance once", async () => {
   const plugin = registeredPlugin(ORCHESTRATE_ROUTE);
   await plugin.beginTurn(PROMPT);
@@ -395,16 +347,13 @@ test("explicit and automatic orchestration compose one policy notice with Adviso
   expect(first[3]).toBe(policy[0]!);
   expect(guidanceCount(policy[0])).toBe(1);
   expect(totalGuidance(first)).toBe(1);
-  // Initial assessment permits scoping; execution activates the pending-review notice.
-  expect(ofType(first, "jev-review-required")).toHaveLength(0);
 
   // A later provider request re-runs every hook on persisted history, or on an already composed copy.
   expect(await plugin.context(persisted)).toEqual(first);
   expect(await plugin.context(first)).toEqual(first);
-  expect(await plugin.attemptMutation()).toMatchObject({ block: true });
-  const pending = await plugin.context(persisted);
-  expect(ofType(pending, "jev-review-required")).toHaveLength(1);
-  expect(totalGuidance(pending)).toBe(1);
+  // Mutation attempts leave the composed context unchanged: no pending-review notice appears.
+  expect(await plugin.attempt("edit")).toBeUndefined();
+  expect(await plugin.context(persisted)).toEqual(first);
 });
 
 test("a workflow turn keeps the native workflow notice and gets one guided supplement", async () => {
@@ -440,7 +389,7 @@ test("master disable leaves native guidance unchanged and does not gate executio
   await plugin.beginTurn(PROMPT);
   const messages = [keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 1), user(PROMPT)];
   expect(await plugin.context(messages)).toEqual(messages);
-  expect(await plugin.attemptMutation()).toBeUndefined();
+  expect(await plugin.attempt("edit")).toBeUndefined();
 });
 
 test("without a router policy, only the current turn's native notice is guided, by copy", async () => {
@@ -453,7 +402,7 @@ test("without a router policy, only the current turn's native notice is guided, 
     registerTool() {},
     getActiveTools: () => [TOOL],
     on(event: string, handler: Handler) { if (event === "context") context = handler; },
-  } as unknown as ExtensionAPI, new ReviewGate());
+  } as unknown as ExtensionAPI);
   const historical = keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 1);
   const current = keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 2);
   const messages = [historical, user("Earlier request"), assistant("done"), current, user(PROMPT)]

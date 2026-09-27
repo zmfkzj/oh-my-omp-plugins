@@ -7,7 +7,6 @@
  * appends. A finding never expires and no review outcome changes it; only a recorded transition
  * does, and a transition is replayed only while its cited evidence still validates on the branch.
  */
-import { createHash } from "node:crypto";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { slugifyAdvisorName } from "@oh-my-pi/pi-coding-agent/advisor/config";
 import type { CustomEntry, SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -298,24 +297,6 @@ function buildLedger(branch: readonly SessionEntry[]): Ledger {
  */
 export function collectFindings(branch: readonly SessionEntry[]): VerificationFinding[] {
   return buildLedger(branch).tracked.map(({ finding }) => finding);
-}
-
-/**
- * Identity of the ledger state a review must reflect: each finding's semantic identity (advisor,
- * scope, folded note), severity, status and the transition record behind that status. Emission
- * ids, repeat counts and timestamps are left out and identical states collapse, so a watchdog
- * repeating itself never invalidates a review, while a new note, an escalation or any recorded
- * transition does. Other advisors, nits and unrelated entries never enter the ledger.
- */
-export function findingRevision(branch: readonly SessionEntry[]): string {
-  const states = new Set(
-    buildLedger(branch).tracked.map(({ key, finding }) =>
-      JSON.stringify([key, finding.severity, finding.status, finding.transition?.recordId ?? null]),
-    ),
-  );
-  return createHash("sha256")
-    .update(JSON.stringify([...states].sort()))
-    .digest("hex");
 }
 
 function findTracked(ledger: Ledger, findingId: string): Tracked {

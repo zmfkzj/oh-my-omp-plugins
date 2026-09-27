@@ -1,7 +1,7 @@
 {
-  "name": "omp-jev-router",
+  "name": "om-orche",
   "version": "1.0.0",
-  "description": "Keeps the primary model fixed while deciding orchestration and review needs with Jev; plugin-owned coordination guidance over OMP's native task worker, with checkpoint reviews and independent verification.",
+  "description": "Keeps the primary model fixed while Jev chooses orchestration; plugin-owned coordination over OMP's native task worker, with optional plan advice and independent verification.",
   "license": "UNLICENSED",
   "type": "module",
   "files": [
@@ -24,7 +24,7 @@
       "enabled": {
         "type": "boolean",
         "default": true,
-        "description": "Master switch for routing and mandatory review enforcement. Manual review/finding tools remain available."
+        "description": "Master switch for routing and automatic guidance. Manual advice/finding tools remain available; no review gate is installed."
       },
       "jevModel": {
         "type": "string",
@@ -34,7 +34,7 @@
       "orchestrationRoutingEnabled": {
         "type": "boolean",
         "default": true,
-        "description": "Allow the ORCHESTRATE execution route. Independent risk/review assessment remains active; the primary model never changes."
+        "description": "Allow the ORCHESTRATE execution route. Advice is optional and never blocks execution; the primary model never changes."
       },
       "orchestrationMinConfidence": {
         "type": "number",
@@ -84,16 +84,19 @@
     "format": "oxfmt src test bin package.json tsconfig.json"
   },
   "dependencies": {
-    "@oh-my-pi/pi-ai": "18.3.1",
+    "@oh-my-pi/pi-ai": "18.3.5",
     "@typesafe-ai/sdk": "^0.6.0"
   },
   "devDependencies": {
-    "@oh-my-pi/pi-coding-agent": "18.3.1",
+    "@oh-my-pi/pi-coding-agent": "18.3.5",
     "@types/bun": "^1.4.2",
     "oxfmt": "^0.68.0",
     "oxlint": "^1.83.0",
     "typescript": "^5.9.3",
     "zod": "^3.25.76"
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.3.5"
   },
   "engines": {
     "bun": ">=1.3.14"

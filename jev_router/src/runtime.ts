@@ -1,7 +1,7 @@
 /**
- * Shared runtime state: configuration, credential, the orchestration router,
- * the review gate and telemetry. One instance per loaded extension; event
- * handlers and commands both read it, so a `/jev-router setup` takes effect on
+ * Shared runtime state: configuration, credential, the orchestration router
+ * and telemetry. One instance per loaded extension; event
+ * handlers and commands both read it, so a `/om-orche setup` takes effect on
  * the next decision without a restart.
  *
  * Generic workers are OMP's native `task` agent; this runtime never classifies,
@@ -15,8 +15,6 @@ import { type ResolvedCredential, resolveCredential } from "./credentials.ts";
 import { JevEngine } from "./jev.ts";
 import { RouteLogger } from "./logging.ts";
 import { OrchestrationRouter } from "./orchestration.ts";
-import { ReviewGate } from "./review-gate.ts";
-import { prepareDispatch } from "./task-contract.ts";
 import { Telemetry } from "./telemetry.ts";
 
 /** Re-resolve the credential at most this often; setup and 401s invalidate early. */
@@ -27,7 +25,6 @@ export class JevRouterRuntime {
 	readonly logger: RouteLogger;
 	readonly engine = new JevEngine();
 	readonly orchestration: OrchestrationRouter;
-	readonly reviewGate: ReviewGate;
 	readonly stateDir: string;
 
 	#config: JevRouterConfig = normalizeConfig(undefined);
@@ -36,19 +33,16 @@ export class JevRouterRuntime {
 	#ctx: ExtensionContext | undefined;
 
 	constructor(pi: ExtensionAPI) {
+		// Keep the existing data directory across the public package rename.
 		this.stateDir = path.join(getAgentDir(), "jev-router");
 		this.telemetry = Telemetry.shared(this.stateDir);
 		this.logger = new RouteLogger(pi.logger);
-		// Declarations are validated against the live native `task` schema, never a copy.
-		this.reviewGate = new ReviewGate(() => this.#config.enabled, input => prepareDispatch(pi, input));
 		this.orchestration = new OrchestrationRouter({
 			engine: this.engine,
 			logger: this.logger,
 			telemetry: this.telemetry,
 			credential: () => this.apiKey(),
 			config: () => this.#config,
-			onReviewDecision: (ctx, required, checkpoint, reason, request, workScope) =>
-				this.reviewGate.noteDecision(ctx, required, checkpoint, reason, request, workScope),
 		});
 	}
 

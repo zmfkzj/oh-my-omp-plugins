@@ -2,10 +2,6 @@ import { describe, expect, test } from "bun:test";
 import type { Effort, AssistantMessage, Usage } from "@oh-my-pi/pi-ai";
 import example from "../examples/initial-plan.json";
 import { AUDITOR_NAME } from "../src/verification-auditor.ts";
-import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
-import { ReviewGate } from "../src/review-gate.ts";
-import { prepareDispatch } from "../src/task-contract.ts";
-import { makeApi, makeSession, registerAsMain, clearRegistry } from "./harness.ts";
 import {
   prepareReviewInput,
   runReview,
@@ -236,13 +232,13 @@ describe("review completion boundary", () => {
   });
 
   for (const verdict of ["REPLAN", "ESCALATE"]) {
-    test(`${verdict} denies permission without retrying or hiding reviewer feedback`, async () => {
+    test(`${verdict} is returned as advice, not an error, without retrying`, async () => {
       const text = structuredReview.replace("KEEP", verdict);
       const { completion, calls } = completionSequence(response({ content: [{ type: "text", text }] }));
       const result = await review(completion);
-      expect(result.isError).toBe(true);
-      expect(result.details.failureKind).toBe("review_rejected");
-      expect(result.text).toContain(text);
+      expect(result.isError).toBe(false);
+      expect(result.details.failureKind).toBeUndefined();
+      expect(result.text.startsWith(text)).toBe(true);
       expect(calls).toHaveLength(1);
     });
   }
@@ -398,61 +394,7 @@ describe("review completion boundary", () => {
     expect(result.details.findingsOmitted).toBe(2);
   });
 
-  test("a long native batch preserves its last worker and marks excerpt truncation", async () => {
-    const branch: SessionEntry[] = [];
-    const { session, ctx } = makeSession({ branch });
-    Object.assign(session.sessionManager, { appendCustomEntry(customType: string, data: unknown) {
-      const id = `entry-${branch.length}`;
-      branch.push({ type: "custom", id, parentId: null, timestamp: "2026-09-27T00:00:00Z", customType, data });
-      return id;
-    } });
-    registerAsMain(session);
-    try {
-      const { pi } = makeApi();
-      const gate = new ReviewGate(() => true, input => prepareDispatch(pi, input));
-      gate.stageDispatch(ctx, { context: "Payment storage migration.", tasks: [
-        ...Array.from({ length: 4 }, (_, index) => ({ name: `Worker${index}`, task: "x".repeat(500) })),
-        { name: "CriticalLast", task: "Migrate production payment storage" },
-      ] });
-      const scope = gate.scope(ctx);
-      expect(scope.dispatchSummary).toHaveLength(5);
-      const { content } = await promptFor({ ...prepared, executionScope: {
-        key: scope.key, checkpoint: scope.checkpoint, planHash: scope.planHash, dispatchSummary: scope.dispatchSummary,
-      } });
-      expect(content).toContain("Staged dispatches (5 total)");
-      expect(content).toContain("CriticalLast (task): Migrate production payment storage");
-      expect(content).toContain("[truncated]");
-      for (let index = 0; index < 4; index++) expect(content).toContain(`Worker${index}`);
-    } finally {
-      clearRegistry();
-    }
-  });
-
-  test("renders the plugin's execution scope apart from the snapshot, with bounded dispatches", async () => {
-    const scoped: PreparedReview = {
-      ...prepared,
-      executionScope: {
-        key: "scope-key",
-        checkpoint: "fan-out",
-        planHash: "plan-hash",
-        dispatchSummary: Array.from({ length: 30 }, (_, index) => `task: slice ${index} ${"x".repeat(200)}`),
-      },
-    };
-    const { content } = await promptFor(scoped);
-    const block = content.split("\n\n").find((part) => part.startsWith("Execution scope")) ?? "";
-    const dispatches = block.split("\n").filter((line) => line.startsWith("  - task: slice"));
-
-    expect(content).toContain(JSON.stringify(prepared.snapshot, null, 2));
-    expect(block).toContain("- Plan hash: plan-hash");
-    expect(block).toContain("- Staged dispatches (30 total):");
-    expect(dispatches.length).toBeGreaterThan(0);
-    expect(dispatches.length).toBeLessThan(30);
-    expect(dispatches.join("").length).toBeLessThanOrEqual(2000 + dispatches.length * 4);
-    expect(block).toContain(`${30 - dispatches.length} more not shown`);
-    expect(block).toContain("[truncated]");
-  });
-
-  test("sends only the checkpoint and snapshot when no findings or scope exist", async () => {
+  test("sends only the checkpoint and snapshot when no findings exist", async () => {
     const { content } = await promptFor(prepared);
 
     expect(content).toBe(

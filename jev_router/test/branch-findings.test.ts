@@ -3,7 +3,7 @@ import type { AdvisorNote } from "@oh-my-pi/pi-coding-agent/advisor/advise-tool"
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { ROLE, TOOL } from "../src/advisor-review.ts";
-import { collectFindings, FINDING_ENTRY_TYPE, findingRevision } from "../src/findings.ts";
+import { collectFindings, FINDING_ENTRY_TYPE } from "../src/findings.ts";
 import { AUDITOR_NAME } from "../src/verification-auditor.ts";
 
 /** A real in-memory session, so ids, parent links and branch paths are the host's own. */
@@ -77,18 +77,15 @@ describe("verification finding ledger", () => {
   test("keeps findings open across successful reviews until a transition is recorded", () => {
     const session = transcript();
     session.audit(blocker("Claimed tests pass; no runner output."));
-    const before = findingRevision(session.branch());
     session.tool("VERDICT: KEEP", { toolName: TOOL });
 
     expect(collectFindings(session.branch()).map((finding) => finding.status)).toEqual(["open"]);
-    expect(findingRevision(session.branch())).toBe(before);
   });
 
-  test("merges watchdog repeats without moving the revision; new substance moves it", () => {
+  test("merges watchdog repeats and preserves distinct findings and severity escalation", () => {
     const session = transcript();
     session.user("Fix the cache.");
     const first = session.audit(concern("Cache eviction is untested."));
-    const baseline = findingRevision(session.branch());
 
     const repeat = session.audit(concern("cache eviction is UNTESTED"));
     session.tool("unrelated output");
@@ -99,22 +96,16 @@ describe("verification finding ledger", () => {
     expect(collectFindings(session.branch())).toMatchObject([
       { id: `${first}:0`, repeatCount: 1, repeatIds: [`${repeat}:0`] },
     ]);
-    expect(findingRevision(session.branch())).toBe(baseline);
 
     session.audit(blocker("Cache eviction is untested."));
-    const escalated = findingRevision(session.branch());
     expect(collectFindings(session.branch())).toMatchObject([{ id: `${first}:0`, severity: "blocker" }]);
-    expect(escalated).not.toBe(baseline);
 
     session.audit(concern("Cache TTL is hard-coded."));
-    const distinct = findingRevision(session.branch());
-    expect(distinct).not.toBe(escalated);
 
     // The same words under a newer user message are a new assertion in a new scope.
     session.user("Also handle the TTL.");
     session.audit(blocker("Cache eviction is untested."));
     expect(collectFindings(session.branch())).toHaveLength(3);
-    expect(findingRevision(session.branch())).not.toBe(distinct);
   });
 
   test("replays a transition only when its cited evidence validates after the finding", () => {
@@ -125,7 +116,6 @@ describe("verification finding ledger", () => {
     const failed = session.tool("1 fail", { isError: true });
     const review = session.tool("VERDICT: KEEP", { toolName: TOOL });
     const passing = session.tool("13 pass, 0 fail");
-    const open = findingRevision(session.branch());
 
     session.transition(id, "resolve", [stale]);
     session.transition(id, "resolve", [failed]);
@@ -134,7 +124,6 @@ describe("verification finding ledger", () => {
     session.transition(id, "resolve", []);
     session.transition(id, "waive", [], "orchestrator");
     expect(collectFindings(session.branch())[0]?.status).toBe("open");
-    expect(findingRevision(session.branch())).toBe(open);
 
     const record = session.transition(id, "resolve", [passing]);
     expect(collectFindings(session.branch())[0]).toMatchObject({
@@ -146,7 +135,6 @@ describe("verification finding ledger", () => {
         evidence: [{ entryId: passing, kind: "tool_result", toolName: "bash", excerpt: "13 pass, 0 fail" }],
       },
     });
-    expect(findingRevision(session.branch())).not.toBe(open);
   });
 
   test("scopes transitions to their branch and survives serialization", () => {
@@ -159,7 +147,6 @@ describe("verification finding ledger", () => {
 
     const reloaded = JSON.parse(JSON.stringify(resolved)) as SessionEntry[];
     expect(collectFindings(reloaded)).toEqual(collectFindings(resolved));
-    expect(findingRevision(reloaded)).toBe(findingRevision(resolved));
 
     session.manager.branch(source);
     session.user("Try a different approach.");
@@ -175,11 +162,9 @@ describe("verification finding ledger", () => {
     const waivedSource = session.audit(concern("Rollback path is untested."));
     // Confirmed in the dialog alone: no new user message, so a repeat stays in the same scope.
     session.transition(`${waivedSource}:0`, "waive", []);
-    const settled = findingRevision(session.branch());
 
     session.audit(concern("Rollback path is untested."));
     expect(collectFindings(session.branch())).toHaveLength(2);
-    expect(findingRevision(session.branch())).toBe(settled);
 
     session.audit(blocker("Migration was never run."));
     expect(collectFindings(session.branch()).map((finding) => finding.status)).toEqual([
@@ -187,6 +172,5 @@ describe("verification finding ledger", () => {
       "waived",
       "open",
     ]);
-    expect(findingRevision(session.branch())).not.toBe(settled);
   });
 });

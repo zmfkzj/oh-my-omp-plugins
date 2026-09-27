@@ -57,19 +57,6 @@ describe("visible classifier context", () => {
 		expect(context.recentMessages.at(-1)?.text.length).toBeLessThanOrEqual(700);
 		expect(context.recentMessages.length).toBeLessThanOrEqual(9);
 	});
-	test("work candidates retain only each task's latest branch-local identity and bound their goals", () => {
-		const state = (id: string, goal: string): SessionEntry => ({
-			type: "custom", id: crypto.randomUUID(), parentId: null, timestamp: "2026-01-01",
-			customType: "jev-review-requirement", data: { workId: id, goal },
-		});
-		const branch = Array.from({ length: 9 }, (_, index) => state(`work-${index}`, "goal".repeat(1000)));
-		branch.push(state("work-8", "Latest current work"));
-		const candidates = buildRoutingContext(branch, "Continue").workScopes!;
-		expect(candidates).toHaveLength(6);
-		expect(candidates[0]).toEqual({ id: "work-8", goal: "Latest current work" });
-		expect(candidates.map(item => item.id)).toEqual(["work-8", "work-7", "work-6", "work-5", "work-4", "work-3"]);
-		expect(candidates.every(item => item.goal.length <= 600)).toBe(true);
-	});
 });
 
 describe("branch-committed todo snapshots", () => {

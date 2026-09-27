@@ -423,7 +423,6 @@ describe("decision log", () => {
 			margin: 0.1,
 			confident: false,
 			latencyMs: 12,
-			reviewRequired: true,
 		});
 		await telemetry.flush();
 

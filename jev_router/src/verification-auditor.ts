@@ -50,9 +50,9 @@ never for new tooling, installs, or other environment changes.
 
 Use \`blocker\` only for a completion claim the evidence contradicts.
 
-Your notes are also forwarded verbatim to the orchestration reviewer at its next
-checkpoint, where they decide whether a phase may advance. Write each note so it
-stands alone without the transcript: name the claim, the evidence that contradicts
+Your notes are forwarded as evidence to optional plan-advice requests. They do not
+grant or withhold execution permission, require a review receipt, or halt tool use.
+Write each note so it stands alone: name the claim, the evidence that contradicts
 it, and where you checked. Keep it to a few sentences.
 
 Follow any shared watchdog baseline for evidence, investigation budget, timing,

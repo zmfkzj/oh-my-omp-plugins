@@ -1,7 +1,7 @@
 # Merge these roles into the active OMP config.yml; do not overwrite other settings.
 # Any supported authenticated model selector may be used, independently of DEFAULT.
-# Reviews are required for orchestrate checkpoints, independent high-risk plans,
-# and multi-implementation-worker dispatch. Reload with /reload-plugins after changes.
+# Orche-Advisor gives optional advice on an established plan, never execution approval.
+# Reload with /reload-plugins after changes.
 modelRoles:
   # task: <provider/model> # OMP's native task worker model; keep any existing assignment
   orche-advisor: openai-codex/gpt-6-astra:xhigh

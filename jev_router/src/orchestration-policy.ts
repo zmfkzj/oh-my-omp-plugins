@@ -8,7 +8,7 @@
  *   - `workflow`: auxiliary only. A native `workflowz` notice keeps choosing the
  *     execution method; this adds the task-body contract and verification duties
  *     without any dispatch or fan-out instruction.
- * Review gates and tool permissions are unaffected by the mode.
+ * Tool permissions are unaffected by the mode.
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 
@@ -70,8 +70,7 @@ function taskBodyContract(tools: ReadonlySet<string>, subject: string): string {
 		"  # Return: done or blocked, actual changes, checks run with results, remaining issues.",
 		"Keep shared context to constraints common to every item; never copy the conversation or earlier reports." +
 			(tools.has("task")
-				? " Give every implementation `task` item a distinct, non-blank `name`; the review gate refuses unnamed or colliding workers it cannot match to their approval." +
-					" Use the existing outputSchema only when a structured result is needed."
+				? " Use the existing outputSchema only when a structured result is needed."
 				: ""),
 		"A worker that finds a defect in a fixed decision returns evidence instead of redesigning it.",
 	].join("\n");
@@ -84,14 +83,14 @@ function verification(tools: ReadonlySet<string>): string {
 		`Never run global ${checks} or formatters concurrently in a shared checkout; isolated, conflict-free local smoke runs by workers are fine.`,
 		"Classify a failure first: implementation defect, ambiguous contract, missing environment or permission, integration conflict, or unresolved design.",
 		"Fix small obvious gaps directly. Never repeat an unchanged failure without new input or a new hypothesis; with no executable next step, report the exact blocker.",
-		"No automatic model escalation, reviewer loops, or out-of-scope reviewer demands. Required reviews and waivers still apply.",
+		"No automatic model escalation, reviewer loops, or out-of-scope reviewer demands.",
 	].join("\n");
 }
 
 function renderDefault(tools: ReadonlySet<string>): string {
 	return [
 		"<system-notice>",
-		"Execution policy for this request (Jev Router).",
+		"Execution policy for this request (om-orche).",
 		"Work directly when the task is cohesive, strongly sequential, or cheaper to do than to delegate.",
 		"Delegate to `task` only when a separate context or tool scope genuinely helps; a single delegated unit is fine, never invent a second one.",
 		"Delegate in parallel only when items run without each other's unfinished output and their file ownership, interfaces and runtime resources do not collide. File count or prompt length is not evidence of independence.",
@@ -104,7 +103,7 @@ function renderDefault(tools: ReadonlySet<string>): string {
 function renderOrchestrate(tools: ReadonlySet<string>): string {
 	if (!tools.has("task")) return [
 		"<system-notice>",
-		"Execution policy for this request (Jev Router): orchestration was requested, but `task` is not enabled for this turn.",
+		"Execution policy for this request (om-orche): orchestration was requested, but `task` is not enabled for this turn.",
 		"Execute directly; do not claim or simulate delegation.",
 		verification(tools),
 		"</system-notice>",
@@ -114,7 +113,7 @@ function renderOrchestrate(tools: ReadonlySet<string>): string {
 		: "Scope the work first and state the ordered phases, each listing its independent units and dependencies.";
 	return [
 		"<system-notice>",
-		"Execution policy for this request (Jev Router): coordinated delegation. You stay responsible for planning, integration, verification and completion.",
+		"Execution policy for this request (om-orche): coordinated delegation. You stay responsible for planning, integration, verification and completion.",
 		planning,
 		"Choose per unit: direct work for cohesive, sequential, or small changes; one `task` for a sufficient unit that benefits from separate context; parallel `task` items only for units that need none of each other's unfinished output and whose ownership, interfaces and runtime resources do not collide.",
 		"File count or prompt length is not evidence of independence. Submit dependent work only after its prerequisite contract is verified.",
@@ -128,7 +127,7 @@ function renderOrchestrate(tools: ReadonlySet<string>): string {
 function renderWorkflow(tools: ReadonlySet<string>): string {
 	return [
 		"<system-notice>",
-		"Jev Router supplement to the workflow notice for this request. The workflow notice alone chooses the execution method, agents and fan-out; this supplement adds no dispatch.",
+		"om-orche supplement to the workflow notice for this request. The workflow notice alone chooses the execution method, agents and fan-out; this supplement adds no dispatch.",
 		taskBodyContract(tools, "workflow item prompt"),
 		verification(tools),
 		"</system-notice>",

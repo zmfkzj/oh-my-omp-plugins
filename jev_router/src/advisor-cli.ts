@@ -29,9 +29,10 @@ Usage:
   orche-advisor --help
   orche-advisor --version
 
-Request one bounded Orche-Advisor review from a JSON object containing
+Request one bounded Orche-Advisor plan advice from a JSON object containing
 { "checkpoint": "...", "snapshot": { ... } }. Pass - to read stdin. With no
-input path, stdin is used only when it is piped.
+input path, stdin is used only when it is piped. Every verdict
+(KEEP/ADJUST/REPLAN/ESCALATE) is advice; none approves or blocks anything.
 
 Options:
   --model <selector>  Override modelRoles.${ROLE} for this invocation only.
@@ -43,34 +44,36 @@ Options:
   -v, --version       Show the package version.
 
 Exit status:
-  0  Review succeeded, input/model check succeeded, or help/version was shown.
-  1  The reviewer returned an error.
+  0  An advisory verdict was returned (any of KEEP/ADJUST/REPLAN/ESCALATE), the
+     input/model check succeeded, or help/version was shown.
+  1  The advisor model failed: provider/runtime error, truncated, tool-call or
+     unstructured output. No advice is available.
   2  Usage, input, settings, credential, or model configuration error.
   130/143  Cancelled by SIGINT/SIGTERM.
 
 Standalone install and use:
-  cd /path/to/jev_router
+  cd /path/to/om-orche
   bun install
   bun run bin/orche-advisor.ts examples/initial-plan.json --check
   bun run bin/orche-advisor.ts examples/initial-plan.json
   cat examples/initial-plan.json | bun run bin/orche-advisor.ts --json
 
 Install a release archive as a command:
-  bun install --global /path/to/omp-jev-router-${VERSION}.tgz
+  bun install --global /path/to/om-orche-${VERSION}.tgz
   orche-advisor /path/to/snapshot.json --model provider/model:high --check
 Requires Bun >=1.3.14 and credentials for the selected provider, not a running OMP session.
 Use provider API-key environment variables or credentials in the selected OMP agent directory.
-The CLI is stateless: every non-check invocation requests a review. Same-branch reuse is
-available only inside the OMP extension. Review usage is in the result, not /advisor status.
+The CLI is stateless: every non-check invocation requests new advice. Advice usage is in
+the result, not /advisor status.
 
 Install the OMP extension from this same package:
-  omp plugin install /path/to/jev_router
+  omp plugin install /path/to/om-orche
 Configure modelRoles.${ROLE}; examples/config.yml also shows the independent
 Verification Auditor role (default @smol, not ADVISOR).
 Reload OMP with /reload-plugins or start a new session after installing or updating.
-The standalone prose keyword orchestrate enables required initial-plan and phase/replan
-reviews through OMP's native orchestration notice. Ordinary requests keep reviews optional.
-The orchestrator calls the tool with a compact snapshot; hooks never invoke a model directly.
+Orche-Advisor is optional advice on an already formed orchestration plan; it is never
+required and never gates execution. The orchestrator calls the tool with a compact
+snapshot; hooks never invoke a model directly.
 `;
 
 interface CliOptions {

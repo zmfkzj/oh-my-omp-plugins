@@ -1,5 +1,5 @@
 /**
- * `/jev-router` slash command.
+ * `/om-orche` slash command.
  *
  * Subcommands: setup, status, test, stats, reset. No subcommand prints status.
  * Secrets are never rendered: the credential is reported by provenance only.
@@ -15,22 +15,24 @@ import {
 } from "./credentials.ts";
 import { mainSessionOf } from "./host.ts";
 import { JEV_ORCHESTRATE_NOTICE_TYPE } from "./orchestration-policy.ts";
-import { GENERIC_TASK_AGENT } from "./task-contract.ts";
 import { historySnapshotName, type OrchestrationCounters, type TelemetryState } from "./telemetry.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import type { JevRouterRuntime } from "./runtime.ts";
 
-export const COMMAND_NAME = "jev-router";
+export const COMMAND_NAME = PLUGIN_NAME;
 const SUBCOMMANDS = ["setup", "status", "test", "stats", "reset"] as const;
 type Subcommand = (typeof SUBCOMMANDS)[number];
 
 const PAD = 23;
 
+/** OMP's bundled generic worker agent, whose model the native `@task` role picks. */
+const GENERIC_TASK_AGENT = "task";
+
 function row(label: string, value: string): string {
 	return `${label.padEnd(PAD)}${value}`;
 }
 
-/** Fixed probes for `/jev-router test`; they exercise the front-door classifier end to end. */
+/** Fixed probes for `/om-orche test`; they exercise the front-door classifier end to end. */
 const TEST_REQUEST =
 	"Rename the `retryCount` field to `attempts` in the HTTP client and update its two call sites.";
 const TEST_PARALLEL_REQUEST =
@@ -43,7 +45,7 @@ function formatCredential(runtime: JevRouterRuntime, stored: boolean, source: st
 	if (source === "env") return `configured (${TYPESAFE_ENV_VAR}, not persisted)`;
 	if (source === "omp-credential-store") return "configured (OMP credential store)";
 	if (stored) return "stored but unreadable";
-	return runtime.config.enabled ? "not configured — run /jev-router setup" : "not configured";
+	return runtime.config.enabled ? "not configured — run /om-orche setup" : "not configured";
 }
 
 export async function renderStatus(
@@ -59,7 +61,7 @@ export async function renderStatus(
 	const taskEnabled = session?.getEnabledToolNames().includes("task");
 
 	const lines = [
-		row("Jev Router", config.enabled ? "enabled" : "disabled"),
+		row(PLUGIN_NAME, config.enabled ? "enabled" : "disabled"),
 		row("Credential", formatCredential(runtime, hasStoredCredential(ctx), credential?.source)),
 		"",
 		row("Orchestration routing", config.orchestrationRoutingEnabled ? "enabled" : "disabled"),
@@ -89,7 +91,6 @@ export async function renderStatus(
 				? `${orchestration.outcome}${orchestration.confidence === undefined ? "" : ` ${orchestration.confidence.toFixed(2)}`}`
 				: "none this session",
 		),
-		row("Review assessment", orchestration?.reviewRequired === undefined ? "not assessed" : orchestration.reviewRequired ? "required (see /review-status)" : "optional"),
 	);
 
 	if (runtime.retiredConfigKeys.length > 0) {
@@ -120,7 +121,7 @@ function telemetryStateNote(state: TelemetryState): string | undefined {
 		case "suspended":
 			return state.reason === "future-version"
 				? `telemetry.json was written by a newer plugin version (v${state.version}); left untouched, recording suspended.`
-				: `Telemetry ${state.reason}: ${state.detail}. Recording suspended; /jev-router reset discards it.`;
+				: `Telemetry ${state.reason}: ${state.detail}. Recording suspended; /om-orche reset discards it.`;
 	}
 }
 
@@ -258,7 +259,7 @@ async function runSetup(runtime: JevRouterRuntime, ctx: ExtensionCommandContext)
 
 async function runTest(runtime: JevRouterRuntime): Promise<string> {
 	const apiKey = await runtime.apiKey();
-	if (!apiKey) return "No TypeSafe credential. Run /jev-router setup first.";
+	if (!apiKey) return "No TypeSafe credential. Run /om-orche setup first.";
 	const config = runtime.config;
 	const options = { apiKey, model: config.jevModel, timeoutMs: Math.max(config.routingTimeoutMs, 10_000) };
 	const lines: string[] = [row("Jev model", runtime.engine.modelFor(options))];

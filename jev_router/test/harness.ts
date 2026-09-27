@@ -18,7 +18,6 @@ import type {
 	JevDecider,
 	OrchestrationDecision,
 	OrchestrationRoute,
-	ReviewRequirement,
 	RoutingContext,
 } from "../src/jev.ts";
 
@@ -134,22 +133,12 @@ export function makeApi(
 	return { pi, logs, taskSchema };
 }
 
-export interface ScriptedReview {
-	top: ReviewRequirement;
-	confidence: number;
-	margin: number;
-}
-
 export interface ScriptedOrchestration {
 	top: OrchestrationRoute;
 	confidence: number;
 	margin: number;
 	confident: boolean;
-	/** The independent review answer; a confident OPTIONAL when omitted, no usable answer when `null`. */
-	review?: ScriptedReview | null;
 }
-
-const OPTIONAL_REVIEW: ScriptedReview = { top: "OPTIONAL", confidence: 0.95, margin: 0.9 };
 
 /** A `JevDecider` returning canned answers and counting requests. */
 export class ScriptedDecider implements JevDecider {
@@ -176,7 +165,6 @@ export class ScriptedDecider implements JevDecider {
 			this.#orchestrationQueue.length > 1 ? this.#orchestrationQueue.shift()! : this.#orchestrationQueue[0]!;
 		if (next instanceof Error) throw next;
 		const { top, confidence, margin } = next;
-		const review = next.review === undefined ? OPTIONAL_REVIEW : next.review;
 		return {
 			top,
 			confidence,
@@ -184,14 +172,6 @@ export class ScriptedDecider implements JevDecider {
 			confident: confidence >= gates.minConfidence && margin >= gates.minMargin,
 			probabilities: { [top]: confidence },
 			latencyMs: 7,
-			// A missing answer gates to the engine's empty, unconfident REQUIRED.
-			review: review
-				? {
-						...review,
-						confident: review.confidence >= gates.minConfidence && review.margin >= gates.minMargin,
-						probabilities: { [review.top]: review.confidence },
-					}
-				: { top: "REQUIRED", confidence: 0, margin: 0, confident: false, probabilities: {} },
 		};
 	}
 }

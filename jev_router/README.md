@@ -1,22 +1,28 @@
-# omp-jev-router
+# om-orche
 
 A coordination layer for [OMP](https://omp.sh). One bounded decision call per
 request, made by TypeSafe's [Jev](https://typesafe.ai) System One model, chooses
-DEFAULT or ORCHESTRATE and independently assesses review risk. The primary model
-stays fixed. The plugin then supplies its **own** execution guidance and
-enforces checkpoint review, while every worker runs through OMP's native `task`
-tool unchanged.
+DEFAULT or ORCHESTRATE. The primary model stays fixed. The plugin supplies its
+own execution guidance while every worker runs through OMP's native `task` tool
+unchanged. There is no plugin review gate or execution-approval state.
+
+Compatibility target: **OMP 18.3.5**. The host peer dependency and the OMP
+development/model-SDK packages are pinned to 18.3.5.
 
 Generic workers are OMP's native `task` agent; their model comes from your
 `@task` role. The plugin does not classify, rewrite, alias or re-route task
 calls, and specialized (`scout`, `reviewer`, `sonic`, …) and custom agents keep
 their identity and tool permissions. This package also provides an explicit
-`orche_advisor` checkpoint-review tool and a passive Verification Auditor.
-Actual review execution is separate from Jev classification.
+`orche_advisor` plan-advice tool and a passive Verification Auditor.
+Advice is requested explicitly on an established plan, not on every turn.
 
 > **Breaking change (single-task cutover).** The `task-easy`, `task-hard` and
 > `task-challenge` aliases, per-task Jev tier classification and their settings
 > are gone; see [Migrating from tier routing](#migrating-from-tier-routing).
+
+> **Breaking change (advice-only cutover).** Mandatory review, dispatch staging,
+> receipts, spawn permits and review waiver/retry commands are removed.
+> See [Migrating from review gates](#migrating-from-review-gates).
 
 ---
 
@@ -29,11 +35,9 @@ USER → Jev (bounded dialogue + committed plan)
   uncertain   → DEFAULT; primary model never changes
 
 Successful todo init/append → reconsider changed plan → optionally promote to ORCHESTRATE
-Independent review REQUIRED → scope-bound gate → successful review or explicit user waiver
-Multiple implementation workers → pre-dispatch gate even when route is DEFAULT
+Established plan → optional explicit orche_advisor advice → coordinator decides
 
 Primary → native `task` call (task text carries the work contract)
-  → review gate (live native schema, exact dispatch hash, single-use spawn permits)
   → OMP preflight / spawn / async / cancel → worker result → primary verifies acceptance
 ```
 
@@ -48,36 +52,26 @@ committed todo plan. It never receives hidden thinking or raw tool-result bodies
 
 - **DEFAULT** injects the plugin's light DEFAULT guidance (when `task` is
   enabled): work directly, delegate one unit only when a separate context helps.
-  It does not mean review is optional.
+  Review does not block direct work or delegation.
 - **ORCHESTRATE** injects the plugin's own coordinated-delegation guidance as a
   hidden, user-attributed `jev-orchestrate-notice`. OMP's native orchestrate
   prompt is not reused as execution policy.
-- In the **same Jev request**, an independent REQUIRED/OPTIONAL question assesses
-  review risk: release gates, persistent data, compensation/payment/security,
-  material redesign or scope expansion, and repeated failures. Ambiguous/missing
-  review answers and unavailable classification require review before execution.
-  Neither decision changes the primary model.
-
-When recent work scopes exist, the same request also links the new message to
-one of up to six branch-local work IDs, or NEW. Progress checks and execution of
-an unchanged reviewed plan retain identity even when risk remains REQUIRED.
-Unrelated work or a material new contract gets a new ID. Missing, ambiguous or
-out-of-list linkage is conservative: it cannot reuse another task's receipt.
-An explicitly resumed listed task restores its own prior obligation/dispatch,
-not the most recently active task's state.
+- Jev asks only about the execution route. It does not classify review risk or
+  link requests to approval scopes. Missing credentials, uncertain answers and
+  classification failures do not create a review requirement.
 
 A successful `todo init` or `todo append` reconsiders a changed committed plan.
-Already-orchestrated turns renew the review requirement without another routing
-call. A newly completed phase renews review for required-review turns, including
-DEFAULT; ordinary task completion does not. Failed writes, views, identical
-plans and late prior-turn results do not trigger spurious transitions.
+An already-orchestrated turn keeps its route without another routing call.
+Task and phase completion do not request advice. Failed writes, views,
+identical plans and late prior-turn results do not trigger spurious promotions.
+Agent-attributed steering does not start a new turn and cannot hide the current
+turn's todo results. User-attributed steering refreshes the turn through
+`before_agent_start`; results from the previous turn remain ineligible.
 
 Initial notices stay before the current user message. A todo-triggered notice is
 anchored after that result's contiguous tool-result group, preserving the earlier prefix.
-The advisor hook then adds required review guidance on the same provider request.
-The mandatory review gate independently blocks unreviewed implementation and
-dispatch, including a worker batch submitted alongside todo. It cannot undo an
-operation already started before a new requirement existed.
+The advisor hook adds optional plan-advice guidance on the same provider request.
+No tool-call or worker-spawn hook requests review or blocks unreviewed execution.
 
 Execution guidance precedence for the current turn is: native `workflow-notice`
 (`workflowz`) > native explicit `orchestrate-notice` > automatic ORCHESTRATE >
@@ -93,8 +87,7 @@ attached once to the plugin's orchestrate/workflow notice.
 Subagents, plan mode, slash commands, synthetic notices and the master disable
 switch skip classification and guidance; with `enabled=false` OMP's native
 behavior is untouched. Disabling `orchestrationRoutingEnabled` or the task tool
-suppresses automatic ORCHESTRATE only: inline work still receives the
-independent review assessment, and an explicit native `orchestrate` request is
+suppresses automatic ORCHESTRATE; an explicit native `orchestrate` request is
 still handled by the plugin's policy. OMP's magic-keyword settings only decide
 whether an explicit native notice appears; they never gate automatic routing.
 With `task` disabled, no delegation is advertised. There is no primary model
@@ -119,143 +112,50 @@ that stays under host validation. The guidance asks the primary to write each
 Shared `context` carries only constraints common to every item; `outputSchema`
 is used only when a structured result is needed. The layout is guidance, not a
 runtime schema: free-form task calls are never rejected for missing sections.
-Because the whole `task`/`context` text is inside the review hash, design
-decisions written into the body are covered by the approval.
+OMP validates and executes the native task input. The plugin neither stages nor
+hashes task calls for approval.
 
-### Checkpoint reviewer and Verification Auditor
+### Plan advice and Verification Auditor
 
-`orche_advisor` reviews orchestration, not source code. It is primary-only and
-uses `modelRoles.orche-advisor` without falling back to the primary's model.
-Native orchestrate checkpoints and independent risk decisions require it.
-Otherwise routine work can still use an optional review.
+`orche_advisor` gives advice on an already-established plan, not source-code
+approval. It is primary-only and uses `modelRoles.orche-advisor` without falling
+back to the primary model. It accepts a `checkpoint` and the seven snapshot
+fields shown in `examples/initial-plan.json`; there is no `dispatch` argument.
 
-### Review before execution
+- Advice is optional in DEFAULT, ORCHESTRATE and workflow execution. Lifecycle
+  hooks do not invoke the model. Do not request advice merely because a new
+  turn, phase completion, worker result or auditor note arrived.
+- Submit a formed plan when an independent assessment can help. Avoid repeating
+  a request for an unchanged plan; each explicit call is a fresh model request.
+- `KEEP`, `ADJUST`, `REPLAN` and `ESCALATE` are recommendations. None grants or
+  withholds permission. The coordinator evaluates the advice, executes through
+  OMP, and remains responsible for tests and acceptance.
+- For material suggestions, the coordinator briefly records acceptance, partial
+  acceptance or rejection with a reason. Accepted changes are applied to the
+  committed plan/todo and affected worker instructions before the changed work
+  executes. The coordinator then continues without reapproval; the advisor
+  itself never mutates the plan.
+- Another opinion on a materially changed plan or new evidence is optional,
+  not an automatic replan/review loop. Do not repeat requests to obtain KEEP.
+- A finding that contradicts claimed completion must still be identified and
+  evaluated. The advisor recommends correction or verification, rather than
+  ordering a tool halt. Neither revising the plan nor receiving advice resolves
+  a finding or turns an unsupported completion claim into evidence.
+- A missing reviewer configuration, provider failure, cancellation or invalid
+  output is a real advice-tool error, not an execution prohibition. Provider
+  errors retain one bounded retry; truncated output retries without reasoning.
+  At most two completion attempts are made, and cancellation is not retried.
+- Review scope, receipts, dispatch staging, single-use worker permits, mandatory
+  phase reviews and `/review-status`, `/review-retry`, `/review-waive` are gone.
+  This also removes the DEFAULT multi-worker fan-out gate and eval/workpool
+  approval fingerprinting, not merely the inline edit denial.
+- OMP still owns input validation, agent/tool permissions, concurrency,
+  cancellation and supported isolation. Those protections do not bind a
+  dispatch to advice or prevent divergence from a previously discussed plan.
+- Old approval, failure or waiver records and historical gate-denial messages
+  are not current authorization requirements. Audit notes are evidence claims,
+  not authority to resurrect the removed gate.
 
-- A batch with two or more implementation workers requires a review before any
-  of those workers starts. Named `scout`/`librarian` read-only discovery is exempt.
-- A required-review scope blocks inline mutation and arbitrary execution too:
-  edit/write/bash/eval and unknown tools are blocked. Native read/search, todo,
-  ask, finding management and the reviewer remain available for scoping.
-- Task declarations are normalized through the **live** native `task` schema
-  (`pi.getAllTools()` parameters) and the host's own `validateToolArguments`:
-  the session's effective default agent and unknown-field handling come from
-  that schema, not from a copy. The intent field `i` is excluded, as the host
-  does. If `task` is missing or its schema cannot be validated, declarations are
-  refused rather than guessed; invalid shapes get no staging or permit.
-- The shared `before_subagent_spawn` hook checks actual task and eval
-  `agent()`/workpool dispatches before child execution. Every native worker,
-  including one in an approved required-review batch, needs a single-use permit
-  issued for the actual `task` tool call. Parent-only approval is not a spawn
-  permit. The spawn event exposes only the agent and a `spawnKey`, so permits
-  are matched against the worker identities OMP derives from the approved
-  arguments (a requested `name`, its `-2`/`-3` collision suffixes, or
-  `<toolCallId>:<index>` for unnamed synchronous items). When OMP's async mode
-  preallocates random IDs, implementation items must carry a unique `name`;
-  overlapping or ambiguous identities are refused before execution instead of
-  guessed. Permits are discarded on error/blocked results, after synchronous
-  completion, and on session switch/branch/tree navigation or shutdown; a normal
-  async return keeps pending permits for its queued workers. Reload loses
-  permits: resubmit the exact task input, reusing its review if the scope is
-  unchanged.
-- Programmatic implementation spawns require review. The eval hook binds the
-  caller's recorded eval arguments, spawn identity and model patterns; the host
-  event does not expose its expanded assignment or mutable kernel state. Use
-  stable names on retries, and prefer native `task` when exact assignment-level
-  scope binding is required. This is a coordination policy, not a sandbox.
-- Two matching execution errors within the current request require a
-  repeated-failure review, once per problem rather than on every failed retry.
-
-To avoid a blocked staging attempt, pass an optional top-level `dispatch` to
-`orche_advisor` containing the exact planned task input (`context`/`tasks`, or
-a flat `task`). The tool binds and separately summarizes that scope, reviews it,
-then the caller submits the unchanged task input. Otherwise the first task
-attempt is blocked before execution and stages its scope for review. One review
-can cover initial planning and fan-out; do not review every worker completion.
-
-Native batches retain one summary per worker, not a single truncated batch
-string. The review prompt counts all contracts, marks shortened excerpts, and
-reports omitted workers with a bounded identity list when the prompt budget is
-exhausted. Full task inputs remain bound into the scope hash.
-
-Dispatch has three explicit states:
-
-| `dispatch` input | Meaning |
-| --- | --- |
-| Omitted | Retain the currently staged contracts. |
-| Non-empty task input | Replace staged contracts with this exact batch. |
-| `null` | Withdraw all staged contracts and review parent-only work. |
-
-For completed or abandoned worker plans, call `orche_advisor` with
-`checkpoint: "replan"`, the current seven-field snapshot, and `dispatch: null`.
-Do not send `tasks: []` or invent a dummy worker. Withdrawal clears the review's
-dispatch summary, not running workers or their results. It creates a new
-generation, invalidating old parent/worker receipts without granting permission.
-Even a rejected batch can therefore be withdrawn and the remaining parent work
-reviewed. Execution stays blocked until that new review succeeds. Repeating null
-when nothing is staged is idempotent: it cannot clear a parent-plan rejection.
-Re-submitting a withdrawn worker batch requires a fresh review.
-The complete snapshot is validated before any replacement or withdrawal is
-persisted. Invalid input, including an oversized combined snapshot, leaves the
-existing dispatch and approval untouched.
-
-For a rejected parent plan, change the semantic committed todo plan (or staged
-contract) before re-review. Editing snapshot prose alone does not change the
-scope and cannot evade a rejection.
-
-Receipts persist on the active branch and bind a work ID, semantic todo plan,
-blockers/abandonments, review generation, exact native dispatch and finding revision.
-Scope identity is finalized at assessment, before any review, waiver or execution.
-Execution may reveal the required notice but never changes the approved key.
-There is no late pending-risk generation to invalidate a just-issued waiver or
-to be erased by cached-review reuse. An old review completing after a task switch
-cannot change the new task's requirement.
-
-Initial assessments do not proactively demand review for conversational turns.
-New work has separate state; a continuation keeps its receipt unless plan,
-dispatch, phase or evidence changes. The global finding revision deliberately
-continues to invalidate execution permission, never ordinary read-only access.
-Reload and branch rewind reconstruct only records on the active branch.
-
-Status questions and read-only diagnostic follow-ups do not proactively request
-another review merely because the project is risky. Jev receives a bounded excerpt
-of the latest successful review and assesses the new action, not historical risk.
-New findings alone do not proactively call for another review, including after
-a successful review in the same turn. They remain unresolved and gate the next
-mutation. Outstanding requirements are not erased by conversational follow-ups.
-Known observation-only Studio devices (discovery, state, logs, instance/
-script/tree inspection) bypass the mutation gate despite using the `write` transport.
-Arbitrary Luau, shell/eval execution and unknown devices remain gated.
-The single-task cutover bumped the review receipt/dispatch format: earlier
-receipts (including ones approving tier-alias dispatches) are never reused, so
-resumed sessions need a fresh review before subsequent required-review
-execution. Legacy aggregate dispatch summaries may already have lost worker
-text: restage the exact task input, or use `dispatch: null` to withdraw them.
-They cannot be reviewed as if complete. Neither recovery path requires a user
-waiver.
-
-Failure is not permission, but an unavailable reviewer is not a rejected plan:
-
-- A provider completion error gets one automatic retry with the configured model
-  and reasoning settings. Truncation instead retries without reasoning. A call
-  makes at most two completion attempts total; cancellation is not retried.
-- Provider/runtime, configuration and malformed-output failures keep execution
-  blocked but leave the same scope reviewable. Diagnose the error and review
-  again after recovery; neither `/review-retry` nor a waiver is required, and
-  recovery does not rotate the scope key. Do not loop on an unchanged outage.
-  Historical untyped failure records also remain reviewable after reload.
-- Approval is committed only after review usage bookkeeping succeeds. A storage
-  failure after `KEEP` leaves execution blocked and the same scope retryable.
-  If the reviewer actually rejected the plan, bookkeeping failure preserves
-  that rejection rather than converting it into a retryable provider outage.
-- `REPLAN` and `ESCALATE` are substantive rejections, not approval. Address the
-  verdict and revise the committed plan before re-review; an unchanged rejected
-  scope cannot make another paid review automatically. `KEEP`/`ADJUST` permit
-  the reviewed scope, with material plan changes still requiring fresh review.
-- `/review-retry <scope-key> <reason>` authorizes an unchanged rejected scope's
-  new attempt. `/review-waive <scope-key> <reason>` explicitly waives review.
-  `/review-status` shows the full key and unavailable/rejected state.
-  These commands are user-only. Waivers never resolve findings or claim that
-  verification passed. A lasting reviewer outage cannot authorize execution.
 
 ### Durable finding ledger
 
@@ -272,8 +172,10 @@ Neither age nor a successful review resolves or deletes a finding.
   note and bounded evidence excerpts stay visible to the reviewer.
 - `waive` requires explicit user confirmation. `reopen` records a renewed concern.
   A renewed auditor objection after a reported resolution opens a new finding.
-- New findings and valid lifecycle changes invalidate receipts/cache reuse.
-  Exact repeated notes, unrelated messages and nits do not.
+- Findings and lifecycle changes update the evidence available to the next
+  explicit advice request. They never block tools, invalidate permission or
+  automatically call the advisor. A finding waiver only records accepted risk;
+  it is not an execution waiver.
 
 The reviewer receives up to five unresolved findings in detail, reserving space
 for the two newest, plus up to three recent resolutions/waivers with evidence.
@@ -300,24 +202,23 @@ The standalone `orche-advisor` CLI remains available from this package:
 input and model selection without requesting a review. The CLI uses
 `modelRoles.orche-advisor` unless `--model` is supplied.
 
-### Native `task` worker (`tool_call`)
+### Native `task` worker
 
-The `tool_call` hook only enforces review; it never returns a revised task
-input. `agent` is never changed, so a restricted session whose spawn-policy
-default is `sonic` keeps that default, and explicit `sonic`, `scout`,
-`reviewer`, `security-reviewer`, project/user/plugin agents and `^`-tagged model
-pseudonyms run exactly as requested. OMP keeps owning task execution, spawn
-policy, concurrency, async results, cancellation, tool permissions, isolation
-and workpool. There is no automatic model escalation after a failure.
+The plugin installs no `tool_call` or `before_subagent_spawn` enforcement hook.
+It never revises task input or changes `agent`, so a restricted session whose
+spawn-policy default is `sonic` keeps that default. Explicit specialists,
+custom agents and tagged model pseudonyms run as requested. OMP owns task
+execution, spawn policy, concurrency, async results, cancellation, tool
+permissions, isolation and workpool. There is no automatic model escalation.
 
 Task execution needs no Jev call or credential. Only the front-door decision
-uses Jev; its failures follow the conservative review policy below.
+uses Jev; failure leaves normal direct execution available.
 
 ## Recommended model topology
 
 ```yaml
 modelRoles:
-  default: <chosen session primary>         # never changed by this plugin
+  default: <choom-orchesion primary>         # never changed by this plugin
   task: <capable worker>                    # OMP's generic task worker
   smol: <lightweight model>                 # OMP's lightweight baseline (sonic)
   advisor: <general advisor model>          # only if declared in WATCHDOG.yml
@@ -326,31 +227,31 @@ modelRoles:
 ```
 
 No vendor/model name is hard-coded. `verification-auditor` is registered as
-`@smol` on primary-session startup if unset; existing assignments are preserved
+`@smol` on primary-om-orche startup if unset; existing assignments are preserved
 and child sessions never register roles. `@task` is never written: if it does
-not resolve, `/jev-router status` says so and OMP reports its own spawn error;
+not resolve, `/om-oche status` says so and OMP reports its own spawn error;
 no other role (such as `@slow`) is substituted.
 
 Keeping one primary model avoids router-induced full-context provider switches;
-it does not guarantee provider cache hits or prevent OMP/user fallback.
+it does not guarantee proom-orcheache hits or prevent OMP/user fallback.
 
 ## Install
 
 ```bash
-omp plugin install omp-jev-router
+omp plugin install om-oche
 ```
 
 From a checkout:
 
 ```bash
-omp plugin link /path/to/jev_router
+omp plugin link /path/to/om-oche
 ```
 
 Nothing else is required. No `AGENTS.md` edit, no agent files, no `models.yml`
-surgery, no routing prompt, no separate SDK install, no OMP patch. The TypeSafe
+surgery, no routing prompt,om-orchearate SDK install, no OMP patch. The TypeSafe
 SDK ships as a plugin dependency; the package ships no agent definitions.
 
-## First-run credential setup
+#om-orche-run credential setup
 
 Priority order:
 
@@ -358,39 +259,36 @@ Priority order:
    disk.
 2. OMP's own credential store for the `typesafe` provider — the same store
    `/login typesafe` writes.
-3. Interactive setup via `/jev-router setup`.
+3. Interactive setup via `/om-oche setup`.
 
 ```bash
-/jev-router setup
+/om-oche setup
 ```
 
 `setup` offers OMP's native `/login typesafe` first, because that dialog masks
 input; the extension dialog API has no masked mode (`ExtensionUIDialogOptions`
 exposes no `secret` flag), so the in-plugin paste path says so explicitly. A
-pasted key is validated against `GET /v1/models` before anything is stored, and
-an invalid key is never stored.
-
-The plugin owns no credential file. Reusing `AuthStorage` means rotation,
-`omp token typesafe`, and 401 handling all keep working, and uninstalling the
+pastom-orcheis validated against `GET /v1/models` before anything is stored, and
+an iom-orchekey is never stored.
+om-orche
+The om-orcheowns no credential file. Reusing `AuthStorage` means rotation,
+`ompom-orchetypesafe`, and 401 handling all keep working, and uninstalling the
 plugin leaves your account credential exactly where you put it.
 
 ## Commands
 
-| Command | Effect |
+om-orchend | Effect |
 | --- | --- |
-| `/jev-router setup` | Configure or remove the TypeSafe credential. |
-| `/jev-router status` | Fixed-primary policy, native `task` worker and `@task` role, last decision, retired leftovers. |
-| `/jev-router test` | Live DEFAULT/ORCHESTRATE probes (front door only; no task classification exists). |
-| `/jev-router stats` | Live-epoch decisions and observed task-worker usage, kept apart from pre-v5 history. |
-| `/jev-router reset` | Clear plugin-owned telemetry files and stored configuration. |
-| `/review-status` | Current required-review scope, receipt and failure state. |
-| `/review-retry <key> <reason>` | User-authorized new attempt for an unchanged rejected plan; not needed for infrastructure recovery. |
-| `/review-waive <key> <reason>` | Explicit user waiver for exactly that scope. |
+| `/om-oche setup` | Configure or remove the TypeSafe credential. |
+| `/om-oche status` | Fixed-primary policy, native `task` worker and `@task` role, last decision, retired leftovers. |
+| `/om-oche test` | Live DEFAULT/ORCHESTRATE probes (front door only; no task classification exists). |
+| `/om-oche stats` | Live-epoch decisions and observed task-worker usage, kept apart from pre-v5 history. |
+| `/om-oche reset` | Clear plugin-owned telemetry files and stored configuration. |
 
 `status` output:
 
 ```text
-Jev Router             enabled
+om-oche                enabled
 Credential             configured (OMP credential store)
 
 Orchestration routing  enabled
@@ -403,7 +301,6 @@ Task worker            native `task` agent
   @task role           provider/coding
 
 Last orchestration     DEFAULT 0.91
-Review assessment      optional
 ```
 
 If `@task` does not resolve, status says so; the plugin does not route around
@@ -412,7 +309,7 @@ it. Retired tier settings still stored for the plugin, and leftover
 left in place.
 
 No secret is ever printed: the credential is reported by provenance only.
-
+om-orche
 ## Routing thresholds
 
 A decision is accepted only when **both** hold, with `confidence =
@@ -423,7 +320,7 @@ max(probabilities)` and `margin = p(top1) - p(top2)`:
 | orchestration (2 labels) | `≥ 0.60` | `≥ 0.20` |
 
 These gates are configurable, not measured guarantees of classifier accuracy.
-Use `/jev-router test` for live probes; only records with stored probabilities
+Use `/om-oche test` for live probes; only records with stored probabilities
 can be replayed offline. Historical aggregate counters cannot reconstruct
 unlogged decisions.
 
@@ -442,19 +339,18 @@ orchestration. Neither branch selects a different primary model.
 
 | failure | front door |
 | --- | --- |
-| credential missing | current model; no automatic orchestration; review required |
-| 401 / 403 | current model; no automatic orchestration; review required |
-| 429 / 5xx | current model; no automatic orchestration; review required |
-| timeout | current model; no automatic orchestration; review required |
-| network failure | current model; no automatic orchestration; review required |
-| malformed response | current model; no automatic orchestration; review required |
-| SDK exception | current model; no automatic orchestration; review required |
-| unknown Jev model | current model; no automatic orchestration; review required |
+| credential missing | current model; no automatic orchestration; no execution block |
+| 401 / 403 | current model; no automatic orchestration; no execution block |
+| 429 / 5xx | current model; no automatic orchestration; no execution block |
+| timeout | current model; no automatic orchestration; no execution block |
+| network failure | current model; no automatic orchestration; no execution block |
+| malformed response | current model; no automatic orchestration; no execution block |
+| SDK exception | current model; no automatic orchestration; no execution block |
+| unknown Jev model | current model; no automatic orchestration; no execution block |
 | gate not cleared | DEFAULT; current model |
 
-Front-door failure never changes the model. Missing or failed assessments keep
-the conservative review requirement. Task workers are unaffected: they never
-depend on Jev.
+Front-door failure never changes the model or requires advisor permission.
+Task workers never depend on Jev.
 
 Every decision runs under a hard `routingTimeoutMs` budget with retries
 disabled: a router that retries costs more than the routing saves.
@@ -462,10 +358,8 @@ disabled: a router that retries costs more than the routing saves.
 ## Privacy and security
 
 Sent to Jev: the current request, up to eight recent visible dialogue messages
-plus the earliest retained user goal, latest committed todo plan, and up to 1200
-characters of the latest successful review as historical context, not authorization.
-Scope linkage also receives up to six work-goal summaries, bounded together
-within the same text budget (at most 1200 characters for these goals).
+plus the earliest retained user goal, and the latest committed todo plan.
+Review results and historical approval/work-scope records are not classifier input.
 Dialogue entries are clipped to 700 characters (the retained goal to 1600);
 plan text is clipped to 3200. The engine applies a combined
 `maxRoutingInputChars` text budget, default 12000, excluding JSON framing and
@@ -476,10 +370,10 @@ thinking, or complete transcripts. Visible dialogue/plan text can itself contain
 user-provided sensitive material; expanded context is sent to TypeSafe.
 It is not copied to telemetry. No scout/summarizer agent is launched for routing.
 
-The checkpoint reviewer additionally receives plugin-owned execution-scope
-metadata and bounded excerpts from explicitly cited finding-resolution evidence.
-It never receives the whole transcript. Inspect evidence IDs before citing
-outputs containing sensitive data.
+The plan advisor receives the submitted seven-field snapshot plus bounded
+findings and explicitly cited finding-resoluom-orcheidence. It never receives
+the whole transcript or execution-approval metadata. Inspect evidence IDs
+before citing outputs containing sensitive data.
 
 Credentials never touch the repository, the project directory, the plugin source
 tree, or any log. Debug lines carry route labels and numbers only; error text is
@@ -488,8 +382,10 @@ scrubbed of any tracked credential and of key-shaped tokens before it is written
 ## Telemetry
 
 Local data only — no prompt text, no task text, no source, no transcript — under
-`<omp agent dir>/jev-router/`, cleared by `/jev-router reset`. With
+`<omp agent dir>/jev-router/`, cleared by `/om-oche reset`. With
 `telemetryEnabled=false` nothing is written (existing data is shown read-only).
+The data directory deliberately keeps its existing name so the package rename
+does not discard or silently relocate telemetry history.
 
 `telemetry.json` (v5) holds a **live epoch** and, after an upgrade, a separate
 **historical** block. Live and historical numbers are never added together.
@@ -511,14 +407,14 @@ Local data only — no prompt text, no task text, no source, no transcript — u
 
 `decisions.jsonl` has one line per Jev decision: `kind`, applied `route`, the
 pre-gate `top` label, per-label `probabilities`, `confidence`, `margin`,
-`confident`, latency, `reviewRequired`, the independent `review` distribution,
-and the decision `policy` and live `epoch`. Errors log `route: "ERROR"` and
-`timedOut`. No task-tier rows are written; earlier rows are never rewritten.
+`confident`, latency, and the decision `policy` and live `epoch`. Errors log
+`route: "ERROR"` and `timedOut`. No review-risk or task-tier fields are written;
+earlier rows are never rewritten.
 For decisions with probabilities, a different confidence/margin gate can be
 replayed exactly offline. The log records what was routed, not whether the
 route was right.
 
-Worker usage is read from OMP's `task:subagent:progress` and
+Worker uom-orche read from OMP's `task:subagent:progress` and
 `task:subagent:lifecycle` frames on the session event bus, which fire for sync
 and background (`async.enabled`) spawns alike. A settlement is counted once
 even when it arrives on several buses; a late measured frame upgrades an
@@ -529,15 +425,15 @@ file is first copied to `telemetry-history/v<version>-<sha256>.json` (exclusive
 create, never overwritten), then the v5 file replaces it atomically. A failed
 backup or write leaves the original active and suspends recording. A file
 written by a newer plugin version is left untouched and recording is suspended
-until `/jev-router reset`. `reset` deletes only plugin-owned files
+until `/om-oche reset`. `reset` deletes only plugin-owned files
 (`telemetry.json`, `decisions.jsonl`, migration temporaries, `telemetry.v<N>.json`
 backups and `telemetry-history/` snapshots) and reports any it could not remove.
 
 Rollback to a tier-routing release: stop all OMP processes, preserve the v5
 `telemetry.json` and `decisions.jsonl` as copies in `telemetry-history/`
-(`v5-<sha256>.json`, `decisions-<sha256>.jsonl`), restore the desired v4 snapshot
-as `telemetry.json`, then start the old package. Do not let an old release read
-a v5 file directly. Re-upgrading starts a fresh live epoch; overlapping periods
+(`v5-<sha256>.json`, `dom-orches-<sha256>.jsonl`), restore the desired v4 snapshot
+as `telemetry.json`, tom-orchert the old package. Do not let an old release read
+a v5 file directly. Reom-orcheing starts a fresh live epoch; overlapping periods
 are never merged.
 
 ## Configuration
@@ -546,37 +442,70 @@ Stored in OMP's own per-plugin settings map and removed by `omp plugin
 uninstall`:
 
 ```bash
-omp plugin config list omp-jev-router
-omp plugin config set omp-jev-router orchestrationMinConfidence 0.7
-omp plugin config get omp-jev-router orchestrationRoutingEnabled
+omp plugin config list om-oche
+omp plugin config set om-oche orchestrationMinConfidence 0.7
+omp plugin config get om-oche orchestrationRoutingEnabled
 ```
 
 | key | default | meaning |
 | --- | --- | --- |
-| `enabled` | `true` | master switch for classification, guidance and mandatory review enforcement |
+| `enabled` | `true` | master switch for classification and automatic guidance; manual advice/finding tools remain available |
 | `jevModel` | `""` | TypeSafe model id; empty = `jev-latest` |
-| `orchestrationRoutingEnabled` | `true` | allow automatic ORCHESTRATE; explicit requests still use plugin policy |
+|om-orchestrationRoutingEnabled` | `true` | allow automatic ORCHESTRATE; explicit requests still use plugin policy |
 | `orchestrationMinConfidence` | `0.60` | confidence gate; below it keep DEFAULT |
 | `orchestrationMinMargin` | `0.20` | top1 - top2 gate; below it keep DEFAULT |
 | `routingTimeoutMs` | `4000` | hard per-decision budget |
 | `maxRoutingInputChars` | `12000` | combined text budget; see privacy section |
-| `telemetryEnabled` | `true` | local aggregate counters |
-| `debugLogging` | `false` | one metrics-only line per decision |
+| `telemetryEnabled` | `true` | local aggregate counters |om-orche
+| `debugLogging` | `false` | one metrics-onom-orche per decision |
+
+### Migrating the plugin name
+
+The package, settings namespace, display label and slash command are now
+`om-oche`. There is no old-name command or settings fallback. The advisor tool
+`orche_advisor`, its `orche-advisor` model role and standalone CLI are unchanged.
+
+Before removing an old installation, record its desired settings with
+`omp plugin config list omp-jev-router`. Finish active work, remove the old
+`omp-jev-router` installation/link, then install or link `om-oche` and reapply
+those settings with `omp plugin config set om-oche <key> <value>`. Do not load
+both installations at once. Start a new session on OMP 18.3.5.
+
+The rename does not modify global configuration, credentials or model roles.
+Telemetry retains the existing `<omp agent dir>/jev-router/` directory.
+
+
+### Migrating from review gates
+
+Finish or cancel active work and start a new session after upgrading so the old
+extension's hooks are no longer installed. Do not rely on mutating a running
+gate in place.
+
+- Removed: review-risk and work-scope classification, review enforcement and
+  approval state, dispatch declaration/withdrawal, worker permits and review
+  status/retry/waiver commands. Remove `dispatch` from advisor calls.
+- The advisor accepts the existing checkpoint/snapshot input and gives advice.
+  All four valid verdicts are successful results (CLI exit 0); actual model or
+  output failures use exit 1, configuration/input failures use exit 2.
+- Historical approval records and old decision-log fields remain untouched but
+  have no execution effect. No migration, user waiver or fresh approval is
+  required to continue work. The finding ledger andom-orcheidence history remain.
+
 
 ### Migrating from tier routing
-
-Finish or cancel running workers and start a new session after upgrading; do
+om-orche
+Finish or cancel running worom-orched start a new session after upgrading; do
 not cut over with live workers.
 
 - **Removed:** `task-easy`, `task-hard`, `task-challenge` agents; per-task Jev
   classification; the `taskRoutingEnabled`, `taskMinConfidence`,
   `taskMinMargin`, `easyTaskRole`, `hardTaskRole`, `challengeTaskRole` settings;
-  the `gen:agents` build step; the tier probe in `/jev-router test`. Calls
+  the `gen:agents` build step; the tier probe in `/om-oche test`. Calls
   naming a removed alias are not silently turned into `task`; dispatch `task`
   (or a specialist) instead.
 - **Stored retired settings** are ignored and never rewritten by the plugin.
-  `/jev-router status` lists any that remain; delete them with
-  `omp plugin config delete omp-jev-router <key>`.
+  `/om-oche status` lists any that remain; delete them with
+  `omp plugin config delete om-oche <key>`.
 - **Model roles** `task_easy`, `task_hard` and `task_challenge` are yours and
   are left untouched; status marks them unused. Worker model choice is now your
   `@task` role. Set it before upgrading if you relied on a tier's model.
@@ -585,7 +514,7 @@ not cut over with live workers.
   The plugin does not introduce or classify a `solutionSpace` field.
 - **Notice:** coordination guidance is the plugin's `jev-orchestrate-notice`;
   OMP's native orchestrate notice is replaced for the current turn only.
-- **Reviews:** old receipts are not reused; resumed sessions review again.
+- **Advice:** historical approvals have no effect; optional plan advice does not authorize execution.
 - **Telemetry:** v4 counters become the `historical` block; the live epoch
   starts empty. See [Telemetry](#telemetry) for rollback.
 
@@ -593,7 +522,7 @@ Earlier releases' `mainModelRoutingEnabled`, `mainNormalRole`, `mainDeepRole`,
 `normalTaskRole`, `deepTaskRole` and `task-deep`/`task-normal` agents are also
 unused. Uninstall leaves role assignments and credentials intact.
 
-## Troubleshooting
+## Troubleshootingom-orche
 
 Turn on `debugLogging` and read the OMP log:
 
@@ -604,28 +533,27 @@ jev.orchestration route=SKIP reason=not-main-session
 
 | symptom | cause |
 | --- | --- |
-| `route=SKIP reason=credential-missing` | no TypeSafe key; run `/jev-router setup` |
+| `route=SKIP reason=om-orcheial-missing` | no TypeSafe key; run `/om-oche setup` |
 | `route=SKIP reason=not-main-session` | expected — a subagent hit the front door and was rejected |
 | `route=SKIP reason=explicit-orchestrate` | a native orchestrate notice is present; it is replaced by the plugin's notice, not duplicated |
 | `route=SKIP reason=plan-mode` | plan mode owns the turn |
-| gate reason `orchestration-routing-disabled` / `task-tool-unavailable` | automatic ORCHESTRATE suppressed; review assessment still runs |
+| routing reason `orchestration-routing-disabled` / `task-tool-unavailable` | automatic ORCHESTRATE suppressed; no review requirement |
 | `@task role unresolved` in status | assign `modelRoles.task`; OMP reports the spawn error and nothing is substituted |
-| task call blocked for a missing `name` | async mode needs a unique `name` per implementation item to bind its permit |
 | `Retired settings still stored` in status | delete the listed keys; they have no effect |
 
 ## Uninstall
-
+om-orche
 ```bash
-omp plugin uninstall omp-jev-router
+omp plugin uninstall om-oche
 ```
 
-Removes the package, the checkpoint tool, the bundled auditor and the plugin's
-guidance and gates; OMP's native `task` behavior and orchestrate notice return
-unchanged. OMP model-role assignments (including `verification-auditor`,
+Removes the package, the plan-advice tool, the bundled auditor and the plugin's
+guidance; OMP's native `task` behavior and orchestrate notice return unchanged.
+OMP model-role assignments (including `verification-auditor`,
 `orche-advisor`, and any leftover `task_easy`/`task_hard`/`task_challenge`)
 remain until removed explicitly. The `typesafe` credential and
 `<omp agent dir>/jev-router/` telemetry files also remain; use
-`/jev-router reset` before uninstalling if those should be cleared.
+`/om-oche reset` before uninstalling if those should be cleared.
 
 ## Development / test
 
@@ -645,21 +573,32 @@ it into place once:
 cp node_modules/@oh-my-pi/pi-natives-linux-x64/*.node node_modules/@oh-my-pi/pi-natives/native/
 ```
 
-`bun test` covers the gate arithmetic, input clipping, front-door guards and
-fallbacks, policy notice precedence, task-contract normalization against OMP's
-real task schema, review gating and permits, credential priority, secret
-redaction, telemetry migration/reset, and status rendering.
+`bun test` covers route confidence thresholds, input clipping, fronom-orche
+guards/fallbacks, notice precedence, advice verdicts and real error handling,
+absence of plugin executionom-orche (including old persisted approval records),
+finding evidence/lifecycle, credential priority, telemetry and status rendering.
 
-Native smoke runs on OMP 18.3.1 (the pinned dependency) and 18.3.4 exercised
-task-body delivery to a real `task`/`@task` worker, reviewed asynchronous
-dispatch, native queued-job cancellation and same-name retry, workflow notice
-precedence, and master-disable restoration. Workers produced and read back
-the expected files; the main agent did not substitute for them. The detailed
-acceptance matrix is in `docs/plans/self-orchestration.md`.
+The renamed plugin was checked against OMP 18.3.5 with `bun run build`:
+133 tests across 14 files passed. Existing `no-control-regex` lint warnings
+remain in the advice parser and its tests.
 
-These runs do not certify every provider/settings combination or a cost
-improvement over tier routing. They did not uninstall the user's global plugin
-or reset the user's telemetry. New host versions still need their own smoke.
+During the advice-only cutover, a disposable local OpenAI-compatible server
+exercised the actual advice CLI: KEEP, REPLAN and ESCALATE each returned exit 0
+with `isError: false`. The subsequent rename/version smoke linked `om-oche`
+using the actual OMP 18.3.5 plugin manager, wrote/read its settings under the
+new name, and dispatched `/om-oche status` without a model request. Print mode
+does not display that command's UI notification.
+
+A separate smoke launched OMP 18.3.5 with the extension, an isolated agent
+directory and a deterministic local model provider. Direct and explicit
+`orchestrate` requests each ran a native two-worker batch without advisor
+approval; the workers wrote four expected files. Native tool approval was
+auto-approved only for this isolated smoke. Temporary state was removed.
+
+These runs verify the exercised host/tool paths, not model reasoning quality
+or every provider/settings combination. OMP 18.3.5 is the compatibility target;
+earlier 18.3.1/18.3.4 smoke results in `docs/plans/self-orchestrom-orched` are
+historical, not the current support target.
 
 ### Known API constraints
 
@@ -669,11 +608,7 @@ Recorded rather than worked around:
   (only the package root does, and it does not re-export `containsOrchestrate`).
   Initial classification happens at `before_agent_start`; `context` handles
   native notices. Thinking-level types are imported only as erased types.
-- **`BeforeSubagentSpawnEvent` carries no parent tool call or task text**, only
-  the agent, invocation kind, model patterns and a `spawnKey`, so spawn permits
-  are matched by the identity OMP derives from the approved call; ambiguous
-  identities are refused.
-- **`ExtensionUIDialogOptions` has no masked-input mode**, so `/jev-router setup`
+- **`ExtensionUIDialogOptions` has no masked-input mode**, so `/om-oche setup`
   routes you to OMP's native `/login typesafe` for masked entry and labels its
   own paste dialog as unmasked.
 - **Cost per completed task is not acceptance rate**: `completed` is the
