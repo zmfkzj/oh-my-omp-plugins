@@ -32,9 +32,10 @@ function transcript() {
       action: "resolve" | "waive" | "reopen",
       evidence: string[],
       author: "orchestrator" | "user" = action === "waive" ? "user" : "orchestrator",
+      version: 1 | 2 = 2,
     ) =>
       manager.appendCustomEntry(FINDING_ENTRY_TYPE, {
-        v: 1,
+        v: version,
         findingId,
         action,
         author,
@@ -108,16 +109,14 @@ describe("verification finding ledger", () => {
     expect(collectFindings(session.branch())).toHaveLength(3);
   });
 
-  test("replays a transition only when its cited evidence validates after the finding", () => {
+  test("replays delayed-notice resolutions only with valid branch evidence", () => {
     const session = transcript();
-    const stale = session.tool("12 pass, 0 fail");
+    const passing = session.tool("13 pass, 0 fail");
     const source = session.audit(blocker("Claimed tests pass; no runner output."));
     const id = `${source}:0`;
     const failed = session.tool("1 fail", { isError: true });
     const review = session.tool("VERDICT: KEEP", { toolName: TOOL });
-    const passing = session.tool("13 pass, 0 fail");
 
-    session.transition(id, "resolve", [stale]);
     session.transition(id, "resolve", [failed]);
     session.transition(id, "resolve", [review]);
     session.transition(id, "resolve", ["missing-entry"]);
@@ -137,11 +136,59 @@ describe("verification finding ledger", () => {
     });
   });
 
+  test("preserves historical v1 evidence eligibility instead of reinterpreting old reports", () => {
+    const session = transcript();
+    const earlier = session.tool("upload done");
+    const source = session.audit(blocker("No upload result."));
+    const id = `${source}:0`;
+    session.transition(id, "resolve", [earlier], "orchestrator", 1);
+    expect(collectFindings(session.branch())[0]?.status).toBe("open");
+
+    const later = session.tool("matching upload confirmed");
+    session.transition(id, "resolve", [later], "orchestrator", 1);
+    expect(collectFindings(session.branch())[0]?.status).toBe("resolved");
+    session.transition(id, "reopen", [], "orchestrator", 1);
+    session.transition(id, "resolve", [later], "orchestrator", 2);
+    expect(collectFindings(session.branch())[0]?.status).toBe("reopened");
+
+    const fresh = session.tool("new revision confirmed");
+    session.transition(id, "resolve", [fresh], "orchestrator", 2);
+    expect(collectFindings(session.branch())[0]?.status).toBe("resolved");
+  });
+
+  test("requires a new v2 report to use evidence rejected by a historical v1 report", () => {
+    const session = transcript();
+    const earlier = session.tool("upload done");
+    const source = session.audit(blocker("No upload result."));
+    const id = `${source}:0`;
+    session.transition(id, "resolve", [earlier], "orchestrator", 1);
+    expect(collectFindings(session.branch())[0]?.status).toBe("open");
+    const record = session.transition(id, "resolve", [earlier]);
+    const branch = JSON.parse(JSON.stringify(session.branch())) as SessionEntry[];
+    expect(collectFindings(branch)[0]).toMatchObject({
+      status: "resolved", transition: { recordId: record, evidence: [{ entryId: earlier }] },
+    });
+  });
+
+  test("does not replay a resolution that cites a result recorded after that resolution", () => {
+    const session = transcript();
+    const source = session.audit(blocker("No upload result."));
+    const record = session.transition(`${source}:0`, "resolve", []);
+    const future = session.tool("upload done");
+    const branch = JSON.parse(JSON.stringify(session.branch())) as SessionEntry[];
+    const transition = branch.find(entry => entry.id === record)!;
+    if (transition.type !== "custom") throw new Error("Expected the persisted transition.");
+    const data = transition.data;
+    if (!data || typeof data !== "object" || !("evidence" in data)) throw new Error("Expected evidence.");
+    data.evidence = [future];
+    expect(collectFindings(branch)[0]?.status).toBe("open");
+  });
+
   test("scopes transitions to their branch and survives serialization", () => {
     const session = transcript();
     session.user("Ship it.");
-    const source = session.audit(blocker("No smoke run recorded."));
     const smoke = session.tool("smoke ok");
+    const source = session.audit(blocker("No smoke run recorded."));
     session.transition(`${source}:0`, "resolve", [smoke]);
     const resolved = session.branch();
 

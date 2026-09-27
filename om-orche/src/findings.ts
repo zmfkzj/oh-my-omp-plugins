@@ -51,7 +51,8 @@ const LISTED_IDS = 20;
  * one source, and a record whose evidence stops validating on the branch is not replayed.
  */
 interface TransitionRecord {
-  v: 1;
+  /** v1 required post-receipt evidence; v2 permits evidence predating delayed delivery. */
+  v: 1 | 2;
   /** Canonical ledger id of the finding. */
   findingId: string;
   action: TransitionAction;
@@ -68,8 +69,10 @@ interface Tracked {
   finding: VerificationFinding;
   /** Advisor, scope and folded note: repeats of one key merge instead of adding findings. */
   key: string;
-  /** Branch index of the latest (re)opening; cited evidence must come after it. */
-  openedAt: number;
+  /** Original receipt index, retained to replay v1 transitions under their original rules. */
+  receivedIndex: number;
+  /** Only an explicit reopening establishes a freshness boundary. Receipt is not observation. */
+  evidenceAfter: number;
 }
 
 interface Ledger {
@@ -151,7 +154,7 @@ function parseRecord(data: unknown): TransitionRecord | undefined {
   if (data === null || typeof data !== "object") return undefined;
   const record = data as Partial<Record<keyof TransitionRecord, unknown>>;
   const valid =
-    record.v === 1 &&
+    (record.v === 1 || record.v === 2) &&
     typeof record.findingId === "string" &&
     typeof record.action === "string" &&
     Object.hasOwn(TRANSITIONS, record.action) &&
@@ -173,7 +176,7 @@ function citeEvidence(
   ledger: Ledger,
   branch: readonly SessionEntry[],
   ids: readonly string[],
-  openedAt: number,
+  evidenceAfter: number,
   action: TransitionAction,
 ): FindingEvidence[] | string {
   if (action === "resolve" && ids.length === 0) {
@@ -184,8 +187,8 @@ function citeEvidence(
     const index = ledger.indexOf.get(id);
     const entry = index === undefined ? undefined : branch[index];
     if (index === undefined || !entry) return `Evidence ${id} is not an entry on the active branch.`;
-    if (index <= openedAt) {
-      return `Evidence ${id} was recorded before the finding was last opened; cite an entry recorded after it.`;
+    if (index <= evidenceAfter) {
+      return `Evidence ${id} predates the latest explicit reopening; cite an entry recorded after it.`;
     }
     const cited = classifyEvidence(entry);
     if (typeof cited === "string") return `Evidence ${id} ${cited}.`;
@@ -210,7 +213,10 @@ function applyRecord(
   // Only the confirmation dialog writes `user`, and only a waiver may carry it.
   const authorized = (record.action === "waive") === (record.author === "user");
   if (!authorized || !from.includes(tracked.finding.status ?? "open")) return;
-  const evidence = citeEvidence(ledger, branch, record.evidence, tracked.openedAt, record.action);
+  const boundary = record.v === 1
+    ? Math.max(tracked.receivedIndex, tracked.evidenceAfter)
+    : tracked.evidenceAfter;
+  const evidence = citeEvidence(ledger, branch, record.evidence, boundary, record.action);
   if (typeof evidence === "string") return;
   tracked.finding.status = to;
   tracked.finding.transition = {
@@ -221,7 +227,7 @@ function applyRecord(
     reason: collapse(record.reason, FINDING_LIMITS.reason),
     evidence,
   };
-  if (to === "reopened") tracked.openedAt = index;
+  if (to === "reopened") tracked.evidenceAfter = index;
 }
 
 function buildLedger(branch: readonly SessionEntry[]): Ledger {
@@ -266,7 +272,8 @@ function buildLedger(branch: readonly SessionEntry[]): Ledger {
         const tracked: Tracked = {
           id,
           key,
-          openedAt: index,
+          receivedIndex: index,
+          evidenceAfter: -1,
           finding: {
             id,
             note: collapse(note.note, FINDING_LIMITS.note),
@@ -321,12 +328,12 @@ function listLedger(branch: readonly SessionEntry[], findingId: string | undefin
   const ledger = buildLedger(branch);
   const sections: string[] = [];
   let details: Record<string, unknown>;
-  // Evidence a resolution may cite must follow this point; absent when nothing awaits resolution.
-  let citableAfter: { index: number; since: string } | undefined;
+  // Initial notices have no observation boundary; reopened findings require newer evidence.
+  let citableAfter: number | undefined;
   if (findingId !== undefined) {
     const tracked = findTracked(ledger, findingId);
     sections.push(describe(tracked.finding));
-    citableAfter = { index: tracked.openedAt, since: "this finding was last opened" };
+    citableAfter = tracked.evidenceAfter;
     details = { action: "list", findingId: tracked.id, status: tracked.finding.status };
   } else {
     const unresolved = ledger.tracked.filter((tracked) => isUnresolved(tracked.finding.status));
@@ -368,18 +375,15 @@ function listLedger(branch: readonly SessionEntry[], findingId: string | undefin
       sections.push(`${rest.length} more: ${named.join(", ")}${unnamed}; add findingId to see one.`);
     }
     if (unresolved.length > 0) {
-      citableAfter = {
-        index: Math.min(...unresolved.map((tracked) => tracked.openedAt)),
-        since: "the oldest unresolved finding was opened",
-      };
+      citableAfter = Math.min(...unresolved.map((tracked) => tracked.evidenceAfter));
     }
     details = { action: "list", ...counts };
   }
-  if (citableAfter) {
+  if (citableAfter !== undefined) {
     const lines: string[] = [];
     for (
       let index = branch.length - 1;
-      index > citableAfter.index && lines.length < LISTED_CANDIDATES;
+      index > citableAfter && lines.length < LISTED_CANDIDATES;
       index--
     ) {
       const entry = branch[index];
@@ -388,10 +392,12 @@ function listLedger(branch: readonly SessionEntry[], findingId: string | undefin
       const source = cited.kind === "tool_result" ? `tool result (${cited.toolName})` : "user message";
       lines.push(`- ${cited.entryId} ${source} at ${cited.at}: "${cited.excerpt}"`);
     }
+    const scope = citableAfter < 0 ? "on this branch" : "after the relevant explicit reopening";
     sections.push(
       lines.length > 0
-        ? `Citable evidence recorded after ${citableAfter.since}, newest first (pass entry ids as \`evidence\`):\n${lines.join("\n")}`
-        : `No citable evidence has been recorded since ${citableAfter.since}.`,
+        ? `Citable evidence ${scope}, newest first (pass entry ids as \`evidence\`):\n${lines.join("\n")}`
+        : `No citable evidence ${scope}.`,
+      "Notice receipt is not the auditor's observation time. Earlier results may answer a delayed note; explain their relevance instead of rerunning solely for chronology. For reopened findings, focus by findingId to see their individual evidence boundary.",
     );
   }
   return { content: [{ type: "text" as const, text: sections.join("\n\n") }], details };
@@ -413,7 +419,7 @@ function planTransition(
       `Finding ${tracked.id} is ${status}; ${action} applies only to ${from.join(" or ")} findings.`,
     );
   }
-  const evidence = citeEvidence(ledger, branch, evidenceIds, tracked.openedAt, action);
+  const evidence = citeEvidence(ledger, branch, evidenceIds, tracked.evidenceAfter, action);
   if (typeof evidence === "string") throw new Error(evidence);
   return { tracked, evidence };
 }
@@ -433,7 +439,7 @@ export function registerFindingTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: FINDINGS_TOOL,
     label: "Review findings",
-    description: `Manage ${AUDITOR_NAME} findings, which stay attached to ${REVIEW_TOOL} reviews until their status changes. DEFAULT only. "list" shows the ledger on this branch (IDs, status, provenance) and citable evidence entry ids; add findingId to focus one finding. "resolve" records your report that a finding is addressed: findingId, reason, and evidence = entry ids of successful tool results or user messages recorded after the finding. The auditor's note stays; reviewers weigh your report and its evidence, not as proof. "reopen" makes a resolved or waived finding unresolved again. "waive" asks the user to accept a finding unresolved; only their explicit confirmation waives it. A review never resolves a finding.`,
+    description: `Manage ${AUDITOR_NAME} findings, which stay attached to ${REVIEW_TOOL} reviews until their status changes. DEFAULT only. "list" shows the ledger on this branch (IDs, status, provenance) and citable evidence entry ids; add findingId to focus one finding. "resolve" records your report that a finding is addressed: findingId, reason explaining relevance, and evidence = entry ids of successful tool results or actual user messages on this branch. Evidence may precede a delayed notice; its receipt time is not its observation time. Do not rerun solely to obtain a later timestamp. The auditor's note stays; reviewers weigh your report and its evidence, not as proof. "reopen" makes a resolved or waived finding unresolved again and requires evidence after that explicit reopening for another resolution. "waive" asks the user to accept a finding unresolved; only their explicit confirmation waives it. A review never resolves a finding.`,
     loadMode: "essential",
     approval: (args) =>
       (args as { action?: unknown } | undefined)?.action === "list" ? "read" : "write",
@@ -493,7 +499,7 @@ export function registerFindingTools(pi: ExtensionAPI): void {
 
       const { tracked, evidence } = planned;
       const record: TransitionRecord = {
-        v: 1,
+        v: 2,
         findingId: tracked.id,
         action,
         author,

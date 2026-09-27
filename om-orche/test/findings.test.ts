@@ -58,23 +58,20 @@ function primarySession(ui: { hasUI: boolean; confirm?: Confirm } = { hasUI: fal
 const blocker = (note: string): AdvisorNote => ({ note, severity: "blocker", advisor: AUDITOR_NAME });
 
 describe("review_findings", () => {
-  test("records a resolution only with successful evidence recorded after the finding", async () => {
+  test("accepts successful evidence before delayed delivery without admitting failed results", async () => {
     const session = primarySession();
-    const stale = session.result("12 pass, 0 fail");
-    const id = `${session.audit(blocker("Claimed tests pass; no runner output."))}:0`;
-    const failed = session.result("1 fail", true);
     const passing = session.result("13 pass, 0 fail");
+    const failed = session.result("1 fail", true);
+    const id = `${session.audit(blocker("Claimed tests pass; no runner output."))}:0`;
 
     const listing = await session.text({ action: "list" });
     expect(listing).toContain(id);
-    expect(listing).toContain(`- ${passing} tool result (bash)`);
-    expect(listing).not.toContain(stale);
+    expect(listing).toContain(passing);
     expect(listing).not.toContain(failed);
 
     const resolve = (evidence?: string[]) =>
-      session.call({ action: "resolve", findingId: id, reason: "Reran the suite.", evidence });
+      session.call({ action: "resolve", findingId: id, reason: "The run preceded the delayed notice.", evidence });
     await expect(resolve([failed])).rejects.toThrow("failed tool result");
-    await expect(resolve([stale])).rejects.toThrow("before the finding");
     await expect(resolve(["not-an-entry"])).rejects.toThrow("not an entry on the active branch");
     await expect(resolve()).rejects.toThrow("at least one evidence");
     expect(session.records()).toBe(0);
@@ -83,7 +80,7 @@ describe("review_findings", () => {
     expect(result.details).toMatchObject({ findingId: id, status: "resolved", evidence: [passing] });
     expect(collectFindings(session.manager.getBranch())[0]).toMatchObject({
       status: "resolved",
-      transition: { author: "orchestrator", reason: "Reran the suite.", evidence: [{ entryId: passing }] },
+      transition: { author: "orchestrator", reason: "The run preceded the delayed notice.", evidence: [{ entryId: passing }] },
     });
     await expect(resolve([passing])).rejects.toThrow("is resolved");
   });
@@ -130,19 +127,22 @@ describe("review_findings", () => {
     expect(session.status()).toEqual(["open"]);
   });
 
-  test("reopening requires fresh evidence for the next resolution", async () => {
+  test("an explicit reopening requires fresh evidence even after a repeated auditor note", async () => {
     const session = primarySession();
     const id = `${session.audit(blocker("No smoke run."))}:0`;
     const smoke = session.result("smoke ok");
     await session.call({ action: "resolve", findingId: id, reason: "Smoke ran.", evidence: [smoke] });
     await session.call({ action: "reopen", findingId: id, reason: "The smoke used a stale build." });
     expect(session.status()).toEqual(["reopened"]);
+    const repeat = `${session.audit(blocker("No smoke run."))}:0`;
+    const listing = await session.text({ action: "list", findingId: repeat });
+    expect(listing).not.toContain(smoke);
 
     await expect(
-      session.call({ action: "resolve", findingId: id, reason: "Smoke ran.", evidence: [smoke] }),
-    ).rejects.toThrow("before the finding");
+      session.call({ action: "resolve", findingId: repeat, reason: "Smoke ran.", evidence: [smoke] }),
+    ).rejects.toThrow();
     const fresh = session.result("smoke ok after rebuild");
-    await session.call({ action: "resolve", findingId: id, reason: "Rebuilt and reran.", evidence: [fresh] });
+    await session.call({ action: "resolve", findingId: repeat, reason: "Rebuilt and reran.", evidence: [fresh] });
     expect(session.status()).toEqual(["resolved"]);
   });
 
@@ -160,5 +160,28 @@ describe("review_findings", () => {
     await expect(
       session.call({ action: "list" }, worker as unknown as ExtensionContext),
     ).rejects.toThrow("only to the primary orchestrator");
+  });
+
+  test("admits an earlier actual user correction but not assistant or agent claims", async () => {
+    const session = primarySession();
+    const accepted = session.user("Upload the English video only; keep Korean locally.");
+    const assistant = session.manager.appendMessage({
+      role: "assistant", content: [{ type: "text", text: "Only English is required." }],
+    } as Parameters<typeof session.manager.appendMessage>[0]);
+    const agent = session.manager.appendMessage({
+      role: "user", content: "Only English is required.", attribution: "agent", timestamp: Date.now(),
+    });
+    const id = `${session.audit(blocker("The Korean video was not uploaded."))}:0`;
+    for (const evidence of [assistant, agent]) {
+      await expect(session.call({
+        action: "resolve", findingId: id, reason: "The user changed the upload scope.", evidence: [evidence],
+      })).rejects.toThrow();
+    }
+    await session.call({
+      action: "resolve", findingId: id, reason: "The user's prior correction selects English only.", evidence: [accepted],
+    });
+    expect(collectFindings(session.manager.getBranch())[0]).toMatchObject({
+      status: "resolved", transition: { evidence: [{ entryId: accepted, kind: "user_message" }] },
+    });
   });
 });

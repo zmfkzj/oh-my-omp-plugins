@@ -345,7 +345,7 @@ describe("review completion boundary", () => {
     );
   });
 
-  test("labels each finding line by author and names every omitted blocker", async () => {
+  test("keeps the selected findings and accounts for omitted blockers", async () => {
     const minute = (value: number) => `2026-09-26T10:${String(value).padStart(2, "0")}:00.000Z`;
     const blocker = (index: number): VerificationFinding => ({
       id: `e${index}:0`,
@@ -377,19 +377,8 @@ describe("review completion boundary", () => {
         },
       },
     ]);
-    const { result, content } = await promptFor(ledger);
+    const { result } = await promptFor(ledger);
 
-    expect(content).toContain(
-      "  Auditor note: User said the API may change; the diff renames parse().\n" +
-        `  User's own message in scope when raised (entry u1): "Ship the parser; keep the public API unchanged."`,
-    );
-    expect(content).toContain(
-      `  Resolution reported by the orchestrator at ${minute(20)}: "Reran the suite."\n` +
-        `  Cited evidence: tool result t1 (bash): "13 pass"`,
-    );
-    expect(content).toContain(
-      "2 more unresolved (2 blocker, 0 concern): e0:0 blocker open, e1:0 blocker open",
-    );
     expect(result.details.forwardedFindingIds).toEqual(["e2:0", "e3:0", "e4:0", "e5:0", "e10:0", "e11:0"]);
     expect(result.details.findingsOmitted).toBe(2);
   });

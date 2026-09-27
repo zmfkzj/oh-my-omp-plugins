@@ -197,22 +197,37 @@ fields shown in `examples/initial-plan.json`; there is no `dispatch` argument.
 ### Durable finding ledger
 
 `review_findings` exposes `list`, `resolve`, `waive`, and `reopen`. Each finding
-has a stable ID, original advisor entry, timestamp, current status, and the
-actual user message identifying its scope. Only the owned auditor's concern and
-blocker notes are admitted; repeated equivalent notes in the same scope merge.
+has a stable ID, original advisor entry, receipt timestamp, current status, and
+the actual user message in scope when received. OMP does not persist the
+auditor's observation boundary in the delivered note, so receipt time must not
+be treated as observation time. Only the owned auditor's concern and blocker
+notes are admitted; repeated equivalent notes in the same scope merge.
 Neither age nor a successful review resolves or deletes a finding.
 
-- `resolve` needs a reason and IDs of later successful tool results or actual
-  user messages on this branch. Assistant claims, failed results, review verdicts
-  and ledger listings cannot serve as resolution evidence.
+- `resolve` needs a relevance explanation and IDs of successful tool results or
+  actual user messages on this branch. Evidence may precede a delayed notice;
+  an already-recorded upload result or user correction need not be repeated just
+  to obtain a timestamp after delivery. `list` includes these earlier candidates.
+  The coordinator must still check that the evidence answers the specific claim
+  and covers the relevant revision: the tool requires a non-empty reason but
+  does not validate its semantic relevance. Assistant claims, failed results,
+  review verdicts and ledger listings cannot serve as resolution evidence.
 - Resolutions are explicitly **orchestrator-reported**, not proof. The original
   note and bounded evidence excerpts stay visible to the reviewer.
-- `waive` requires explicit user confirmation. `reopen` records a renewed concern.
-  A renewed auditor objection after a reported resolution opens a new finding.
+- `waive` requires explicit user confirmation. An explicit `reopen` records a
+  renewed concern and requires evidence after that reopening for the next
+  resolution; repeated notes do not reset this boundary. A renewed auditor
+  objection after a reported resolution opens a new finding.
 - Findings and lifecycle changes update the evidence available to the next
   explicit advice request. They never block tools, invalidate permission or
   automatically call the advisor. A finding waiver only records accepted risk;
   it is not an execution waiver.
+
+New lifecycle reports use record version 2. Existing version 1 reports retain
+their original post-receipt/post-reopening evidence rules during replay; an old
+invalid report does not become valid just by upgrading. No transcript entries
+are rewritten. Using earlier evidence for an existing finding requires a new,
+explicit resolution report under the current rules.
 
 The reviewer receives up to five unresolved findings in detail, reserving space
 for the two newest, plus up to three recent resolutions/waivers with evidence.
@@ -221,6 +236,16 @@ counts and bounded ID lists, not silently treated as resolved. Use `list` with
 `findingId` to inspect any omitted item. An auditor's account of a user
 instruction is not itself a direct user instruction; scope and evidence must be
 weighed before superseding restrictions.
+
+The bundled auditor is instructed to stay silent on confirmations, praise,
+progress reminders and checks that already passed. It reports concrete remaining
+contradictions or evidenced irreversible-operation risks, not unfinished tasks
+that have not been called complete. It must identify the snapshot or result it
+actually checked; a growing transcript's last observed entry is not proof that
+the session ended. These are model instructions, not a semantic runtime filter:
+existing notes are not silently dropped based on phrase matching or automatically
+marked resolved. The reviewer likewise assesses evidence against the claim and
+revision, not against the note's delivery time.
 
 The bundled Verification Auditor runs through OMP's WATCHDOG roster only while
 advisors are enabled. Its model is `@verification-auditor`, a custom role

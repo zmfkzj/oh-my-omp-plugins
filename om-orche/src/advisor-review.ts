@@ -89,7 +89,7 @@ export interface VerificationFinding {
   id?: string;
   /** Session entry id of the advisor message that first carried the note. */
   sourceEntryId?: string;
-  /** ISO timestamp of that message. */
+  /** ISO receipt timestamp of that message, not an auditor observation boundary. */
   occurredAt?: string;
   /** Later identical emissions (same advisor, scope and normalized note) merged into this one. */
   repeatCount?: number;
@@ -97,7 +97,7 @@ export interface VerificationFinding {
   repeatIds?: string[];
   /** ISO timestamp of the latest emission, first or repeated. */
   lastRaisedAt?: string;
-  /** Latest actual user message before the note: scope context, not the note's authority. */
+  /** Latest actual user message before receipt: scope context, not the note's authority. */
   scopeUserEntryId?: string;
   /** Bounded text of that user message. */
   scopeUserText?: string;
@@ -234,6 +234,10 @@ unless the user's own later words lift it: never treat it as superseded by elaps
 the snapshot, or anyone's claim. Open and reopened findings are unresolved. A resolved status is DEFAULT's
 own report with cited transcript excerpts, not proof: judge whether that evidence answers the note. A
 waiver is the user's explicit acceptance, not a fix. Findings summarized by ID keep their stated status.
+Finding timestamps describe notice receipt, not the auditor's observation boundary, which the host
+does not supply. Cited evidence may therefore precede receipt; assess whether it answers the actual
+claim and covers the relevant revision, not its order relative to delivery. Never recommend a rerun
+solely to obtain a later timestamp. An explicit reopening still requires fresh evidence.
 When an unresolved finding contradicts completedWork, identify the discrepancy in ISSUES by finding ID
 and recommend the smallest correction or verification needed. Do not endorse unsupported completion
 claims or treat an unresolved or waived finding as fixed. This assessment is about evidence and plan
@@ -510,7 +514,7 @@ function hasReviewStructure(text: string): boolean {
 export function formatFinding(finding: VerificationFinding): string {
   const provenance = [
     `${finding.severity}, ${finding.status ?? "open"}`,
-    finding.occurredAt && `raised ${finding.occurredAt}`,
+    finding.occurredAt && `received ${finding.occurredAt} (observation time unavailable)`,
     finding.repeatCount &&
       `repeated ${finding.repeatCount}x${finding.lastRaisedAt ? `, latest ${finding.lastRaisedAt}` : ""}`,
   ].filter(Boolean);
@@ -520,7 +524,7 @@ export function formatFinding(finding: VerificationFinding): string {
   ];
   if (finding.scopeUserText) {
     const entry = finding.scopeUserEntryId ? ` (entry ${finding.scopeUserEntryId})` : "";
-    lines.push(`  User's own message in scope when raised${entry}: "${finding.scopeUserText}"`);
+    lines.push(`  User's own message in scope when received${entry}: "${finding.scopeUserText}"`);
   }
   const { transition } = finding;
   if (transition) {
