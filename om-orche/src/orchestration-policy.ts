@@ -77,7 +77,7 @@ function taskBodyContract(tools: ReadonlySet<string>, subject: string): string {
 			(tools.has("task")
 				? " Use the existing outputSchema only when a structured result is needed."
 				: ""),
-		"A worker that finds a defect in a fixed decision returns evidence instead of redesigning it.",
+		"A worker that finds a defect in a fixed decision, an ownership conflict, or an invalid prerequisite pauses affected changes and reports evidence, touched files and partial work immediately; it does not redesign the contract, expand its scope, or overwrite another owner's edits.",
 	].join("\n");
 }
 
@@ -85,9 +85,15 @@ function verification(tools: ReadonlySet<string>): string {
 	const checks = tools.has("bash") ? "project checks" : "available checks";
 	return [
 		"A worker finishing or reporting success is not acceptance. You integrate and verify acceptance yourself.",
+		...(tools.has("task") ? [
+			"On an ownership or shared-resource conflict, hold new overlapping work and check host-visible writer status. Request affected writers to stop only through controls the host actually exposes; do not reconcile their edits or assign overlapping work until they are confirmed stopped. Otherwise keep the overlap blocked; preserve user and unrelated worker changes.",
+			"When an upstream contract changes, identify every affected pending, running and completed unit. Hold new affected work and handle active writers as above; update the plan and worker instructions, verify the revised prerequisite, and revalidate affected completed results against it before accepting them. Resume affected work only after its prerequisites and writer status permit it; unaffected work continues.",
+			"On partial failure, preserve independently verified results and continue unrelated work. Record the failed unit, dependent units and exact blocker; retry or reassign only the affected scope after its cause or inputs change and any previous writer has stopped.",
+		] : []),
 		`Never run global ${checks} or formatters concurrently in a shared checkout; isolated, conflict-free local smoke runs by workers are fine.`,
 		"Classify a failure first: implementation defect, ambiguous contract, missing environment or permission, integration conflict, or unresolved design.",
 		"Fix small obvious gaps directly. Never repeat an unchanged failure without new input or a new hypothesis; with no executable next step, report the exact blocker.",
+		"Before declaring completion, reconcile every requested outcome with the integrated result and run the relevant end-to-end or boundary checks. Report actual verification and unresolved blockers explicitly; partial success is not overall completion.",
 		"No automatic model escalation, reviewer loops, or out-of-scope reviewer demands.",
 	].join("\n");
 }

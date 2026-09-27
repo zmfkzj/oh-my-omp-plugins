@@ -125,6 +125,33 @@ runtime schema: free-form task calls are never rejected for missing sections.
 OMP validates and executes the native task input. The plugin neither stages nor
 hashes task calls for approval.
 
+Execution guidance also covers recovery and final acceptance:
+
+- Workers pause affected changes and promptly report evidence, touched files and
+  partial work when ownership conflicts, invalid prerequisites or defects in
+  fixed decisions appear. They do not silently redesign or expand their scope.
+- With `task` enabled, the coordinator holds new overlapping work and checks
+  host-visible writer status. Stop requests use only controls the host exposes;
+  edits are reconciled or overlapping work assigned only after writers are
+  confirmed stopped. Otherwise the overlap stays blocked; user and unrelated
+  changes are preserved.
+- An upstream contract change requires checking pending, running and completed
+  consumers: hold new affected work and check active writers as above. Update
+  the plan and worker instructions, verify the revised prerequisite, and
+  revalidate affected completed results against it before accepting them.
+  Resume affected work only when prerequisites and writer status permit it;
+  unrelated work continues.
+- Partial failure preserves independently verified results. Only affected work
+  is retried or reassigned, after its cause or inputs change and the previous
+  writer has stopped; failed units, dependencies and exact blockers stay explicit.
+- Completion requires reconciling every requested outcome with the integrated
+  result and relevant end-to-end or boundary checks. Partial success and unresolved
+  blockers must not be presented as overall completion.
+
+These are model instructions, not automatic cancellation, scheduling or approval
+mechanisms. Workflow mode retains the native workflow's execution-method and
+fan-out authority; the supplement adds recovery and acceptance duties only.
+
 ### Plan advice and Verification Auditor
 
 `orche_advisor` gives advice on an already-established plan, not source-code
