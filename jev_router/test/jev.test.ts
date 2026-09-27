@@ -50,8 +50,9 @@ describe("input bounding", () => {
 				{ role: "assistant", text: "a".repeat(10000) },
 			],
 			plan: "p".repeat(10000),
+			previousReview: "review".repeat(10000),
 		}, 300);
-		const used = state.request.length + (state.plan?.length ?? 0)
+		const used = state.request.length + (state.plan?.length ?? 0) + (state.previous_review?.length ?? 0)
 			+ state.recent_messages.reduce((sum, item) => sum + item.text.length, 0);
 		expect(used).toBeLessThanOrEqual(300);
 		expect(state.request).toContain("r");

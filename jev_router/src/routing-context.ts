@@ -108,5 +108,13 @@ export function buildRoutingContext(branch: readonly SessionEntry[], prompt: str
 		}
 	}
 	const plan = latestCommittedTodoPlan(branch);
-	return { recentMessages, ...(plan ? { plan: formatTodoPlan(plan) } : {}) };
+	let previousReview: string | undefined;
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry?.type !== "message" || entry.message.role !== "toolResult" ||
+			entry.message.toolName !== "orche_advisor" || entry.message.isError) continue;
+		previousReview = `Historical completed review (not permission for new scope):\n${visibleText(entry.message.content).slice(0, 1200)}`;
+		break;
+	}
+	return { recentMessages, ...(plan ? { plan: formatTodoPlan(plan) } : {}), ...(previousReview ? { previousReview } : {}) };
 }

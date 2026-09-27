@@ -185,4 +185,47 @@ describe("scope-bound review enforcement", () => {
     branch.push(call("await agent(task='Redesign payment storage')"));
     expect(gate.beforeSpawn(ctx, event)?.block).toBe(true);
   });
+  test("optional continuation retains the reviewed plan and dispatch across user turns", () => {
+    const { gate, ctx, branch } = fixture();
+    gate.beforeTool(ctx, "task", batch);
+    gate.complete(ctx, gate.scope(ctx), true);
+    const reviewed = gate.scope(ctx).key;
+    branch.push({ type: "message", id: "followup", parentId: null, timestamp: "2026-09-27T00:00:00Z",
+      message: { role: "user", content: "Continue the same work", timestamp: 2 } });
+    gate.noteDecision(ctx, false, "initial-plan", "review-optional", "Continue the same work");
+    expect(gate.scope(ctx).key).toBe(reviewed);
+    expect(gate.beforeTool(ctx, "task", batch)).toBeUndefined();
+    expect(gate.guidance(ctx)).toBeUndefined();
+  });
+  test("diagnostic follow-up does not demand a proactive review but new findings still block mutation", () => {
+    const { gate, ctx, branch } = fixture();
+    gate.noteDecision(ctx, true, "initial-plan", "review-required", goal);
+    gate.complete(ctx, gate.scope(ctx), true);
+    addFinding(branch);
+    branch.push({ type: "message", id: "status", parentId: null, timestamp: "2026-09-27T00:00:00Z",
+      message: { role: "user", content: "What is the status?", timestamp: 2 } });
+    gate.noteDecision(ctx, false, "initial-plan", "review-optional", "What is the status?");
+    expect(gate.guidance(ctx)).toBeUndefined();
+    expect(gate.beforeTool(ctx, "read", {})).toBeUndefined();
+    expect(gate.beforeTool(ctx, "edit", {})?.block).toBe(true);
+  });
+  test("new required user scope cannot reuse a prior receipt with unchanged todo", () => {
+    const { gate, ctx, branch } = fixture();
+    gate.noteDecision(ctx, true, "initial-plan", "review-required", goal);
+    gate.complete(ctx, gate.scope(ctx), true);
+    const request = "Also migrate payment storage";
+    branch.push({ type: "message", id: "new-work", parentId: null, timestamp: "2026-09-27T00:00:00Z",
+      message: { role: "user", content: request, timestamp: 2 } });
+    gate.noteDecision(ctx, true, "initial-plan", "review-required", request);
+    expect(gate.beforeTool(ctx, "edit", {})?.block).toBe(true);
+  });
+  test("known observation devices do not require review just because their transport is write", () => {
+    const { gate, ctx } = fixture();
+    gate.noteDecision(ctx, true, "initial-plan", "review-required", goal);
+    for (const device of ["list_roblox_studios", "get_studio_state", "get_console_output"]) {
+      expect(gate.beforeTool(ctx, "write", { path: `xd://mcp__roblox_studio_${device}`, content: "{}" })).toBeUndefined();
+    }
+    expect(gate.beforeTool(ctx, "write", { path: "xd://mcp__roblox_studio_execute_luau", content: "{}" })?.block).toBe(true);
+    expect(gate.beforeTool(ctx, "write", { path: "/tmp/project.ts", content: "change" })?.block).toBe(true);
+  });
 });

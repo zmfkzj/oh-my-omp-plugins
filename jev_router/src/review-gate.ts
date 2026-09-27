@@ -12,6 +12,20 @@ import { normalizeCall } from "./task-routing.ts";
 const STATE = "jev-review-requirement";
 const RECEIPT = "jev-review-receipt";
 const WAIVER = "jev-review-waiver";
+
+// write is the device transport, not necessarily a mutation.
+// Arbitrary execution and unrecognized devices remain gated.
+const OBSERVATION_DEVICES: Record<string, true> = {
+  "xd://mcp__codegraph_explore": true,
+  "xd://mcp__roblox_studio_list_roblox_studios": true,
+  "xd://mcp__roblox_studio_get_studio_state": true,
+  "xd://mcp__roblox_studio_get_console_output": true,
+  "xd://mcp__roblox_studio_inspect_instance": true,
+  "xd://mcp__roblox_studio_script_read": true,
+  "xd://mcp__roblox_studio_script_search": true,
+  "xd://mcp__roblox_studio_script_grep": true,
+  "xd://mcp__roblox_studio_search_game_tree": true,
+};
 const FAILURE = "jev-review-failure";
 
 function hash(value: unknown): string {
@@ -44,6 +58,8 @@ interface Requirement {
   checkpoint: Checkpoint;
   reason: string;
   generation: number;
+  /** Latest assessment controls prompting, not outstanding execution protection. */
+  promptReview?: boolean;
   dispatches: { key: string; summary: string }[];
 }
 export interface ReviewScope {
@@ -86,7 +102,6 @@ export class ReviewGate {
       const entry = branch[i];
       if (entry?.type !== "custom" || entry.customType !== STATE || !record(entry.data)) continue;
       const d = entry.data;
-      if (d.requestHash !== requestHash) continue;
       if (typeof d.required !== "boolean" || typeof d.checkpoint !== "string" || !CHECKPOINTS.includes(d.checkpoint) ||
           typeof d.reason !== "string" || typeof d.generation !== "number" || !Array.isArray(d.dispatches)) continue;
       if (!d.dispatches.every(item => record(item) && typeof item.key === "string" && typeof item.summary === "string")) continue;
@@ -107,7 +122,7 @@ export class ReviewGate {
       abandoned: task.status === "abandoned" || undefined,
     })) })));
     const revision = findingRevision(branch);
-    const key = hash({ requestHash, planHash, generation: state.generation, dispatches: state.dispatches.map(d => d.key).sort(), revision });
+    const key = hash({ version: 2, planHash, generation: state.generation, dispatches: state.dispatches.map(d => d.key).sort(), revision });
     let satisfied = false;
     let failed = false;
     for (let i = branch.length - 1; i >= 0; i--) {
@@ -124,9 +139,12 @@ export class ReviewGate {
     if (!this.enabled() || !mainSessionOf(ctx)) return;
     const requestHash = hash(request.trim());
     const before = this.requirement(this.branch(ctx), requestHash);
-    if (!required && before.required) return; // An optional hint cannot erase an outstanding obligation.
-    const generation = before.generation + (required && ["phase-boundary", "repeated-failure", "replan"].includes(checkpoint) ? 1 : 0);
-    const next = { ...before, required, checkpoint, reason: reason.slice(0, 500), generation };
+    const newRiskScope = required && before.requestHash !== requestHash && checkpoint === "initial-plan";
+    const generation = before.generation + (newRiskScope ||
+      (required && ["phase-boundary", "repeated-failure", "replan"].includes(checkpoint)) ? 1 : 0);
+    const next = { ...before, requestHash, required: required || before.required,
+      promptReview: required, checkpoint: required ? checkpoint : before.checkpoint,
+      reason: required ? reason.slice(0, 500) : before.reason, generation };
     if (JSON.stringify(next) !== JSON.stringify(before)) this.persist(ctx, STATE, next);
   }
   observeToolResult(ctx: ExtensionContext, event: ToolResultEvent): void {
@@ -159,7 +177,7 @@ export class ReviewGate {
     const dispatches = exists ? state.dispatches : accumulate
       ? [...state.dispatches, { key, summary: summary.slice(0, 1600) }]
       : [{ key, summary: summary.slice(0, 1600) }];
-    const next = { ...state, required: true, checkpoint, reason, dispatches };
+    const next = { ...state, required: true, promptReview: true, checkpoint, reason, dispatches };
     if (JSON.stringify(next) !== JSON.stringify(state)) this.persist(ctx, STATE, next);
   }
   private denial(scope: ReviewScope): ToolCallEventResult {
@@ -197,7 +215,7 @@ export class ReviewGate {
     // Arbitrary execution can mutate files or dispatch agents. Unknown tools
     // are not assumed read-only; shell/eval strings are never regex-classified.
     if (["read", "grep", "glob", "find", "web_search", "ask", "todo", "wait", "orche_advisor", "review_findings"].includes(name)) return undefined;
-    if (name === "write" && input.path === "xd://mcp__codegraph_explore") return undefined;
+    if (name === "write" && typeof input.path === "string" && Object.hasOwn(OBSERVATION_DEVICES, input.path)) return undefined;
     return this.denial(scope);
   }
   beforeSpawn(ctx: ExtensionContext, event: BeforeSubagentSpawnEvent): BeforeSubagentSpawnEventResult | undefined {
@@ -248,6 +266,7 @@ export class ReviewGate {
   guidance(ctx: ExtensionContext): string | undefined {
     if (!this.enabled() || !mainSessionOf(ctx)) return undefined;
     const scope = this.scope(ctx);
+    if (this.requirement(this.branch(ctx), scope.requestHash).promptReview === false) return undefined;
     if (!scope.required || scope.satisfied) return undefined;
     return `<system-notice>Mandatory orchestration review pending: ${scope.checkpoint}. ${scope.reason}\n` +
       "Read-only scoping and todo planning may continue; implementation and worker dispatch are blocked until a successful scope-bound orche_advisor review. " +

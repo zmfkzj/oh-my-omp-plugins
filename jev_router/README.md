@@ -100,13 +100,25 @@ then the caller submits the unchanged task input. Otherwise the first task
 attempt is blocked before execution and stages its scope for review. One review
 can cover initial planning and fan-out; do not review every worker completion.
 
-Receipts are persisted on the active session branch and bind the user request,
-semantic todo plan, blockers/abandonments, phase generation, exact native dispatch
-and finding revision. Routine in-progress/completed status changes alone do not
-invalidate a receipt. A new phase, changed contract or evidence does. Reload and
+Receipts persist on the active branch and bind the semantic todo plan,
+blockers/abandonments, review generation, exact native dispatch and finding revision.
+The latest user wording is provenance, not receipt identity: optional continuations
+retain the reviewed scope across turns. A newly assessed consequential request
+renews the generation even if todo is unchanged. A new phase, contract or evidence
+also invalidates the receipt. Reload and
 branch rewind cannot turn a stale review into permission; a finding arriving
 during review leaves the changed scope blocked. Unchanged unresolved findings
 do not force infinite rereviews.
+
+Status questions and read-only diagnostic follow-ups do not proactively request
+another review merely because the project is risky. Jev receives a bounded excerpt
+of the latest successful review and assesses the new action, not historical risk.
+Outstanding requirements/findings still block mutation; optional follow-ups do not
+erase them. Known observation-only Studio devices (discovery, state, logs, instance/
+script/tree inspection) bypass the mutation gate despite using the `write` transport.
+Arbitrary Luau, shell/eval execution and unknown devices remain gated.
+The new receipt identity intentionally does not accept old-format receipts; an
+existing session may need one fresh review before subsequent mutation.
 
 Failure is not permission. After a failed review, an unchanged scope cannot make
 another paid review automatically. The user can authorize one new attempt with
@@ -366,7 +378,8 @@ disabled: a router that retries costs more than the routing saves.
 ## Privacy and security
 
 Sent to Jev: the current request, up to eight recent visible dialogue messages
-plus the earliest retained user goal, and the latest committed todo plan.
+plus the earliest retained user goal, latest committed todo plan, and up to 1200
+characters of the latest successful review as historical context, not authorization.
 Dialogue entries are clipped to 700 characters (the retained goal to 1600);
 plan text is clipped to 3200. The engine applies a combined
 `maxRoutingInputChars` text budget, default 12000, excluding JSON framing and
