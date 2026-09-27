@@ -51,9 +51,11 @@ describe("input bounding", () => {
 			],
 			plan: "p".repeat(10000),
 			previousReview: "review".repeat(10000),
+			workScopes: Array.from({ length: 10 }, (_, index) => ({ id: `scope-${index}`, goal: "goal".repeat(10000) })),
 		}, 300);
 		const used = state.request.length + (state.plan?.length ?? 0) + (state.previous_review?.length ?? 0)
-			+ state.recent_messages.reduce((sum, item) => sum + item.text.length, 0);
+			+ state.recent_messages.reduce((sum, item) => sum + item.text.length, 0)
+			+ (state.work_scopes ?? []).reduce((sum, item) => sum + item.goal.length, 0);
 		expect(used).toBeLessThanOrEqual(300);
 		expect(state.request).toContain("r");
 		expect(state.plan).toContain("p");
@@ -134,6 +136,20 @@ describe("front-door classifier request", () => {
 			expect(decision).toMatchObject({ top: "DEFAULT", confident: true, review: { top, confident: false } });
 			// The router reports an empty distribution as a missing answer.
 			expect(Object.keys(decision.review.probabilities).length === 0).toBe(missing);
+		}
+	});
+	test("only confident in-list scope linkage can reuse an existing work identity", async () => {
+		const scoped = { ...context, workScopes: [{ id: "work-a", goal: "Existing release" }] };
+		for (const [answer, expected] of [
+			[{ type: "choice", probabilities: { W0: 0.95, NEW: 0.05 } }, "work-a"],
+			[{ type: "choice", probabilities: { W0: 0.51, NEW: 0.49 } }, "NEW"],
+			[{ type: "choice", probabilities: { W99: 1 } }, "NEW"],
+			[undefined, "NEW"],
+		] as const) {
+			serve({ route, work_scope: answer, review: { type: "choice", probabilities: { REQUIRED: 0.9, OPTIONAL: 0.1 } } });
+			const decision = await new JevEngine().decideOrchestration("Continue", scoped, options, gates, 12000);
+			expect(decision.workScope).toBe(expected);
+			expect(decision.workScopeUncertain).toBe(expected === "NEW");
 		}
 	});
 });

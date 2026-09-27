@@ -81,8 +81,8 @@ export class JevRouterRuntime {
 		this.reviewGate = new ReviewGate(() => this.#config.enabled);
 		this.orchestration = new OrchestrationRouter({
 			...deps,
-			onReviewDecision: (ctx, required, checkpoint, reason, request) =>
-				this.reviewGate.noteDecision(ctx, required, checkpoint, reason, request),
+			onReviewDecision: (ctx, required, checkpoint, reason, request, workScope) =>
+				this.reviewGate.noteDecision(ctx, required, checkpoint, reason, request, workScope),
 		});
 		this.task = new TaskRouter({
 			...deps,

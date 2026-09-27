@@ -108,6 +108,17 @@ export function buildRoutingContext(branch: readonly SessionEntry[], prompt: str
 		}
 	}
 	const plan = latestCommittedTodoPlan(branch);
+	const workScopes: { id: string; goal: string }[] = [];
+	const seen = new Set<string>();
+	for (let index = branch.length - 1; index >= 0 && workScopes.length < 6; index--) {
+		const entry = branch[index];
+		if (entry?.type !== "custom" || entry.customType !== "jev-review-requirement" ||
+			!entry.data || typeof entry.data !== "object") continue;
+		const data = entry.data as Record<string, unknown>;
+		if (typeof data.workId !== "string" || typeof data.goal !== "string" || seen.has(data.workId)) continue;
+		seen.add(data.workId);
+		workScopes.push({ id: data.workId, goal: data.goal.slice(0, 600) });
+	}
 	let previousReview: string | undefined;
 	for (let index = branch.length - 1; index >= 0; index--) {
 		const entry = branch[index];
@@ -116,5 +127,6 @@ export function buildRoutingContext(branch: readonly SessionEntry[], prompt: str
 		previousReview = `Historical completed review (not permission for new scope):\n${visibleText(entry.message.content).slice(0, 1200)}`;
 		break;
 	}
-	return { recentMessages, ...(plan ? { plan: formatTodoPlan(plan) } : {}), ...(previousReview ? { previousReview } : {}) };
+	return { recentMessages, ...(plan ? { plan: formatTodoPlan(plan) } : {}),
+		...(previousReview ? { previousReview } : {}), ...(workScopes.length ? { workScopes } : {}) };
 }

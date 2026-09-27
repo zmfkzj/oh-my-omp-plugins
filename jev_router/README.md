@@ -48,6 +48,14 @@ committed todo plan. It never receives hidden thinking or raw tool-result bodies
   review answers and unavailable classification require review before execution.
   Neither decision changes the primary model.
 
+When recent work scopes exist, the same request also links the new message to
+one of up to six branch-local work IDs, or NEW. Progress checks and execution of
+an unchanged reviewed plan retain identity even when risk remains REQUIRED.
+Unrelated work or a material new contract gets a new ID. Missing, ambiguous or
+out-of-list linkage is conservative: it cannot reuse another task's receipt.
+An explicitly resumed listed task restores its own prior obligation/dispatch,
+not the most recently active task's state.
+
 A successful `todo init` or `todo append` reconsiders a changed committed plan.
 Already-orchestrated turns renew the review requirement without another routing
 call. A newly completed phase renews review for required-review turns, including
@@ -100,21 +108,27 @@ then the caller submits the unchanged task input. Otherwise the first task
 attempt is blocked before execution and stages its scope for review. One review
 can cover initial planning and fan-out; do not review every worker completion.
 
-Receipts persist on the active branch and bind the semantic todo plan,
+Receipts persist on the active branch and bind a work ID, semantic todo plan,
 blockers/abandonments, review generation, exact native dispatch and finding revision.
-The latest user wording is provenance, not receipt identity: optional continuations
-retain the reviewed scope across turns. A newly assessed consequential request
-renews the generation even if todo is unchanged. A new phase, contract or evidence
-also invalidates the receipt. Reload and
-branch rewind cannot turn a stale review into permission; a finding arriving
-during review leaves the changed scope blocked. Unchanged unresolved findings
-do not force infinite rereviews.
+Scope identity is finalized at assessment, before any review, waiver or execution.
+Execution may reveal the required notice but never changes the approved key.
+There is no late pending-risk generation to invalidate a just-issued waiver or
+to be erased by cached-review reuse. An old review completing after a task switch
+cannot change the new task's requirement.
+
+Initial assessments do not proactively demand review for conversational turns.
+New work has separate state; a continuation keeps its receipt unless plan,
+dispatch, phase or evidence changes. The global finding revision deliberately
+continues to invalidate execution permission, never ordinary read-only access.
+Reload and branch rewind reconstruct only records on the active branch.
 
 Status questions and read-only diagnostic follow-ups do not proactively request
 another review merely because the project is risky. Jev receives a bounded excerpt
 of the latest successful review and assesses the new action, not historical risk.
-Outstanding requirements/findings still block mutation; optional follow-ups do not
-erase them. Known observation-only Studio devices (discovery, state, logs, instance/
+New findings alone do not proactively call for another review, including after
+a successful review in the same turn. They remain unresolved and gate the next
+mutation. Outstanding requirements are not erased by conversational follow-ups.
+Known observation-only Studio devices (discovery, state, logs, instance/
 script/tree inspection) bypass the mutation gate despite using the `write` transport.
 Arbitrary Luau, shell/eval execution and unknown devices remain gated.
 The new receipt identity intentionally does not accept old-format receipts; an
@@ -126,6 +140,8 @@ another paid review automatically. The user can authorize one new attempt with
 `/review-waive <scope-key> <reason>`. `/review-status` shows the current full key.
 These slash commands are not model-callable tools. A waiver covers only that
 scope and never resolves findings or claims verification passed.
+Failed review status remains visible until the user authorizes retry/waiver or
+the task scope changes. Failure guidance must not be cleared as if review succeeded.
 
 ### Durable finding ledger
 
@@ -380,6 +396,8 @@ disabled: a router that retries costs more than the routing saves.
 Sent to Jev: the current request, up to eight recent visible dialogue messages
 plus the earliest retained user goal, latest committed todo plan, and up to 1200
 characters of the latest successful review as historical context, not authorization.
+Scope linkage also receives up to six work-goal summaries, bounded together
+within the same text budget (at most 1200 characters for these goals).
 Dialogue entries are clipped to 700 characters (the retained goal to 1600);
 plan text is clipped to 3200. The engine applies a combined
 `maxRoutingInputChars` text budget, default 12000, excluding JSON framing and

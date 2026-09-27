@@ -6,6 +6,8 @@ import example from "../examples/initial-plan.json";
 import { prepareReviewInput, ROLE, TOOL } from "../src/advisor-review.ts";
 import { registerJevRouter } from "../src/index.ts";
 import { AUDITOR_NAME, VERIFICATION_AUDITOR } from "../src/verification-auditor.ts";
+import { registerOrcheAdvisor } from "../src/orche-advisor.ts";
+import { ReviewGate } from "../src/review-gate.ts";
 import { clearRegistry, makeSession, registerAsMain } from "./harness.ts";
 import { findingRevision } from "../src/findings.ts";
 
@@ -91,4 +93,45 @@ test("one extension registers the checkpoint tool and an independent auditor rol
     .rejects.toThrow("Configure modelRoles.orche-advisor");
   await expect(checkpointTool!.execute("review-call-3", example, new AbortController().signal, () => {}, ctx))
     .rejects.toThrow("Review already failed for this exact scope");
+});
+
+test("new required work cannot reuse an identical old snapshot and erase its risk", async () => {
+  const branch: SessionEntry[] = [{
+    type: "message", id: "old-user", parentId: null, timestamp: "2026-09-27T00:00:00Z",
+    message: { role: "user", content: "Old release plan", timestamp: 0 },
+  }];
+  const { session, ctx } = makeSession({ branch });
+  Object.assign(session.sessionManager, {
+    appendCustomEntry(customType: string, data: unknown) {
+      const id = `state-${branch.length}`;
+      branch.push({ type: "custom", id, parentId: null, timestamp: "2026-09-27T01:00:00Z", customType, data });
+      return id;
+    },
+  });
+  registerAsMain(session);
+  const gate = new ReviewGate();
+  gate.noteDecision(ctx, true, "initial-plan", "review-required", "Old release plan");
+  gate.beforeTool(ctx, "edit", {});
+  const oldScope = gate.scope(ctx);
+  gate.complete(ctx, oldScope, true);
+  branch.push({
+    type: "message", id: "cached-review", parentId: null, timestamp: "2026-09-27T01:01:00Z",
+    message: { role: "toolResult", toolCallId: "prior", toolName: TOOL, isError: false, timestamp: 1,
+      content: [{ type: "text", text: "VERDICT: KEEP" }],
+      details: { role: ROLE, snapshotHash: prepareReviewInput(example).snapshotHash, scopeKey: oldScope.key, findingRevision: findingRevision(branch), model: "old-model" } },
+  });
+  branch.push({ type: "message", id: "new-user", parentId: null, timestamp: "2026-09-27T02:00:00Z",
+    message: { role: "user", content: "New payment migration", timestamp: 2 } });
+  gate.noteDecision(ctx, true, "initial-plan", "review-required", "New payment migration");
+  let reviewer: Parameters<ExtensionAPI["registerTool"]>[0] | undefined;
+  registerOrcheAdvisor({
+    zod: z, on() {},
+    registerTool(tool: Parameters<ExtensionAPI["registerTool"]>[0]) { reviewer = tool; },
+  } as unknown as ExtensionAPI, gate);
+  Object.assign(session.settings, { reloadFromDisk: async () => {} });
+  Object.assign(ctx.modelRegistry, { getAvailable: () => [] });
+  // A new review requires a configured model; stale cache reuse would incorrectly succeed.
+  await expect(reviewer!.execute("new-review", example, new AbortController().signal, () => {}, ctx))
+    .rejects.toThrow("Configure modelRoles.orche-advisor");
+  expect(gate.beforeTool(ctx, "edit", {})?.block).toBe(true);
 });

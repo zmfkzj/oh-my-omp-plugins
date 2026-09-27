@@ -24,8 +24,8 @@ import { ReviewGate } from "./review-gate.ts";
 
 const DEFAULT_GUIDANCE = `Orche-Advisor reviews orchestration, not code; it is not a worker or second orchestrator.
 You retain planning, delegation, implementation integration, verification, and termination responsibility.
-Reviews are mandatory when a review-required notice or dispatch gate says so, even in DEFAULT mode.
-They are also required at native orchestrate initial-plan and phase/replan checkpoints.
+Reviews are mandatory when the execution gate or a committed phase/scope notice requires them.
+Do not call initial-plan merely because a new user turn, risk assessment, or auditor note arrived.
 Before submitting a worker batch, you may predeclare its exact task input via the optional
 dispatch field of orche_advisor; then submit that same task input after reading the verdict.
 Otherwise the task gate stages the scope without spawning, and asks for a review before retry.
@@ -40,14 +40,14 @@ Weigh the short verdict and changes; retain final decisions. Do not call another
 Orche-Advisor completed. Existing watchdog advisors retain their existing responsibilities.`;
 
 const ORCHESTRATE_GUIDANCE = `<system-notice>
-Orche-Advisor integration for this orchestrate request. These checkpoints are REQUIRED, not optional:
-1. After scoping and forming the initial plan, call orche_advisor with checkpoint "initial-plan".
-   Read its result before dispatching workers or implementing the plan, even if the work stays inline.
-2. After verifying a phase, call with checkpoint "phase-boundary" before advancing to the next phase.
-   For a changed decomposition, major replan, scope expansion, or repeated failures, review the updated
-   snapshot before dispatching or implementing the revised plan, using the corresponding checkpoint.
-3. One review covers overlapping checkpoints. Do not repeat an unchanged snapshot, review each worker
-   completion, or request another review merely because the reviewer returned. No final-only review.
+Orche-Advisor integration: review applies to execution checkpoints, not every conversational turn.
+1. Scope and plan first. Before implementing or dispatching, use the execution gate's current
+   requirement. An existing receipt covers unchanged work; do not request another initial-plan
+   review just because this orchestration notice appears again.
+2. Verified phase transitions and material scope changes require renewed review before execution.
+3. Status answers, read-only inspection and discussing new auditor findings do not require a review.
+   Findings remain recorded and may invalidate permission for the next mutation or dispatch.
+   One review covers overlapping checkpoints. Never review each worker completion or reviewer response.
 4. Send only the seven compact snapshot fields. Use actual task state and 'None' for empty fields.
    Wait for the result, weigh it, and continue the task in the same turn; you remain the orchestrator.
    If the tool fails, report the failure rather than claiming review succeeded; do not loop on retries.

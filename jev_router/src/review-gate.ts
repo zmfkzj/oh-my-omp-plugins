@@ -54,6 +54,8 @@ function requestText(branch: readonly SessionEntry[]): string {
 }
 interface Requirement {
   requestHash: string;
+  workId: string;
+  goal: string;
   required: boolean;
   checkpoint: Checkpoint;
   reason: string;
@@ -65,6 +67,7 @@ interface Requirement {
 export interface ReviewScope {
   key: string;
   requestHash: string;
+  workId: string;
   planHash: string;
   findingRevision: string;
   checkpoint: Checkpoint;
@@ -102,12 +105,13 @@ export class ReviewGate {
       const entry = branch[i];
       if (entry?.type !== "custom" || entry.customType !== STATE || !record(entry.data)) continue;
       const d = entry.data;
-      if (typeof d.required !== "boolean" || typeof d.checkpoint !== "string" || !CHECKPOINTS.includes(d.checkpoint) ||
+      if (typeof d.requestHash !== "string" || typeof d.required !== "boolean" || typeof d.checkpoint !== "string" || !CHECKPOINTS.includes(d.checkpoint) ||
           typeof d.reason !== "string" || typeof d.generation !== "number" || !Array.isArray(d.dispatches)) continue;
       if (!d.dispatches.every(item => record(item) && typeof item.key === "string" && typeof item.summary === "string")) continue;
-      return d as unknown as Requirement;
+      return { ...d, workId: typeof d.workId === "string" ? d.workId : hash(entry.id),
+        goal: typeof d.goal === "string" ? d.goal : "Historical task" } as unknown as Requirement;
     }
-    return { requestHash, required: false, checkpoint: "initial-plan", reason: "No mandatory review for this request.", generation: 0, dispatches: [] };
+    return { workId: hash(["unassigned", requestHash]), goal: "", requestHash, required: false, checkpoint: "initial-plan", reason: "No mandatory review for this request.", generation: 0, dispatches: [] };
   }
   scope(ctx: ExtensionContext): ReviewScope {
     const branch = this.branch(ctx);
@@ -122,7 +126,7 @@ export class ReviewGate {
       abandoned: task.status === "abandoned" || undefined,
     })) })));
     const revision = findingRevision(branch);
-    const key = hash({ version: 2, planHash, generation: state.generation, dispatches: state.dispatches.map(d => d.key).sort(), revision });
+    const key = hash({ version: 3, workId: state.workId, planHash, generation: state.generation, dispatches: state.dispatches.map(d => d.key).sort(), revision });
     let satisfied = false;
     let failed = false;
     for (let i = branch.length - 1; i >= 0; i--) {
@@ -132,20 +136,37 @@ export class ReviewGate {
       if (e.customType === WAIVER && e.data.author === "user" && typeof e.data.reason === "string") { satisfied = true; break; }
       if (e.customType === FAILURE) { failed = true; break; }
     }
-    return { key, requestHash, planHash, findingRevision: revision, checkpoint: state.checkpoint,
+    return { key, requestHash, workId: state.workId, planHash, findingRevision: revision, checkpoint: state.checkpoint,
       required: state.required, reason: state.reason, dispatchSummary: state.dispatches.map(d => d.summary), satisfied, failed };
   }
-  noteDecision(ctx: ExtensionContext, required: boolean, checkpoint: Checkpoint, reason: string, request: string): void {
+  noteDecision(ctx: ExtensionContext, required: boolean, checkpoint: Checkpoint, reason: string, request: string, workScope?: string): boolean | undefined {
     if (!this.enabled() || !mainSessionOf(ctx)) return;
+    const branch = this.branch(ctx);
     const requestHash = hash(request.trim());
-    const before = this.requirement(this.branch(ctx), requestHash);
-    const newRiskScope = required && before.requestHash !== requestHash && checkpoint === "initial-plan";
-    const generation = before.generation + (newRiskScope ||
-      (required && ["phase-boundary", "repeated-failure", "replan"].includes(checkpoint)) ? 1 : 0);
-    const next = { ...before, requestHash, required: required || before.required,
-      promptReview: required, checkpoint: required ? checkpoint : before.checkpoint,
+    const active = this.requirement(branch, requestHash);
+    let before = active;
+    if (workScope && workScope !== "NEW" && workScope !== "CONTINUE") {
+      const index = branch.findLastIndex(entry => entry.type === "custom" && entry.customType === STATE &&
+        record(entry.data) && entry.data.workId === workScope);
+      if (index >= 0) before = this.requirement(branch.slice(0, index + 1), requestHash);
+      else workScope = "NEW"; // Unknown or off-branch scopes cannot inherit approval.
+    }
+    const fresh = workScope === "NEW" ||
+      (!workScope && checkpoint === "initial-plan" && active.requestHash !== requestHash);
+    if (fresh) {
+      before = { workId: hash({ requestHash, parent: branch.at(-1)?.id ?? null }),
+        goal: request.trim().slice(0, 600), requestHash, required: false, checkpoint: "initial-plan",
+        reason: "New work scope", generation: 0, dispatches: [] };
+    }
+    const deferred = checkpoint === "initial-plan";
+    const generation = before.generation +
+      (required && ["phase-boundary", "repeated-failure", "replan"].includes(checkpoint) ? 1 : 0);
+    const next: Requirement = { ...before, requestHash, required: required || before.required,
+      goal: before.goal || request.trim().slice(0, 600),
+      promptReview: required && !deferred, checkpoint: required ? checkpoint : before.checkpoint,
       reason: required ? reason.slice(0, 500) : before.reason, generation };
-    if (JSON.stringify(next) !== JSON.stringify(before)) this.persist(ctx, STATE, next);
+    if (JSON.stringify(next) !== JSON.stringify(active)) this.persist(ctx, STATE, next);
+    return next.required;
   }
   observeToolResult(ctx: ExtensionContext, event: ToolResultEvent): void {
     if (!this.enabled() || !mainSessionOf(ctx) || !event.isError ||
@@ -191,6 +212,15 @@ export class ReviewGate {
     if (this.persistenceFault && !["read", "grep", "glob", "find", "ask", "orche_advisor", "review_findings"].includes(name)) {
       return { block: true, reason: "Review state could not be persisted. Restore session storage and obtain a successful review before execution." };
     }
+    // Initial risk is only an assessment. Read-only work must not turn it into
+    // a mandatory review, even when new findings invalidate an old receipt.
+    if (["read", "grep", "glob", "find", "web_search", "ask", "todo", "wait", "orche_advisor", "review_findings"].includes(name)) return undefined;
+    if (name === "write" && typeof input.path === "string" && Object.hasOwn(OBSERVATION_DEVICES, input.path)) return undefined;
+    if (name === "task") {
+      const call = normalizeCall(input);
+      if (call && call.items.every(item => ["scout", "librarian"].includes(String(item.agent)))) return undefined;
+    }
+    this.activateExecution(ctx);
     let scope = this.scope(ctx);
     if (name === "task") {
       const call = normalizeCall(input);
@@ -206,7 +236,7 @@ export class ReviewGate {
       }
       if (!scope.required) {
         for (const item of implementations) {
-          const key = `${ctx.sessionManager.getSessionId()}:${scope.requestHash}:${workerName(item.agent)}`;
+          const key = `${ctx.sessionManager.getSessionId()}:${scope.workId}:${workerName(item.agent)}`;
           this.nativePermits.set(key, (this.nativePermits.get(key) ?? 0) + 1);
         }
       }
@@ -218,9 +248,18 @@ export class ReviewGate {
     if (name === "write" && typeof input.path === "string" && Object.hasOwn(OBSERVATION_DEVICES, input.path)) return undefined;
     return this.denial(scope);
   }
+  private activateExecution(ctx: ExtensionContext): void {
+    const scope = this.scope(ctx);
+    const state = this.requirement(this.branch(ctx), scope.requestHash);
+    if (!state.required) return;
+    if (!scope.satisfied && !state.promptReview) {
+      this.persist(ctx, STATE, { ...state, promptReview: true });
+    }
+  }
   beforeSpawn(ctx: ExtensionContext, event: BeforeSubagentSpawnEvent): BeforeSubagentSpawnEventResult | undefined {
     if (!this.enabled() || !mainSessionOf(ctx) || ["scout", "librarian"].includes(event.agent)) return undefined;
     if (this.persistenceFault) return { block: true, reason: "Review state storage failed; worker dispatch remains blocked." };
+    this.activateExecution(ctx);
     if (event.invocationKind === "eval") {
       // This shared host hook runs before allocation/execution for eval agent()
       // and workpool too. Its contract exposes identity/model, not task text.
@@ -243,7 +282,7 @@ export class ReviewGate {
       this.stage(ctx, key, `eval worker ${event.spawnKey ?? "unnamed"} (${event.agent}); caller fingerprint ${sourceKey}; model patterns ${event.patterns.join(", ")}`,
         "fan-out", "Programmatic implementation dispatch must be reviewed before execution. Use stable agent names when retrying.", true);
     } else if (!this.scope(ctx).required) {
-      const key = `${ctx.sessionManager.getSessionId()}:${this.scope(ctx).requestHash}:${workerName(event.agent)}`;
+      const key = `${ctx.sessionManager.getSessionId()}:${this.scope(ctx).workId}:${workerName(event.agent)}`;
       const permits = this.nativePermits.get(key) ?? 0;
       if (permits > 0) {
         this.nativePermits.set(key, permits - 1);
@@ -258,15 +297,17 @@ export class ReviewGate {
   }
   complete(ctx: ExtensionContext, captured: ReviewScope, success: boolean, requestId?: string): void {
     const state = this.requirement(this.branch(ctx), captured.requestHash);
-    if (!state.required) this.persist(ctx, STATE, { ...state, required: true,
-      checkpoint: captured.checkpoint, reason: "A review was requested for this execution scope; later changes need a fresh receipt." });
+    // A late result cannot clear or promote another task's state.
+    if (this.scope(ctx).key === captured.key && state.workId === captured.workId) {
+      this.persist(ctx, STATE, { ...state, required: true, promptReview: !success });
+    }
     this.persist(ctx, success ? RECEIPT : FAILURE, { scopeKey: captured.key, success, requestId, checkpoint: captured.checkpoint,
       planHash: captured.planHash, findingRevision: captured.findingRevision, at: Date.now() });
   }
   guidance(ctx: ExtensionContext): string | undefined {
     if (!this.enabled() || !mainSessionOf(ctx)) return undefined;
     const scope = this.scope(ctx);
-    if (this.requirement(this.branch(ctx), scope.requestHash).promptReview === false) return undefined;
+    if (!scope.failed && this.requirement(this.branch(ctx), scope.requestHash).promptReview === false) return undefined;
     if (!scope.required || scope.satisfied) return undefined;
     return `<system-notice>Mandatory orchestration review pending: ${scope.checkpoint}. ${scope.reason}\n` +
       "Read-only scoping and todo planning may continue; implementation and worker dispatch are blocked until a successful scope-bound orche_advisor review. " +

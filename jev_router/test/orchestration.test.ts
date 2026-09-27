@@ -70,7 +70,7 @@ function build(decider: ScriptedDecider, options: {
 	apiKey?: string | undefined;
 	config?: Partial<JevRouterConfig>;
 	/** Runs after each recorded review decision; throwing stands in for a failed requirement store. */
-	onReview?: (call: ReviewCall) => void;
+	onReview?: (call: ReviewCall) => boolean | void;
 } = {}) {
 	const currentModel = options.session?.currentModel ?? fakeModel("p", "explicit-choice");
 	const branch = options.session?.branch ?? [];
@@ -87,7 +87,7 @@ function build(decider: ScriptedDecider, options: {
 		onReviewDecision: (_ctx, required, checkpoint, reason, request) => {
 			const call = { required, checkpoint, reason, request };
 			reviews.push(call);
-			options.onReview?.(call);
+			return options.onReview?.(call);
 		},
 	});
 	return { router, branch, currentModel, reviews, ...fake };
@@ -419,6 +419,20 @@ describe("committed todo promotion", () => {
 		await expect(router.beginTurn(ctx, PROMPT)).rejects.toThrow("requirement store unavailable");
 		await router.onTodoResult(ctx, todoResult(withStatus(start, "Parser", "completed"), "done", "todo-3"));
 		expect(reviews).toEqual([review(true, "initial-plan", "review-required"), review(true, "phase-boundary", "phase-completed")]);
+	});
+
+	test("a continuation inherits its task's phase-review obligation even when new risk is optional", async () => {
+		const start = plan("Finish accepted implementation");
+		const branch = [entry(user(PROMPT)), committedPlan(start), entry(toolCall("finish", "done"))];
+		const { router, ctx, reviews } = build(new ScriptedDecider(DEFAULT), {
+			session: { branch }, onReview: () => true,
+		});
+		await router.beginTurn(ctx, PROMPT);
+		await router.onTodoResult(ctx, todoResult(withStatus(start, "Finish accepted implementation", "completed"), "done", "finish"));
+		expect(reviews).toEqual([
+			review(false, "initial-plan", "review-optional"),
+			review(true, "phase-boundary", "phase-completed"),
+		]);
 	});
 
 	test("failed, view, status-only, malformed and unrelated results cannot promote", async () => {

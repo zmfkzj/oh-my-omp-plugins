@@ -175,7 +175,8 @@ export interface OrchestrationRouterDeps {
 		checkpoint: ReviewCheckpoint,
 		reason: string,
 		request: string,
-	) => void;
+		workScope?: string,
+	) => boolean | void;
 }
 
 interface TurnState {
@@ -321,15 +322,17 @@ export class OrchestrationRouter {
 		if (!result) return;
 		if (!result.ok) {
 			// A missing risk assessment is not evidence that review is optional.
-			this.#notify(ctx, turn, true, checkpoint, result.reason);
+			this.#notify(ctx, turn, true, checkpoint, result.reason, phases ? "CONTINUE" : "NEW");
 			return;
 		}
 		const { decision } = result;
 		// Unavailable orchestration withholds only the route; review is still assessed.
 		const outcome: OrchestrationRoute = decision.confident && gate.orchestrationAllowed ? decision.top : "DEFAULT";
 		// A missing or unconfident review answer requires review.
-		const reviewReason = Object.keys(decision.review.probabilities).length === 0
-			? "review-missing"
+		const reviewReason = decision.workScopeUncertain
+			? "work-scope-uncertain"
+			: Object.keys(decision.review.probabilities).length === 0
+				? "review-missing"
 			: !decision.review.confident
 				? "review-uncertain"
 				: decision.review.top === "REQUIRED" ? "review-required" : "review-optional";
@@ -367,7 +370,8 @@ export class OrchestrationRouter {
 			turn.notice = this.#buildNotice(turn.session);
 			turn.noticeAnchor = todoToolCallId;
 		}
-		this.#notify(ctx, turn, reviewRequired, checkpoint, outcome === "ORCHESTRATE" ? "orchestrate" : reviewReason);
+		this.#notify(ctx, turn, reviewRequired, checkpoint, outcome === "ORCHESTRATE" ? "orchestrate" : reviewReason,
+			phases ? "CONTINUE" : decision.workScope ?? "NEW");
 	}
 
 	/** One bounded Jev request; failures are recorded here. Undefined once the turn is superseded. */
@@ -404,9 +408,10 @@ export class OrchestrationRouter {
 	}
 
 	/** Handler failures propagate: an unrecorded requirement fails its hook rather than passing as reviewed. */
-	#notify(ctx: ExtensionContext, turn: TurnState, required: boolean, checkpoint: ReviewCheckpoint, reason: string): void {
+	#notify(ctx: ExtensionContext, turn: TurnState, required: boolean, checkpoint: ReviewCheckpoint, reason: string, workScope = "CONTINUE"): void {
 		if (required) turn.reviewRequired = true;
-		this.#deps.onReviewDecision?.(ctx, required, checkpoint, reason, turn.prompt);
+		const inherited = this.#deps.onReviewDecision?.(ctx, required, checkpoint, reason, turn.prompt, workScope);
+		if (inherited === true) turn.reviewRequired = true;
 	}
 
 	#buildNotice(session: AgentSession): AgentMessage {

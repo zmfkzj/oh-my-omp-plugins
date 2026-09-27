@@ -192,7 +192,7 @@ describe("scope-bound review enforcement", () => {
     const reviewed = gate.scope(ctx).key;
     branch.push({ type: "message", id: "followup", parentId: null, timestamp: "2026-09-27T00:00:00Z",
       message: { role: "user", content: "Continue the same work", timestamp: 2 } });
-    gate.noteDecision(ctx, false, "initial-plan", "review-optional", "Continue the same work");
+    gate.noteDecision(ctx, false, "initial-plan", "review-optional", "Continue the same work", "CONTINUE");
     expect(gate.scope(ctx).key).toBe(reviewed);
     expect(gate.beforeTool(ctx, "task", batch)).toBeUndefined();
     expect(gate.guidance(ctx)).toBeUndefined();
@@ -204,7 +204,7 @@ describe("scope-bound review enforcement", () => {
     addFinding(branch);
     branch.push({ type: "message", id: "status", parentId: null, timestamp: "2026-09-27T00:00:00Z",
       message: { role: "user", content: "What is the status?", timestamp: 2 } });
-    gate.noteDecision(ctx, false, "initial-plan", "review-optional", "What is the status?");
+    gate.noteDecision(ctx, false, "initial-plan", "review-optional", "What is the status?", "CONTINUE");
     expect(gate.guidance(ctx)).toBeUndefined();
     expect(gate.beforeTool(ctx, "read", {})).toBeUndefined();
     expect(gate.beforeTool(ctx, "edit", {})?.block).toBe(true);
@@ -227,5 +227,101 @@ describe("scope-bound review enforcement", () => {
     }
     expect(gate.beforeTool(ctx, "write", { path: "xd://mcp__roblox_studio_execute_luau", content: "{}" })?.block).toBe(true);
     expect(gate.beforeTool(ctx, "write", { path: "/tmp/project.ts", content: "change" })?.block).toBe(true);
+  });
+  for (const reason of ["review-required", "review-uncertain"]) {
+    test(`${reason} follow-up never prompts or changes generation before execution`, () => {
+      const { gate, ctx, branch } = fixture();
+      gate.noteDecision(ctx, true, "initial-plan", "review-required", goal);
+      gate.complete(ctx, gate.scope(ctx), true);
+      const key = gate.scope(ctx).key;
+      const request = "I opened Studio; what now?";
+      branch.push({ type: "message", id: "follow", parentId: null, timestamp: "2026-09-27T00:00:00Z",
+        message: { role: "user", content: request, timestamp: 2 } });
+      gate.noteDecision(ctx, true, "initial-plan", reason, request, "CONTINUE");
+      expect(gate.scope(ctx).key).toBe(key);
+      expect(gate.guidance(ctx)).toBeUndefined();
+      addFinding(branch, "Studio discovery has no open place");
+      expect(gate.guidance(ctx)).toBeUndefined();
+      expect(gate.beforeTool(ctx, "read", {})).toBeUndefined();
+      expect(gate.beforeTool(ctx, "edit", {})?.block).toBe(true);
+      expect(gate.guidance(ctx)).toBeDefined();
+    });
+  }
+  test("new finding after an executed review is silent until the next mutation", () => {
+    const { gate, ctx, branch } = fixture();
+    gate.beforeTool(ctx, "task", batch);
+    gate.complete(ctx, gate.scope(ctx), true);
+    addFinding(branch, "New evidence needs checking");
+    expect(gate.guidance(ctx)).toBeUndefined();
+    expect(gate.beforeTool(ctx, "read", {})).toBeUndefined();
+    expect(gate.beforeTool(ctx, "edit", {})?.block).toBe(true);
+    expect(gate.guidance(ctx)).toBeDefined();
+  });
+  test("failed review retains failure guidance without reopening automatic retries", () => {
+    const { gate, ctx } = fixture();
+    gate.noteDecision(ctx, true, "initial-plan", "review-required", goal);
+    gate.beforeTool(ctx, "edit", {});
+    gate.complete(ctx, gate.scope(ctx), false);
+    expect(gate.scope(ctx)).toMatchObject({ failed: true, satisfied: false });
+    expect(gate.guidance(ctx)).toContain("Previous review failed");
+  });
+  test("waiving new risk uses the same scope key as its first execution", async () => {
+    const { gate, ctx, branch } = fixture();
+    gate.noteDecision(ctx, true, "initial-plan", "review-required", goal);
+    gate.beforeTool(ctx, "edit", {});
+    gate.complete(ctx, gate.scope(ctx), true);
+    const request = "Migrate a new payment store";
+    branch.push({ type: "message", id: "payment-request", parentId: null, timestamp: "2026-09-27T00:00:00Z",
+      message: { role: "user", content: request, timestamp: 2 } });
+    gate.noteDecision(ctx, true, "initial-plan", "review-required", request);
+    const newScope = gate.scope(ctx);
+    expect(newScope.satisfied).toBe(false);
+    const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+    gate.registerCommands({ registerCommand(name: string, command: Parameters<ExtensionAPI["registerCommand"]>[1]) { commands.set(name, command); } } as unknown as ExtensionAPI);
+    const commandCtx = Object.assign(ctx, { ui: { notify() {} } }) as unknown as ExtensionCommandContext;
+    await commands.get("review-waive")!.handler(`${newScope.key} Accept this specific migration risk`, commandCtx);
+    expect(gate.beforeTool(ctx, "edit", {})).toBeUndefined();
+    expect(gate.scope(ctx).key).toBe(newScope.key);
+  });
+  test("unrelated optional work is isolated and resuming an old scope restores its obligation", () => {
+    const { gate, ctx, branch } = fixture();
+    gate.noteDecision(ctx, true, "initial-plan", "review-required", goal, "NEW");
+    gate.beforeTool(ctx, "task", batch);
+    const old = gate.scope(ctx);
+    const request = "Rename a local variable in an unrelated demo";
+    branch.push({ type: "message", id: "demo", parentId: null, timestamp: "2026-09-27T00:00:00Z",
+      message: { role: "user", content: request, timestamp: 2 } });
+    gate.noteDecision(ctx, false, "initial-plan", "review-optional", request, "NEW");
+    expect(gate.scope(ctx)).toMatchObject({ required: false, dispatchSummary: [] });
+    expect(gate.scope(ctx).workId).not.toBe(old.workId);
+    expect(gate.beforeTool(ctx, "edit", {})).toBeUndefined();
+    gate.noteDecision(ctx, false, "initial-plan", "review-optional", "Resume the release", old.workId);
+    expect(gate.scope(ctx)).toMatchObject({ required: true, workId: old.workId, dispatchSummary: old.dispatchSummary });
+    expect(gate.beforeTool(ctx, "edit", {})?.block).toBe(true);
+  });
+  test("same-scope REQUIRED continuation reuses approval for actual edit and dispatch", () => {
+    const { gate, ctx, branch } = fixture();
+    gate.noteDecision(ctx, true, "initial-plan", "review-required", goal, "NEW");
+    gate.beforeTool(ctx, "task", batch);
+    const reviewed = gate.scope(ctx);
+    gate.complete(ctx, reviewed, true);
+    branch.push({ type: "message", id: "continue", parentId: null, timestamp: "2026-09-27T00:00:00Z",
+      message: { role: "user", content: "Continue the accepted plan", timestamp: 2 } });
+    gate.noteDecision(ctx, true, "initial-plan", "review-required", "Continue the accepted plan", reviewed.workId);
+    expect(gate.beforeTool(ctx, "edit", {})).toBeUndefined();
+    expect(gate.beforeTool(ctx, "task", batch)).toBeUndefined();
+    expect(gate.scope(ctx).key).toBe(reviewed.key);
+  });
+  test("late old review never changes the currently selected task", () => {
+    const { gate, ctx, branch } = fixture();
+    gate.noteDecision(ctx, true, "initial-plan", "review-required", goal, "NEW");
+    const old = gate.scope(ctx);
+    branch.push({ type: "message", id: "new", parentId: null, timestamp: "2026-09-27T00:00:00Z",
+      message: { role: "user", content: "Unrelated question", timestamp: 2 } });
+    gate.noteDecision(ctx, false, "initial-plan", "review-optional", "Unrelated question", "NEW");
+    const current = gate.scope(ctx);
+    gate.complete(ctx, old, false);
+    expect(gate.scope(ctx)).toEqual(current);
+    expect(gate.guidance(ctx)).toBeUndefined();
   });
 });
