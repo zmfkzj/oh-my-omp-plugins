@@ -7,7 +7,7 @@ import type { Checkpoint, ReviewFailureKind } from "./advisor-review.ts";
 import { mainSessionOf } from "./host.ts";
 import { latestCommittedTodoPlan, visibleText } from "./routing-context.ts";
 import { findingRevision } from "./findings.ts";
-import { normalizeCall } from "./task-routing.ts";
+import { normalizeCall, type NormalizedCall } from "./task-routing.ts";
 
 const STATE = "jev-review-requirement";
 const RECEIPT = "jev-review-receipt";
@@ -42,6 +42,15 @@ function canonical(value: unknown): unknown {
 function workerName(value: unknown): string {
   return typeof value === "string" && !["task-easy", "task-hard", "task-challenge"].includes(value) ? value : "task";
 }
+function nativeDispatch(call: NormalizedCall): Requirement["dispatches"] {
+  const dispatch = { context: call.context ?? "", tasks: call.items.map(item => ({ ...item, agent: workerName(item.agent) })) };
+  const batchKey = hash(canonical(dispatch));
+  return call.items.map((item, index) => {
+    const task = String(item.task ?? "");
+    return { key: hash({ batchKey, index }),
+      summary: `${String(item.name ?? `worker-${index + 1}`)} (${workerName(item.agent)}): ${task.slice(0, 450)}${task.length > 450 ? " [task text truncated]" : ""}` };
+  });
+}
 function requestText(branch: readonly SessionEntry[]): string {
   for (let i = branch.length - 1; i >= 0; i--) {
     const entry = branch[i];
@@ -63,6 +72,8 @@ interface Requirement {
   /** Latest assessment controls prompting, not outstanding execution protection. */
   promptReview?: boolean;
   dispatches: { key: string; summary: string }[];
+  /** Older records contain irreversibly truncated aggregate batch summaries. */
+  dispatchVersion?: 1;
 }
 export interface ReviewScope {
   key: string;
@@ -74,6 +85,7 @@ export interface ReviewScope {
   required: boolean;
   reason: string;
   dispatchSummary: string[];
+  dispatchComplete: boolean;
   satisfied: boolean;
   failed: boolean;
   unavailable: boolean;
@@ -82,7 +94,10 @@ const CHECKPOINTS: readonly string[] = ["initial-plan", "fan-out", "repeated-fai
 
 /** Receipts are branch-local facts, not a process-wide "review happened" flag. */
 export class ReviewGate {
-  private readonly nativePermits = new Map<string, number>();
+  private readonly nativePermits = new Map<string, {
+    scopeKey: string;
+    workers: { agent: string; name?: string }[];
+  }>();
   private persistenceFault = false;
   private readonly noticeAnchors = new Map<string, { index: number; timestamp: number }>();
   constructor(private readonly enabled: () => boolean = () => true) {}
@@ -95,6 +110,11 @@ export class ReviewGate {
     if (!primary) throw new Error("Review gate is primary-only.");
     try {
       primary.sessionManager.appendCustomEntry(type, data);
+      const sessionId = ctx.sessionManager.getSessionId();
+      const permits = this.nativePermits.get(sessionId);
+      if (permits && (permits.scopeKey !== this.scope(ctx).key || type === FAILURE)) {
+        this.nativePermits.delete(sessionId);
+      }
       this.persistenceFault = false;
     } catch (error) {
       this.persistenceFault = true;
@@ -127,7 +147,7 @@ export class ReviewGate {
       abandoned: task.status === "abandoned" || undefined,
     })) })));
     const revision = findingRevision(branch);
-    const key = hash({ version: 3, workId: state.workId, planHash, generation: state.generation, dispatches: state.dispatches.map(d => d.key).sort(), revision });
+    const key = hash({ version: 4, workId: state.workId, planHash, generation: state.generation, dispatches: state.dispatches.map(d => d.key).sort(), revision });
     let satisfied = false;
     let failed = false;
     let unavailable = false;
@@ -144,7 +164,8 @@ export class ReviewGate {
       }
     }
     return { key, requestHash, workId: state.workId, planHash, findingRevision: revision, checkpoint: state.checkpoint,
-      required: state.required, reason: state.reason, dispatchSummary: state.dispatches.map(d => d.summary), satisfied, failed, unavailable };
+      required: state.required, reason: state.reason, dispatchSummary: state.dispatches.map(d => d.summary),
+      dispatchComplete: state.dispatches.length === 0 || state.dispatchVersion === 1, satisfied, failed, unavailable };
   }
   noteDecision(ctx: ExtensionContext, required: boolean, checkpoint: Checkpoint, reason: string, request: string, workScope?: string): boolean | undefined {
     if (!this.enabled() || !mainSessionOf(ctx)) return;
@@ -198,14 +219,16 @@ export class ReviewGate {
       }
     }
   }
-  private stage(ctx: ExtensionContext, key: string, summary: string, checkpoint: Checkpoint, reason: string, accumulate = false): void {
+  private stage(ctx: ExtensionContext, entries: Requirement["dispatches"], checkpoint: Checkpoint, reason: string, accumulate = false): void {
     const scope = this.scope(ctx);
     const state = this.requirement(this.branch(ctx), scope.requestHash);
-    const exists = state.dispatches.some(d => d.key === key);
-    const dispatches = exists ? state.dispatches : accumulate
-      ? [...state.dispatches, { key, summary: summary.slice(0, 1600) }]
-      : [{ key, summary: summary.slice(0, 1600) }];
-    const next = { ...state, required: true, promptReview: true, checkpoint, reason, dispatches };
+    if (accumulate && !scope.dispatchComplete) {
+      throw new Error("Legacy dispatch summaries are incomplete. Restage the exact task input or withdraw with dispatch: null before reviewing.");
+    }
+    const dispatches = accumulate
+      ? [...state.dispatches, ...entries.filter(entry => !state.dispatches.some(d => d.key === entry.key))]
+      : entries;
+    const next: Requirement = { ...state, required: true, promptReview: true, checkpoint, reason, dispatches, dispatchVersion: 1 };
     if (JSON.stringify(next) !== JSON.stringify(state)) this.persist(ctx, STATE, next);
   }
   private denial(scope: ReviewScope): ToolCallEventResult {
@@ -237,16 +260,19 @@ export class ReviewGate {
       const implementations = call.items.filter(item => !["scout", "librarian"].includes(String(item.agent)));
       if (implementations.length === 0) return undefined;
       if (implementations.length >= 2 || scope.required) {
-        const dispatch = { context: call.context ?? "", tasks: call.items.map(item => ({ ...item, agent: workerName(item.agent) })) };
-        this.stage(ctx, hash(canonical(dispatch)), call.items.map(item => `${String(item.name ?? "worker")} (${workerName(item.agent)}): ${String(item.task ?? "").slice(0, 450)}`).join("\n"),
+        this.stage(ctx, nativeDispatch(call),
           scope.required ? scope.checkpoint : "fan-out", implementations.length >= 2 ? "Multiple implementation workers require a scope-bound pre-dispatch review." : scope.reason);
         scope = this.scope(ctx);
       }
-      if (!scope.required) {
+      if (!scope.required || scope.satisfied) {
+        const sessionId = ctx.sessionManager.getSessionId();
+        const prior = this.nativePermits.get(sessionId);
+        const permits = prior?.scopeKey === scope.key ? prior : { scopeKey: scope.key, workers: [] };
         for (const item of implementations) {
-          const key = `${ctx.sessionManager.getSessionId()}:${scope.workId}:${workerName(item.agent)}`;
-          this.nativePermits.set(key, (this.nativePermits.get(key) ?? 0) + 1);
+          permits.workers.push({ agent: workerName(item.agent),
+            name: typeof item.name === "string" ? item.name.trim() || undefined : undefined });
         }
+        this.nativePermits.set(sessionId, permits);
       }
     }
     if (!scope.required || scope.satisfied) return undefined;
@@ -287,18 +313,33 @@ export class ReviewGate {
       }
       const sourceKey = hash(invocation ?? null);
       const key = hash({ agent: workerName(event.agent), patterns: event.patterns, spawnKey: event.spawnKey ?? "unnamed", sourceKey });
-      this.stage(ctx, key, `eval worker ${event.spawnKey ?? "unnamed"} (${event.agent}); caller fingerprint ${sourceKey}; model patterns ${event.patterns.join(", ")}`,
+      this.stage(ctx, [{ key, summary: `eval worker ${event.spawnKey ?? "unnamed"} (${event.agent}); caller fingerprint ${sourceKey}; model patterns ${event.patterns.join(", ")}` }],
         "fan-out", "Programmatic implementation dispatch must be reviewed before execution. Use stable agent names when retrying.", true);
-    } else if (!this.scope(ctx).required) {
-      const key = `${ctx.sessionManager.getSessionId()}:${this.scope(ctx).workId}:${workerName(event.agent)}`;
-      const permits = this.nativePermits.get(key) ?? 0;
-      if (permits > 0) {
-        this.nativePermits.set(key, permits - 1);
-        return undefined;
+    } else {
+      const scope = this.scope(ctx);
+      if (scope.required && !scope.satisfied) return this.denial(scope);
+      const sessionId = ctx.sessionManager.getSessionId();
+      const permits = this.nativePermits.get(sessionId);
+      if (permits?.scopeKey === scope.key) {
+        const agent = workerName(event.agent);
+        // Native async handles retain the requested name, with a numeric
+        // collision suffix. Unnamed tasks get generated handles from the host.
+        let index = permits.workers.findIndex(worker => worker.agent === agent && worker.name === event.spawnKey);
+        if (index < 0) index = permits.workers.findIndex(worker => {
+          if (worker.agent !== agent || !worker.name || !event.spawnKey?.startsWith(`${worker.name}-`)) return false;
+          const suffix = event.spawnKey.slice(worker.name.length + 1);
+          return /^[1-9]\d*$/.test(suffix) && Number(suffix) >= 2;
+        });
+        if (index < 0) index = permits.workers.findIndex(worker => worker.agent === agent && worker.name === undefined);
+        if (index >= 0) {
+          permits.workers.splice(index, 1);
+          if (permits.workers.length === 0) this.nativePermits.delete(sessionId);
+          return undefined;
+        }
+      } else {
+        this.nativePermits.delete(sessionId);
       }
-      this.stage(ctx, hash({ agent: event.agent, spawnKey: event.spawnKey, patterns: event.patterns }),
-        `Unstaged worker ${event.spawnKey ?? "unnamed"} (${event.agent})`, "fan-out",
-        "Implementation dispatch bypassed the task preflight; review its scope before spawning.", true);
+      return { block: true, reason: "Native worker has no matching task preflight permit for the current scope. Submit the exact task input through task before retrying; a parent-only review does not authorize worker spawning." };
     }
     const scope = this.scope(ctx);
     return scope.required && !scope.satisfied ? this.denial(scope) : undefined;
@@ -353,8 +394,7 @@ export class ReviewGate {
     const call = normalizeCall(input);
     if (!call) throw new Error("dispatch must contain a task or a non-empty tasks array. Use dispatch: null to withdraw staged dispatches; omit dispatch to retain them.");
     if (call.items.some(item => typeof item.task !== "string" || !item.task.trim())) throw new Error("Every planned worker needs task text.");
-    const dispatch = { context: call.context ?? "", tasks: call.items.map(item => ({ ...item, agent: workerName(item.agent) })) };
-    this.stage(ctx, hash(canonical(dispatch)), call.items.map(item => `${String(item.name ?? "worker")} (${workerName(item.agent)}): ${String(item.task).slice(0, 450)}`).join("\n"), "fan-out", "Review the predeclared worker dispatch before execution.");
+    this.stage(ctx, nativeDispatch(call), "fan-out", "Review the predeclared worker dispatch before execution.");
   }
   registerCommands(pi: ExtensionAPI): void {
     pi.registerCommand("review-status", {

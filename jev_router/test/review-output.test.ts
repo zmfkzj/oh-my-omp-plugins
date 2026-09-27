@@ -2,6 +2,9 @@ import { describe, expect, test } from "bun:test";
 import type { Effort, AssistantMessage, Usage } from "@oh-my-pi/pi-ai";
 import example from "../examples/initial-plan.json";
 import { AUDITOR_NAME } from "../src/verification-auditor.ts";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { ReviewGate } from "../src/review-gate.ts";
+import { makeSession, registerAsMain, clearRegistry } from "./harness.ts";
 import {
   prepareReviewInput,
   runReview,
@@ -394,6 +397,35 @@ describe("review completion boundary", () => {
     expect(result.details.findingsOmitted).toBe(2);
   });
 
+  test("a long native batch preserves its last worker and marks excerpt truncation", async () => {
+    const branch: SessionEntry[] = [];
+    const { session, ctx } = makeSession({ branch });
+    Object.assign(session.sessionManager, { appendCustomEntry(customType: string, data: unknown) {
+      const id = `entry-${branch.length}`;
+      branch.push({ type: "custom", id, parentId: null, timestamp: "2026-09-27T00:00:00Z", customType, data });
+      return id;
+    } });
+    registerAsMain(session);
+    try {
+      const gate = new ReviewGate();
+      gate.stageDispatch(ctx, { tasks: [
+        ...Array.from({ length: 4 }, (_, index) => ({ name: `Worker${index}`, task: "x".repeat(500) })),
+        { name: "CriticalLast", task: "Migrate production payment storage" },
+      ] });
+      const scope = gate.scope(ctx);
+      expect(scope.dispatchSummary).toHaveLength(5);
+      const { content } = await promptFor({ ...prepared, executionScope: {
+        key: scope.key, checkpoint: scope.checkpoint, planHash: scope.planHash, dispatchSummary: scope.dispatchSummary,
+      } });
+      expect(content).toContain("Staged dispatches (5 total)");
+      expect(content).toContain("CriticalLast (task): Migrate production payment storage");
+      expect(content).toContain("[truncated]");
+      for (let index = 0; index < 4; index++) expect(content).toContain(`Worker${index}`);
+    } finally {
+      clearRegistry();
+    }
+  });
+
   test("renders the plugin's execution scope apart from the snapshot, with bounded dispatches", async () => {
     const scoped: PreparedReview = {
       ...prepared,
@@ -415,6 +447,7 @@ describe("review completion boundary", () => {
     expect(dispatches.length).toBeLessThan(30);
     expect(dispatches.join("").length).toBeLessThanOrEqual(2000 + dispatches.length * 4);
     expect(block).toContain(`${30 - dispatches.length} more not shown`);
+    expect(block).toContain("[truncated]");
   });
 
   test("sends only the checkpoint and snapshot when no findings or scope exist", async () => {

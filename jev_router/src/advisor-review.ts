@@ -526,15 +526,19 @@ function formatExecutionScope(scope: ExecutionScope): string {
   ];
   let remaining = DISPATCH_SUMMARY_LIMIT;
   let shown = 0;
+  const marker = " [truncated]";
   for (const summary of scope.dispatchSummary) {
-    if (remaining <= 0) break;
-    const text = collapse(summary, remaining) || "(no summary)";
+    if (remaining <= marker.length) break;
+    const limit = Math.min(remaining, Math.max(96, Math.floor(remaining / (total - shown))));
+    const full = collapse(summary, summary.length) || "(no summary)";
+    const text = full.length > limit ? full.slice(0, limit - marker.length) + marker : full;
     lines.push(`  - ${text}`);
     remaining -= text.length;
     shown++;
   }
   if (shown < total) {
-    lines.push(`  - ${total - shown} more not shown (${DISPATCH_SUMMARY_LIMIT}-character cap)`);
+    const names = scope.dispatchSummary.slice(shown, shown + 5).map(summary => summary.split(": ", 1)[0]).join("; ");
+    lines.push(`  - ${total - shown} more not shown (${DISPATCH_SUMMARY_LIMIT}-character cap): ${collapse(names, 400)}${total - shown > 5 ? "; additional workers omitted" : ""}`);
   }
   return lines.join("\n");
 }

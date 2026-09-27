@@ -56,6 +56,43 @@ describe("scope-bound review enforcement", () => {
     expect(gate.beforeSpawn(ctx, event)).toBeUndefined();
     expect(gate.beforeSpawn(ctx, { ...event, spawnKey: "Unstaged" })?.block).toBe(true);
   });
+  test("parent approval never authorizes native workers without task preflight", () => {
+    const { gate, ctx } = fixture();
+    gate.noteDecision(ctx, true, "initial-plan", "Parent integration", goal);
+    gate.complete(ctx, gate.scope(ctx), true);
+    const event = { type: "before_subagent_spawn" as const, agent: "task", invocationKind: "task" as const, patterns: [], spawnKey: "Compensation" };
+    expect(gate.beforeSpawn(ctx, event)?.block).toBe(true);
+    expect(gate.beforeTool(ctx, "task", batch)?.block).toBe(true);
+    gate.complete(ctx, gate.scope(ctx), true);
+    // A review alone is not a permit: the actual task call must pass preflight.
+    expect(gate.beforeSpawn(ctx, event)?.block).toBe(true);
+    expect(gate.beforeTool(ctx, "task", batch)).toBeUndefined();
+    expect(gate.beforeSpawn(ctx, { ...event, spawnKey: "Unreviewed" })?.block).toBe(true);
+    expect(gate.beforeSpawn(ctx, { ...event, agent: "task-hard", spawnKey: "Compensation-2" })).toBeUndefined();
+    expect(gate.beforeSpawn(ctx, event)?.block).toBe(true);
+    expect(gate.beforeSpawn(ctx, { ...event, spawnKey: "Telemetry" })).toBeUndefined();
+  });
+  test("native permits cannot cross findings, withdrawal, or plugin reload", () => {
+    const { gate, ctx, branch } = fixture();
+    gate.stageDispatch(ctx, batch);
+    gate.complete(ctx, gate.scope(ctx), true);
+    gate.beforeTool(ctx, "task", batch);
+    const event = { type: "before_subagent_spawn" as const, agent: "task", invocationKind: "task" as const, patterns: [], spawnKey: "Compensation" };
+    addFinding(branch);
+    gate.complete(ctx, gate.scope(ctx), true);
+    expect(gate.beforeSpawn(ctx, event)?.block).toBe(true);
+    gate.beforeTool(ctx, "task", batch);
+    gate.stageDispatch(ctx, null);
+    gate.complete(ctx, gate.scope(ctx), true);
+    expect(gate.beforeSpawn(ctx, event)?.block).toBe(true);
+    gate.stageDispatch(ctx, batch);
+    gate.complete(ctx, gate.scope(ctx), true);
+    gate.beforeTool(ctx, "task", batch);
+    const reloaded = new ReviewGate();
+    expect(reloaded.beforeSpawn(ctx, event)?.block).toBe(true);
+    expect(reloaded.beforeTool(ctx, "task", batch)).toBeUndefined();
+    expect(reloaded.beforeSpawn(ctx, event)).toBeUndefined();
+  });
   test("eval implementation spawning hits the shared gate and survives reload", () => {
     const { gate, ctx } = fixture();
     const event = { type: "before_subagent_spawn" as const, agent: "task", invocationKind: "eval" as const, patterns: ["@task"], spawnKey: "StableWorker" };

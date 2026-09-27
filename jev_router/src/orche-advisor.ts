@@ -18,6 +18,7 @@ import {
   AUDITOR_SLUG,
   prepareReviewInput,
   runReview,
+  type ReviewResult,
 } from "./advisor-review.ts";
 import { collectFindings, findingRevision } from "./findings.ts";
 import { ReviewGate } from "./review-gate.ts";
@@ -96,7 +97,7 @@ async function installVerificationAuditor(primary: AgentSession): Promise<void> 
 }
 
 
-export function registerOrcheAdvisor(pi: ExtensionAPI, gate = new ReviewGate()): void {
+export function registerOrcheAdvisor(pi: ExtensionAPI, gate = new ReviewGate(), reviewer: typeof runReview = runReview): void {
   const z = pi.zod;
   const field = z.string().min(1).max(2000);
   let inFlight = false;
@@ -170,10 +171,16 @@ export function registerOrcheAdvisor(pi: ExtensionAPI, gate = new ReviewGate()):
         throw new Error(
           "An orchestration review is already running; use its result before requesting another.",
         );
+      const prepared = prepareReviewInput(
+        { checkpoint: params.checkpoint, snapshot: params.snapshot },
+        collectFindings(primary.sessionManager.getBranch()),
+      );
       if (params.dispatch !== undefined) gate.stageDispatch(ctx, params.dispatch);
       const branch = primary.sessionManager.getBranch();
-      const prepared = prepareReviewInput({ checkpoint: params.checkpoint, snapshot: params.snapshot }, collectFindings(branch));
       const capturedScope = gate.scope(ctx);
+      if (!capturedScope.dispatchComplete) throw new Error(
+        "Legacy dispatch summaries are incomplete. Supply the exact dispatch again, or dispatch: null for parent-only work; no waiver is needed to restage.",
+      );
       if (capturedScope.failed) throw new Error(
         "This exact plan was rejected. Address the verdict and revise the committed plan before requesting review. " +
         "Execution remains blocked; only the user can authorize an unchanged retry or waive review.",
@@ -224,7 +231,7 @@ export function registerOrcheAdvisor(pi: ExtensionAPI, gate = new ReviewGate()):
       }
 
       inFlight = true;
-      let reviewRecorded = false;
+      let completedReview: ReviewResult | undefined;
       try {
         await primary.settings.reloadFromDisk();
         const selection = resolveRoleSelection(
@@ -241,10 +248,8 @@ export function registerOrcheAdvisor(pi: ExtensionAPI, gate = new ReviewGate()):
           sessionId: primary.sessionManager.getSessionId(),
           parentId: primary.sessionManager.getLeafId(),
         };
-        const review = await runReview(prepared, selection, ctx.modelRegistry, signal);
-        gate.complete(ctx, capturedScope, !review.isError, review.details.requestId, review.details.failureKind);
-        reviewRecorded = true;
-        const scopeStale = gate.scope(ctx).key !== capturedScope.key;
+        const review = await reviewer(prepared, selection, ctx.modelRegistry, signal);
+        completedReview = review;
         for (const attempt of review.details.attempts) {
           const entryId = primary.sessionManager.appendModelUsage(
             {
@@ -261,13 +266,18 @@ export function registerOrcheAdvisor(pi: ExtensionAPI, gate = new ReviewGate()):
           );
           if (entryId) usageOwner.parentId = entryId;
         }
-        return {
+        const scopeStale = gate.scope(ctx).key !== capturedScope.key;
+        const result = {
           ...(review.isError ? { isError: true } : {}),
-          content: [{ type: "text", text: review.text + (scopeStale ? "\n\nScope changed while review ran; this result does not authorize the new scope." : "") }],
+          content: [{ type: "text" as const, text: review.text + (scopeStale ? "\n\nScope changed while review ran; this result does not authorize the new scope." : "") }],
           details: { ...review.details, scopeKey: capturedScope.key, findingRevision: revision, scopeStale },
         };
+        // Commit permission only after all fallible review bookkeeping succeeds.
+        gate.complete(ctx, capturedScope, !review.isError, review.details.requestId, review.details.failureKind);
+        return result;
       } catch (error) {
-        if (!reviewRecorded) gate.complete(ctx, capturedScope, false, undefined, "provider_error");
+        gate.complete(ctx, capturedScope, false, completedReview?.details.requestId,
+          completedReview?.details.failureKind ?? "provider_error");
         throw error;
       } finally {
         inFlight = false;

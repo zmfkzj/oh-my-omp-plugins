@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import example from "../examples/initial-plan.json";
-import { prepareReviewInput, ROLE, TOOL } from "../src/advisor-review.ts";
+import { prepareReviewInput, runReview, ROLE, TOOL, type ReviewSelection } from "../src/advisor-review.ts";
 import { registerJevRouter } from "../src/index.ts";
 import { AUDITOR_NAME, VERIFICATION_AUDITOR } from "../src/verification-auditor.ts";
 import { registerOrcheAdvisor } from "../src/orche-advisor.ts";
@@ -184,4 +184,103 @@ test("tool retains omitted dispatch, withdraws explicitly, and re-reviews a revi
   await expect(execute(example)).rejects.toThrow("Configure modelRoles.orche-advisor");
   expect(gate.scope(ctx)).toMatchObject({ failed: false, unavailable: true, satisfied: false });
   expect(gate.scope(ctx).key).not.toBe(withdrawn.key);
+});
+
+function reviewExecutionFixture(verdict: "KEEP" | "REPLAN" = "KEEP") {
+  const branch: SessionEntry[] = [];
+  const { session, ctx } = makeSession({ branch });
+  const storage = { failUsage: false, modelCalls: 0 };
+  Object.assign(session.sessionManager, {
+    getLeafId: () => branch.at(-1)?.id ?? null,
+    appendCustomEntry(customType: string, data: unknown) {
+      const id = `state-${branch.length}`;
+      branch.push({ type: "custom", id, parentId: null, timestamp: "2026-09-27T00:00:00Z", customType, data });
+      return id;
+    },
+    appendModelUsage() {
+      if (storage.failUsage) throw new Error("Usage storage unavailable");
+      return undefined;
+    },
+  });
+  registerAsMain(session);
+  const model = { id: "review-fixture", provider: "openai", api: "openai-completions",
+    name: "Review fixture", reasoning: false, input: ["text"], contextWindow: 100000, maxTokens: 4096,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } as ReviewSelection["model"];
+  session.settings.setModelRole(ROLE, `${model.provider}/${model.id}`);
+  Object.assign(session.settings, { reloadFromDisk: async () => {} });
+  Object.assign(ctx.modelRegistry, { getAvailable: () => [model], getApiKey: async () => "fixture-key" });
+  const gate = new ReviewGate();
+  gate.noteDecision(ctx, true, "initial-plan", "Review required", "Integration");
+  let tool!: Parameters<ExtensionAPI["registerTool"]>[0];
+  registerOrcheAdvisor({ zod: z, on() {},
+    registerTool(registered: Parameters<ExtensionAPI["registerTool"]>[0]) { tool = registered; },
+  } as unknown as ExtensionAPI, gate, (prepared, selection, registry, signal) =>
+    runReview(prepared, selection, registry, signal, async () => {
+      storage.modelCalls++;
+      return {
+        role: "assistant", api: model.api, provider: model.provider, model: model.id, timestamp: 0,
+        stopReason: "stop", content: [{ type: "text", text: `VERDICT: ${verdict}\n\nISSUES:\n- None\n\nORCHESTRATION CHANGES:\n- None\n\nAVOID:\n- None` }],
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      };
+    }));
+  return { branch, session, ctx, gate, tool, storage };
+}
+
+test("failed review bookkeeping withholds approval and recovers on the same scope", async () => {
+  const { ctx, gate, tool, storage } = reviewExecutionFixture();
+  const scope = gate.scope(ctx);
+  storage.failUsage = true;
+  await expect(tool.execute("failed", example, new AbortController().signal, () => {}, ctx))
+    .rejects.toThrow("Usage storage unavailable");
+  expect(gate.scope(ctx)).toMatchObject({ key: scope.key, satisfied: false, unavailable: true });
+  expect(gate.beforeTool(ctx, "edit", {})?.block).toBe(true);
+  storage.failUsage = false;
+  const result = await tool.execute("recovered", example, new AbortController().signal, () => {}, ctx);
+  expect(result.isError).not.toBe(true);
+  expect(storage.modelCalls).toBe(2);
+  expect(gate.scope(ctx)).toMatchObject({ key: scope.key, satisfied: true });
+  expect(gate.beforeTool(ctx, "edit", {})).toBeUndefined();
+});
+
+test("bookkeeping failure cannot downgrade an actual rejection to an unavailable review", async () => {
+  const { ctx, gate, tool, storage } = reviewExecutionFixture("REPLAN");
+  storage.failUsage = true;
+  await expect(tool.execute("rejected", example, new AbortController().signal, () => {}, ctx))
+    .rejects.toThrow("Usage storage unavailable");
+  expect(gate.scope(ctx)).toMatchObject({ satisfied: false, failed: true, unavailable: false });
+  storage.failUsage = false;
+  await expect(tool.execute("unchanged", example, new AbortController().signal, () => {}, ctx))
+    .rejects.toThrow("This exact plan was rejected");
+  expect(storage.modelCalls).toBe(1);
+});
+
+for (const dispatch of [null, { tasks: [{ name: "Replacement", task: "Replace existing contract" }] }]) {
+  test(`oversized snapshot cannot ${dispatch === null ? "withdraw" : "replace"} an approved dispatch`, async () => {
+    const { ctx, gate, tool, branch, storage } = reviewExecutionFixture();
+    gate.stageDispatch(ctx, { tasks: [{ name: "Original", task: "Preserve this contract" }] });
+    gate.complete(ctx, gate.scope(ctx), true);
+    const before = gate.scope(ctx);
+    const entries = branch.length;
+    const snapshot = Object.fromEntries(Object.keys(example.snapshot).map(key => [key, "x".repeat(1500)]));
+    const input = (tool.parameters as unknown as z.ZodType).parse({ checkpoint: "replan", dispatch, snapshot });
+    await expect(tool.execute("invalid", input, new AbortController().signal, () => {}, ctx)).rejects.toThrow("8000");
+    expect(gate.scope(ctx)).toEqual(before);
+    expect(branch.length).toBe(entries);
+    expect(storage.modelCalls).toBe(0);
+  });
+}
+
+test("legacy aggregate summaries require restaging or withdrawal before a review", async () => {
+  const { ctx, gate, tool, branch, storage } = reviewExecutionFixture();
+  const state = branch.findLast(entry => entry.type === "custom" && entry.customType === "jev-review-requirement");
+  if (!state || state.type !== "custom") throw new Error("Missing requirement");
+  Object.assign(state.data as object, { dispatches: [{ key: "old-batch", summary: "Worker1: truncated batch" }] });
+  await expect(tool.execute("legacy", example, new AbortController().signal, () => {}, ctx))
+    .rejects.toThrow("Legacy dispatch summaries");
+  expect(storage.modelCalls).toBe(0);
+  const result = await tool.execute("parent-review", { ...example, dispatch: null },
+    new AbortController().signal, () => {}, ctx);
+  expect(result.isError).not.toBe(true);
+  expect(gate.scope(ctx)).toMatchObject({ dispatchComplete: true, dispatchSummary: [], satisfied: true });
 });

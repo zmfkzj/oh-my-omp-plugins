@@ -90,9 +90,14 @@ Otherwise routine work can still use an optional review.
 - A required-review scope blocks inline mutation and arbitrary execution too:
   edit/write/bash/eval and unknown tools are blocked. Native read/search, todo,
   ask, finding management and the reviewer remain available for scoping.
-- The shared `before_subagent_spawn` hook checks task and eval `agent()`/workpool
-  dispatches before artifact allocation/child execution. An ordinary single
-  worker cleared by the task preflight receives one native spawn permit.
+- The shared `before_subagent_spawn` hook checks actual task and eval
+  `agent()`/workpool dispatches before child execution. Every native worker,
+  including one in an approved required-review batch, needs a single-use permit
+  from an accepted `task` preflight. Parent-only approval is not a spawn permit.
+  Permits bind the current scope, worker type and requested name; host collision
+  suffixes are accepted. Unnamed workers consume a scope/type-bound allowance
+  because the host generates their handle after preflight. Reload loses permits:
+  resubmit the exact task input, reusing its review if the scope is unchanged.
 - Programmatic implementation spawns require review. The eval hook binds the
   caller's recorded eval arguments, spawn identity and model patterns; the host
   event does not expose its expanded assignment or mutable kernel state. Use
@@ -107,6 +112,11 @@ a flat `task`). The tool binds and separately summarizes that scope, reviews it,
 then the caller submits the unchanged task input. Otherwise the first task
 attempt is blocked before execution and stages its scope for review. One review
 can cover initial planning and fan-out; do not review every worker completion.
+
+Native batches retain one summary per worker, not a single truncated batch
+string. The review prompt counts all contracts, marks shortened excerpts, and
+reports omitted workers with a bounded identity list when the prompt budget is
+exhausted. Full task inputs remain bound into the scope hash.
 
 Dispatch has three explicit states:
 
@@ -125,6 +135,9 @@ Even a rejected batch can therefore be withdrawn and the remaining parent work
 reviewed. Execution stays blocked until that new review succeeds. Repeating null
 when nothing is staged is idempotent: it cannot clear a parent-plan rejection.
 Re-submitting a withdrawn worker batch requires a fresh review.
+The complete snapshot is validated before any replacement or withdrawal is
+persisted. Invalid input, including an oversized combined snapshot, leaves the
+existing dispatch and approval untouched.
 
 For a rejected parent plan, change the semantic committed todo plan (or staged
 contract) before re-review. Editing snapshot prose alone does not change the
@@ -153,8 +166,11 @@ mutation. Outstanding requirements are not erased by conversational follow-ups.
 Known observation-only Studio devices (discovery, state, logs, instance/
 script/tree inspection) bypass the mutation gate despite using the `write` transport.
 Arbitrary Luau, shell/eval execution and unknown devices remain gated.
-The new receipt identity intentionally does not accept old-format receipts; an
-existing session may need one fresh review before subsequent mutation.
+Receipt format v4 does not accept earlier receipts, so existing sessions need a
+fresh review before subsequent required-review execution. Legacy aggregate
+dispatch summaries may already have lost worker text: restage the exact task
+input, or use `dispatch: null` to withdraw them. They cannot be reviewed as if
+complete. Neither recovery path requires a user waiver.
 
 Failure is not permission, but an unavailable reviewer is not a rejected plan:
 
@@ -166,6 +182,10 @@ Failure is not permission, but an unavailable reviewer is not a rejected plan:
   again after recovery; neither `/review-retry` nor a waiver is required, and
   recovery does not rotate the scope key. Do not loop on an unchanged outage.
   Historical untyped failure records also remain reviewable after reload.
+- Approval is committed only after review usage bookkeeping succeeds. A storage
+  failure after `KEEP` leaves execution blocked and the same scope retryable.
+  If the reviewer actually rejected the plan, bookkeeping failure preserves
+  that rejection rather than converting it into a retryable provider outage.
 - `REPLAN` and `ESCALATE` are substantive rejections, not approval. Address the
   verdict and revise the committed plan before re-review; an unchanged rejected
   scope cannot make another paid review automatically. `KEEP`/`ADJUST` permit
