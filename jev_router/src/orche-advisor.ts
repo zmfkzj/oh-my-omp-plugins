@@ -29,6 +29,9 @@ Do not call initial-plan merely because a new user turn, risk assessment, or aud
 Before submitting a worker batch, you may predeclare its exact task input via the optional
 dispatch field of orche_advisor; then submit that same task input after reading the verdict.
 Otherwise the task gate stages the scope without spawning, and asks for a review before retry.
+Omit dispatch to retain staged contracts; pass dispatch: null to withdraw them when moving to
+parent-only work. Withdrawal requires a fresh review and does not cancel running workers.
+Never use tasks: [] or invent a dummy task to clear a dispatch.
 Changed plans, dispatch contracts, phase boundaries or finding state invalidate previous receipts.
 Do not loop on unchanged failures. Provider/runtime errors are not rejected plans: the tool makes
 one bounded provider retry, and later review remains available after recovery without a waiver.
@@ -137,13 +140,13 @@ export function registerOrcheAdvisor(pi: ExtensionAPI, gate = new ReviewGate()):
   pi.registerTool({
     name: TOOL,
     label: "Orche-Advisor",
-    description: `Request a scope-bound orchestration checkpoint review. Primary only. Required by review gates independently of DEFAULT/ORCHESTRATE; successful results authorize only the current plan, dispatch and finding revision. Optional dispatch predeclares the exact task input. Use the seven snapshot fields; ${AUDITOR_NAME} findings and resolution evidence attach automatically. Failed reviews do not authorize execution.`,
+    description: `Request a scope-bound orchestration checkpoint review. Primary only. Required by review gates independently of DEFAULT/ORCHESTRATE; successful results authorize only the current plan, dispatch and finding revision. Omit dispatch to retain staged contracts, pass a task input to replace them, or null to withdraw them and review parent-only work. Withdrawal does not cancel workers. Use the seven snapshot fields; ${AUDITOR_NAME} findings and resolution evidence attach automatically. Failed reviews do not authorize execution.`,
     loadMode: "essential",
     deferrable: false,
     parameters: z
       .object({
         checkpoint: z.enum(CHECKPOINTS),
-        dispatch: z.record(z.unknown()).optional().describe("Optional exact planned task input (context/tasks or a flat task), reviewed before dispatch. Omit to use already-staged scope."),
+        dispatch: z.record(z.unknown()).nullable().optional().describe("Omit to retain staged contracts. Supply exact planned task input (context/tasks or a flat task) to replace them. Supply null to withdraw all staged dispatches and review parent-only work; this does not cancel running workers. Empty tasks arrays are invalid."),
         snapshot: z
           .object({
             goal: field,
@@ -167,7 +170,7 @@ export function registerOrcheAdvisor(pi: ExtensionAPI, gate = new ReviewGate()):
         throw new Error(
           "An orchestration review is already running; use its result before requesting another.",
         );
-      if (params.dispatch) gate.stageDispatch(ctx, params.dispatch);
+      if (params.dispatch !== undefined) gate.stageDispatch(ctx, params.dispatch);
       const branch = primary.sessionManager.getBranch();
       const prepared = prepareReviewInput({ checkpoint: params.checkpoint, snapshot: params.snapshot }, collectFindings(branch));
       const capturedScope = gate.scope(ctx);

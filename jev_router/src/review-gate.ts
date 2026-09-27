@@ -337,10 +337,21 @@ export class ReviewGate {
       content, display: false, attribution: "agent", timestamp: anchor.timestamp });
     return next;
   }
-  /** Optionally predeclare exact dispatch so one review covers planning and fan-out. */
-  stageDispatch(ctx: ExtensionContext, input: Record<string, unknown>): void {
+  /** Replace planned dispatch, or explicitly withdraw it without approving execution. */
+  stageDispatch(ctx: ExtensionContext, input: Record<string, unknown> | null): void {
+    if (input === null) {
+      const scope = this.scope(ctx);
+      const state = this.requirement(this.branch(ctx), scope.requestHash);
+      if (state.dispatches.length === 0) return;
+      // A new generation prevents withdrawal from resurrecting a receipt for
+      // an earlier parent-only plan or for a later re-staging of the old batch.
+      this.persist(ctx, STATE, { ...state, dispatches: [], generation: state.generation + 1,
+        required: true, promptReview: true, checkpoint: "replan",
+        reason: "Worker dispatch withdrawn; review the remaining parent-owned scope before execution." });
+      return;
+    }
     const call = normalizeCall(input);
-    if (!call) throw new Error("dispatch must contain a task or a non-empty tasks array.");
+    if (!call) throw new Error("dispatch must contain a task or a non-empty tasks array. Use dispatch: null to withdraw staged dispatches; omit dispatch to retain them.");
     if (call.items.some(item => typeof item.task !== "string" || !item.task.trim())) throw new Error("Every planned worker needs task text.");
     const dispatch = { context: call.context ?? "", tasks: call.items.map(item => ({ ...item, agent: workerName(item.agent) })) };
     this.stage(ctx, hash(canonical(dispatch)), call.items.map(item => `${String(item.name ?? "worker")} (${workerName(item.agent)}): ${String(item.task).slice(0, 450)}`).join("\n"), "fan-out", "Review the predeclared worker dispatch before execution.");

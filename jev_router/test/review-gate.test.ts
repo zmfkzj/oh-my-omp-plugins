@@ -74,6 +74,46 @@ describe("scope-bound review enforcement", () => {
     const changed = { ...batch, tasks: [{ ...batch.tasks[0], task: "Change compensation semantics" }, batch.tasks[1]] };
     expect(gate.beforeTool(ctx, "task", changed)?.block).toBe(true);
   });
+  test("withdrawal invalidates old parent and worker receipts and survives reload", () => {
+    const { gate, ctx } = fixture();
+    gate.noteDecision(ctx, true, "initial-plan", "release", goal);
+    const parent = gate.scope(ctx);
+    gate.complete(ctx, parent, true);
+    gate.stageDispatch(ctx, batch);
+    const workers = gate.scope(ctx);
+    gate.complete(ctx, workers, true);
+    gate.stageDispatch(ctx, null);
+    const withdrawn = gate.scope(ctx);
+    expect(withdrawn).toMatchObject({ required: true, checkpoint: "replan", satisfied: false, dispatchSummary: [] });
+    expect(withdrawn.key).not.toBe(parent.key);
+    expect(withdrawn.key).not.toBe(workers.key);
+    const reloaded = new ReviewGate();
+    expect(reloaded.scope(ctx)).toEqual(withdrawn);
+    reloaded.stageDispatch(ctx, null);
+    expect(reloaded.scope(ctx)).toEqual(withdrawn);
+    expect(reloaded.beforeTool(ctx, "edit", {})?.block).toBe(true);
+    reloaded.complete(ctx, workers, true);
+    expect(reloaded.beforeTool(ctx, "edit", {})?.block).toBe(true);
+    reloaded.complete(ctx, withdrawn, true);
+    expect(reloaded.beforeTool(ctx, "edit", {})).toBeUndefined();
+    expect(reloaded.beforeTool(ctx, "task", batch)?.block).toBe(true);
+    expect(reloaded.scope(ctx).key).not.toBe(workers.key);
+  });
+  test("empty batches cannot silently withdraw, and repeated withdrawal cannot erase rejection", () => {
+    const { gate, ctx } = fixture();
+    gate.stageDispatch(ctx, batch);
+    const staged = gate.scope(ctx);
+    expect(() => gate.stageDispatch(ctx, { context: "withdraw", tasks: [] })).toThrow();
+    expect(gate.scope(ctx)).toEqual(staged);
+    gate.complete(ctx, staged, false);
+    gate.stageDispatch(ctx, null);
+    const withdrawn = gate.scope(ctx);
+    expect(withdrawn).toMatchObject({ failed: false, satisfied: false, dispatchSummary: [] });
+    gate.complete(ctx, withdrawn, false);
+    gate.stageDispatch(ctx, null);
+    expect(gate.scope(ctx)).toMatchObject({ key: withdrawn.key, failed: true, satisfied: false });
+    expect(gate.beforeTool(ctx, "edit", {})?.block).toBe(true);
+  });
   test("plan edits and new finding evidence invalidate completed reviews", () => {
     const { gate, ctx, branch } = fixture();
     addPlan(branch, ["Persistent compensation"]);

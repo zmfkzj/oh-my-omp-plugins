@@ -142,3 +142,46 @@ test("new required work cannot reuse an identical old snapshot and erase its ris
     .rejects.toThrow("Configure modelRoles.orche-advisor");
   expect(gate.beforeTool(ctx, "edit", {})?.block).toBe(true);
 });
+
+test("tool retains omitted dispatch, withdraws explicitly, and re-reviews a revised rejected plan", async () => {
+  const branch: SessionEntry[] = [];
+  const { session, ctx } = makeSession({ branch });
+  Object.assign(session.sessionManager, {
+    appendCustomEntry(customType: string, data: unknown) {
+      const id = `state-${branch.length}`;
+      branch.push({ type: "custom", id, parentId: null, timestamp: "2026-09-27T00:00:00Z", customType, data });
+      return id;
+    },
+  });
+  registerAsMain(session);
+  const gate = new ReviewGate();
+  gate.stageDispatch(ctx, { tasks: [{ task: "Implement preview", name: "Preview" }] });
+  const staged = gate.scope(ctx);
+  gate.complete(ctx, staged, false, "rejection", "review_rejected");
+  let reviewer: Parameters<ExtensionAPI["registerTool"]>[0] | undefined;
+  registerOrcheAdvisor({ zod: z, on() {},
+    registerTool(tool: Parameters<ExtensionAPI["registerTool"]>[0]) { reviewer = tool; },
+  } as unknown as ExtensionAPI, gate);
+  Object.assign(session.settings, { reloadFromDisk: async () => {} });
+  Object.assign(ctx.modelRegistry, { getAvailable: () => [] });
+  const execute = (params: unknown) => reviewer!.execute("review", params as typeof example,
+    new AbortController().signal, () => {}, ctx);
+  await expect(execute(example)).rejects.toThrow("This exact plan was rejected");
+  expect(gate.scope(ctx).key).toBe(staged.key);
+  // Exercise the public schema as well as the handler: null must reach staging.
+  const withdrawnInput = (reviewer!.parameters as unknown as z.ZodType).parse({ ...example, dispatch: null });
+  await expect(execute(withdrawnInput)).rejects.toThrow("Configure modelRoles.orche-advisor");
+  const withdrawn = gate.scope(ctx);
+  expect(withdrawn).toMatchObject({ failed: false, unavailable: true, dispatchSummary: [], satisfied: false });
+  expect(withdrawn.key).not.toBe(staged.key);
+  expect(gate.beforeTool(ctx, "edit", {})?.block).toBe(true);
+  gate.complete(ctx, withdrawn, false, "parent-rejected", "review_rejected");
+  await expect(execute(withdrawnInput)).rejects.toThrow("This exact plan was rejected");
+  // A semantic committed-plan revision changes the scope, unlike snapshot prose.
+  branch.push({ type: "custom", id: "revised-plan", parentId: null, timestamp: "2026-09-27T01:00:00Z",
+    customType: "user_todo_edit", data: { phases: [{ name: "Integration",
+      tasks: [{ content: "Address rejected integration ordering", status: "pending" }] }] } });
+  await expect(execute(example)).rejects.toThrow("Configure modelRoles.orche-advisor");
+  expect(gate.scope(ctx)).toMatchObject({ failed: false, unavailable: true, satisfied: false });
+  expect(gate.scope(ctx).key).not.toBe(withdrawn.key);
+});

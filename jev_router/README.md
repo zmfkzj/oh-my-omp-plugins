@@ -108,6 +108,28 @@ then the caller submits the unchanged task input. Otherwise the first task
 attempt is blocked before execution and stages its scope for review. One review
 can cover initial planning and fan-out; do not review every worker completion.
 
+Dispatch has three explicit states:
+
+| `dispatch` input | Meaning |
+| --- | --- |
+| Omitted | Retain the currently staged contracts. |
+| Non-empty task input | Replace staged contracts with this exact batch. |
+| `null` | Withdraw all staged contracts and review parent-only work. |
+
+For completed or abandoned worker plans, call `orche_advisor` with
+`checkpoint: "replan"`, the current seven-field snapshot, and `dispatch: null`.
+Do not send `tasks: []` or invent a dummy worker. Withdrawal clears the review's
+dispatch summary, not running workers or their results. It creates a new
+generation, invalidating old parent/worker receipts without granting permission.
+Even a rejected batch can therefore be withdrawn and the remaining parent work
+reviewed. Execution stays blocked until that new review succeeds. Repeating null
+when nothing is staged is idempotent: it cannot clear a parent-plan rejection.
+Re-submitting a withdrawn worker batch requires a fresh review.
+
+For a rejected parent plan, change the semantic committed todo plan (or staged
+contract) before re-review. Editing snapshot prose alone does not change the
+scope and cannot evade a rejection.
+
 Receipts persist on the active branch and bind a work ID, semantic todo plan,
 blockers/abandonments, review generation, exact native dispatch and finding revision.
 Scope identity is finalized at assessment, before any review, waiver or execution.
