@@ -3,8 +3,6 @@
 # Reviews are required for orchestrate checkpoints, independent high-risk plans,
 # and multi-implementation-worker dispatch. Reload with /reload-plugins after changes.
 modelRoles:
-  task_easy: "@smol"
-  task_hard: "@task" # retain any existing assignment
-  task_challenge: "@slow"
+  # task: <provider/model> # OMP's native task worker model; keep any existing assignment
   orche-advisor: openai-codex/gpt-6-astra:xhigh
   verification-auditor: "@smol" # separate from ADVISOR; customize independently

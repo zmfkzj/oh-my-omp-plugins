@@ -1,29 +1,26 @@
 /**
- * omp-jev-router — two bounded routing decisions for OMP.
+ * omp-jev-router — plugin-owned coordination over OMP's native `task` worker.
  *
- *   1. DEFAULT or native ORCHESTRATE; the primary model never changes.
- *   2. EASY, HARD or CHALLENGE for generic `task` workers.
+ *   1. DEFAULT or ORCHESTRATE plus an independent review requirement; the
+ *      primary model never changes.
+ *   2. Generic workers stay OMP's native `task` agent. Its model comes from the
+ *      user's `@task` role; task calls are never classified or rewritten.
  *
- * OMP's own SMOL vs TASK decision, its specialized agents, and every explicit
- * user choice are left exactly as they are.
+ * Specialized and custom agents, and every explicit user choice, are left
+ * exactly as they are.
  */
-import path from "node:path";
 import { registerOrcheAdvisor } from "./orche-advisor.ts";
 import { AUDITOR_ROLE } from "./verification-auditor.ts";
 import { registerCommands } from "./commands.ts";
 import { TYPESAFE_PROVIDER } from "./credentials.ts";
-import { mainSessionOf, sessionOf } from "./host.ts";
+import { mainSessionOf } from "./host.ts";
 import { registerFindingTools } from "./findings.ts";
 import { JevRouterRuntime } from "./runtime.ts";
-import { GENERIC_TASK_AGENT } from "./task-routing.ts";
-import { EASY_AGENT_NAME, HARD_AGENT_NAME, CHALLENGE_AGENT_NAME } from "./deep-agent.ts";
 import { trackWorkerUsage } from "./worker-usage.ts";
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
-export const TASK_TOOL = "task";
-
-export function registerJevRouter(pi: ExtensionAPI, packageRoot: string): JevRouterRuntime {
-	const runtime = new JevRouterRuntime(pi, packageRoot);
+export function registerJevRouter(pi: ExtensionAPI): JevRouterRuntime {
+	const runtime = new JevRouterRuntime(pi);
 	pi.setLabel("Jev Router");
 	registerCommands(pi, runtime);
 	runtime.reviewGate.registerCommands(pi);
@@ -32,37 +29,17 @@ export function registerJevRouter(pi: ExtensionAPI, packageRoot: string): JevRou
 	pi.on("session_start", async (_event, ctx) => {
 		runtime.bindContext(ctx);
 		await runtime.reloadConfig(ctx.cwd);
-		// Register missing custom roles without changing user assignments.
+		// Register the auditor role without changing user assignments.
 		// Child sessions inherit settings and must not write global configuration.
 		const settings = mainSessionOf(ctx)?.settings;
-		if (settings) {
-			let changed = false;
-			for (const [role, fallback] of [
-				[runtime.config.easyTaskRole, "@smol"],
-				[runtime.config.hardTaskRole, "@task"],
-				[runtime.config.challengeTaskRole, "@slow"],
-			] as const) {
-				if (settings.getModelRole(role) === undefined) {
-					settings.setModelRole(role, fallback);
-					changed = true;
-				}
-			}
-			if (settings.getModelRole(AUDITOR_ROLE) === undefined) {
-				settings.setModelRole(AUDITOR_ROLE, "@smol");
-				changed = true;
-			}
-			if (changed) await settings.flush();
+		if (settings && settings.getModelRole(AUDITOR_ROLE) === undefined) {
+			settings.setModelRole(AUDITOR_ROLE, "@smol");
+			await settings.flush();
 		}
 		await runtime.telemetry.load();
-		// Materialize + verify the tier aliases before the first `task` call.
-		await runtime.surveyAgents(ctx.cwd, sessionOf(ctx)?.settings);
-		runtime.checkTierRoles(ctx);
 	});
-	const stopUsageTracking = trackWorkerUsage(
-		pi.events,
-		runtime.telemetry,
-		new Set([GENERIC_TASK_AGENT, EASY_AGENT_NAME, HARD_AGENT_NAME, CHALLENGE_AGENT_NAME]),
-	);
+	// Live usage covers workers named `task`, whichever native path spawned them.
+	const stopUsageTracking = trackWorkerUsage(pi.events, runtime.telemetry);
 
 	// Initial classification sees bounded visible history and the committed plan.
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -83,19 +60,17 @@ export function registerJevRouter(pi: ExtensionAPI, packageRoot: string): JevRou
 		if (event.willContinue !== true) runtime.orchestration.endTurn();
 	});
 
-	// Reconsider orchestration after a successful plan commit, never model selection.
+	// Settle review permits for the finished call; reconsider orchestration after a plan commit.
 	pi.on("tool_result", async (event, ctx) => {
 		runtime.bindContext(ctx);
 		runtime.reviewGate.observeToolResult(ctx, event);
 		if (event.toolName === "todo") await runtime.orchestration.onTodoResult(ctx, event);
 	});
 
-	pi.on("tool_call", async (event, ctx) => {
+	// Review enforcement only: the native task input is never rewritten.
+	pi.on("tool_call", (event, ctx) => {
 		runtime.bindContext(ctx);
-		const blocked = runtime.reviewGate.beforeTool(ctx, event.toolName, { ...event.input });
-		if (blocked) return blocked;
-		if (event.toolName !== TASK_TOOL) return undefined;
-		return await runtime.task.route(pi, event.toolCallId, event.input);
+		return runtime.reviewGate.beforeTool(ctx, event.toolName, { ...event.input }, event.toolCallId);
 	});
 
 	// Shared preflight covers actual task dispatch and eval agent()/workpool.
@@ -106,17 +81,23 @@ export function registerJevRouter(pi: ExtensionAPI, packageRoot: string): JevRou
 		if (event.provider === TYPESAFE_PROVIDER) runtime.invalidateCredential();
 	});
 
-	pi.on("session_shutdown", async () => {
+	// Unconsumed spawn permits never survive session navigation or shutdown.
+	const clearPermits = (_event: unknown, ctx: ExtensionContext) =>
+		runtime.reviewGate.clearSession(ctx.sessionManager.getSessionId());
+	pi.on("session_switch", clearPermits);
+	pi.on("session_branch", clearPermits);
+	pi.on("session_tree", clearPermits);
+	pi.on("session_shutdown", async (_event, ctx) => {
 		stopUsageTracking();
+		runtime.reviewGate.clearSession(ctx.sessionManager.getSessionId());
 		await runtime.telemetry.flush();
 	});
 	// Run after our context hook so new orchestration notices get review guidance immediately.
-	registerOrcheAdvisor(pi, runtime.reviewGate);
+	registerOrcheAdvisor(pi, runtime.reviewGate, undefined, () => runtime.config.enabled);
 
 	return runtime;
 }
 
 export default function jevRouterExtension(pi: ExtensionAPI): void {
-	// `agents/` beside this module's parent is what OMP's discovery scans.
-	registerJevRouter(pi, path.resolve(import.meta.dir, ".."));
+	registerJevRouter(pi);
 }

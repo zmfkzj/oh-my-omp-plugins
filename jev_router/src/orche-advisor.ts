@@ -9,6 +9,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/advisor/config";
 import { resolveRoleSelection } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { mainSessionOf } from "./host.ts";
+import { currentTurnNotices, NATIVE_ORCHESTRATE_NOTICE_TYPE, policyModeOf } from "./orchestration-policy.ts";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AUDITOR_NAME, VERIFICATION_AUDITOR } from "./verification-auditor.ts";
 import {
@@ -46,7 +47,8 @@ Supply additional context only when needed; decide whether requested information
 Weigh the short verdict and changes; retain final decisions. Do not call another reviewer merely because
 Orche-Advisor completed. Existing watchdog advisors retain their existing responsibilities.`;
 
-const ORCHESTRATE_GUIDANCE = `<system-notice>
+/** Appended once to the live turn's orchestration or workflow policy notice. */
+export const ORCHESTRATE_GUIDANCE = `<system-notice>
 Orche-Advisor integration: review applies to execution checkpoints, not every conversational turn.
 1. Scope and plan first. Before implementing or dispatching, use the execution gate's current
    requirement. An existing receipt covers unchanged work; do not request another initial-plan
@@ -97,7 +99,7 @@ async function installVerificationAuditor(primary: AgentSession): Promise<void> 
 }
 
 
-export function registerOrcheAdvisor(pi: ExtensionAPI, gate = new ReviewGate(), reviewer: typeof runReview = runReview): void {
+export function registerOrcheAdvisor(pi: ExtensionAPI, gate = new ReviewGate(), reviewer: typeof runReview = runReview, guidanceEnabled: () => boolean = () => true): void {
   const z = pi.zod;
   const field = z.string().min(1).max(2000);
   let inFlight = false;
@@ -113,29 +115,34 @@ export function registerOrcheAdvisor(pi: ExtensionAPI, gate = new ReviewGate(), 
     await installVerificationAuditor(primary);
   });
   pi.on("before_agent_start", (event, ctx) => {
-    if (primarySession(ctx) && pi.getActiveTools().includes(TOOL)) {
+    if (guidanceEnabled() && primarySession(ctx) && pi.getActiveTools().includes(TOOL)) {
       return { systemPrompt: [...event.systemPrompt, DEFAULT_GUIDANCE] };
     }
   });
   pi.on("context", (event, ctx) => {
-    if (!primarySession(ctx) || !pi.getActiveTools().includes(TOOL)) return;
+    if (!guidanceEnabled() || !primarySession(ctx) || !pi.getActiveTools().includes(TOOL)) return;
 
-    // Use OMP's own notice, not a second keyword parser: this respects prose boundaries,
-    // disabled magic keywords, synthetic prompts, and queued user messages.
-    let changed = false;
-    for (const message of event.messages) {
-      if (
-        message.role === "custom" &&
-        message.customType === "orchestrate-notice" &&
-        message.attribution === "user" &&
-        typeof message.content === "string" &&
-        !message.content.endsWith(ORCHESTRATE_GUIDANCE)
-      ) {
-        message.content += `\n\n${ORCHESTRATE_GUIDANCE}`;
-        changed = true;
-      }
-    }
-    if (changed) return { messages: event.messages };
+    // The router's policy notice is provider-only and exists solely for the live turn, so its
+    // orchestration and workflow modes carry the guidance. Without one (automatic routing
+    // skipped), OMP's explicit notice of the current turn carries it. Historical turns are never rewritten,
+    // and every change is a copy: shared message objects are left untouched.
+    const messages = event.messages;
+    const policyActive = messages.some(message => policyModeOf(message) !== undefined);
+    const index = policyActive
+      ? messages.findIndex(message => {
+          const mode = policyModeOf(message);
+          return mode === "orchestrate" || mode === "workflow";
+        })
+      : currentTurnNotices(messages, NATIVE_ORCHESTRATE_NOTICE_TYPE).find(candidate => {
+          const notice = messages[candidate];
+          return notice?.role === "custom" && notice.attribution === "user";
+        }) ?? -1;
+    const message = messages[index];
+    if (message?.role !== "custom" || typeof message.content !== "string" ||
+        message.content.endsWith(ORCHESTRATE_GUIDANCE)) return;
+    const next = [...messages];
+    next[index] = { ...message, content: `${message.content}\n\n${ORCHESTRATE_GUIDANCE}` };
+    return { messages: next };
   });
 
   pi.registerTool({

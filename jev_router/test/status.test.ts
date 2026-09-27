@@ -1,50 +1,73 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { renderStatus } from "../src/commands.ts";
 import { normalizeConfig } from "../src/config.ts";
-import { JevRouterRuntime } from "../src/runtime.ts";
-import { fakeModel, makeApi } from "./harness.ts";
+import type { JevRouterRuntime } from "../src/runtime.ts";
+import { clearRegistry, fakeModel, makeApi, makeSession, registerAsMain } from "./harness.ts";
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 
-function context(roles: Record<string, Model>): ExtensionCommandContext {
+afterEach(clearRegistry);
+
+function fakeRuntime(retiredConfigKeys: string[] = []): JevRouterRuntime {
 	return {
-		cwd: "/tmp", hasUI: false,
-		sessionManager: { getSessionId: () => "s1" },
-		models: { resolve: (spec: string) => roles[spec] },
-		modelRegistry: { authStorage: { keys: { get: async () => undefined }, credentials: { has: () => false } } },
-	} as unknown as ExtensionCommandContext;
+		config: normalizeConfig(undefined),
+		retiredConfigKeys,
+		credential: async () => ({ key: "ts_super_secret_value", source: "omp-credential-store" }),
+		orchestration: { lastDecision: undefined },
+	} as unknown as JevRouterRuntime;
 }
 
-const roles = {
-	"@task_easy": fakeModel("provider", "easy"),
-	"@task_hard": fakeModel("provider", "hard"),
-	"@task_challenge": fakeModel("provider", "challenge"),
-};
-
-describe("tier role preflight", () => {
-	test("missing challenge role warns even when both lower tiers resolve", () => {
-		const { pi, logs } = makeApi();
-		const runtime = new JevRouterRuntime(pi, "/tmp/jev-router-pkg");
-		runtime.checkTierRoles(context({ "@task_easy": roles["@task_easy"], "@task_hard": roles["@task_hard"] }));
-		expect(logs.some(line => line.startsWith("warn ") && line.includes("@task_challenge"))).toBe(true);
-	});
-
-	test("resolved worker roles do not require default or slow primary roles", () => {
-		const { pi, logs } = makeApi();
-		const runtime = new JevRouterRuntime(pi, "/tmp/jev-router-pkg");
-		runtime.checkTierRoles(context(roles));
-		expect(logs).toEqual([]);
-	});
-});
+/** The main session's command context, resolving only the given role aliases. */
+function mainContext(roles: Record<string, Model>) {
+	const fake = makeSession();
+	registerAsMain(fake.session);
+	const ctx = { ...fake.ctx, models: { resolve: (spec: string) => roles[spec] } } as unknown as ExtensionCommandContext;
+	return { ctx, settings: fake.session.settings };
+}
 
 test("status does not expose credential values", async () => {
 	const { pi } = makeApi();
-	const runtime = {
-		config: normalizeConfig(undefined),
-		survey: { genericTaskIsBundled: true, discoveredAliases: new Set(), materialized: { available: [], failed: [], written: [] } },
-		credential: async () => ({ key: "ts_super_secret_value", source: "omp-credential-store" }),
-		orchestration: {}, task: {},
-	} as unknown as JevRouterRuntime;
-	const status = await renderStatus(pi, runtime, context(roles));
+	const { ctx } = mainContext({});
+	const status = await renderStatus(pi, fakeRuntime(), ctx);
 	expect(status).not.toContain("ts_super_secret_value");
+});
+
+test("an unresolved @task role is reported without naming a substitute model", async () => {
+	const { pi } = makeApi();
+	const { ctx } = mainContext({ "@slow": fakeModel("provider", "slow"), "@smol": fakeModel("provider", "smol") });
+	const status = await renderStatus(pi, fakeRuntime(), ctx);
+	expect(status).toMatch(/@task role\s+unresolved/);
+	expect(status).not.toContain("provider/slow");
+	expect(status).not.toContain("provider/smol");
+});
+
+test("a resolved @task role is shown as the native worker model", async () => {
+	const { pi } = makeApi();
+	const { ctx } = mainContext({ "@task": fakeModel("provider", "worker") });
+	const status = await renderStatus(pi, fakeRuntime(), ctx);
+	expect(status).toMatch(/@task role\s+provider\/worker/);
+	expect(status).not.toContain("does not resolve");
+});
+
+test("retired settings and leftover tier roles are reported but left untouched", async () => {
+	const { pi } = makeApi();
+	const { ctx, settings } = mainContext({ "@task": fakeModel("provider", "worker") });
+	settings.setModelRole("task_easy", "@smol");
+	settings.setModelRole("task_challenge", "@slow");
+
+	const status = await renderStatus(pi, fakeRuntime(["taskRoutingEnabled", "hardTaskRole"]), ctx);
+
+	expect(status).toContain("taskRoutingEnabled, hardTaskRole");
+	expect(status).toContain("@task_easy, @task_challenge");
+	expect(status).not.toContain("@task_hard");
+	expect(settings.getModelRole("task_easy")).toBe("@smol");
+	expect(settings.getModelRole("task_challenge")).toBe("@slow");
+});
+
+test("a clean install reports neither retired settings nor leftover roles", async () => {
+	const { pi } = makeApi();
+	const { ctx } = mainContext({ "@task": fakeModel("provider", "worker") });
+	const status = await renderStatus(pi, fakeRuntime(), ctx);
+	expect(status).not.toContain("Retired settings");
+	expect(status).not.toContain("no longer used");
 });

@@ -7,7 +7,7 @@
  */
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
-export type RouteLabel = "DEFAULT" | "ORCHESTRATE" | "TASK_EASY" | "TASK_HARD" | "TASK_CHALLENGE";
+export type RouteLabel = "DEFAULT" | "ORCHESTRATE";
 
 export interface RouteLogRecord {
 	route: RouteLabel | "SKIP" | "ERROR";
@@ -16,8 +16,6 @@ export interface RouteLogRecord {
 	latencyMs?: number;
 	/** Bounded, non-sensitive explanation (`credential-missing`, `timeout`, `http-401`, …). */
 	reason?: string;
-	/** Number of decisions in the batch, when more than one. */
-	items?: number;
 }
 
 /** Secrets that must never reach a log line, keyed by the value to blank out. */
@@ -58,12 +56,11 @@ export class RouteLogger {
 		return redact(raw, [...this.#secrets]).slice(0, 200);
 	}
 
-	route(channel: "jev.orchestration" | "jev.task", record: RouteLogRecord): void {
+	route(channel: "jev.orchestration", record: RouteLogRecord): void {
 		if (!this.#enabled) return;
 		const parts = [`route=${record.route}`];
 		if (record.confidence !== undefined) parts.push(`confidence=${record.confidence.toFixed(2)}`);
 		if (record.margin !== undefined) parts.push(`margin=${record.margin.toFixed(2)}`);
-		if (record.items !== undefined) parts.push(`items=${record.items}`);
 		if (record.latencyMs !== undefined) parts.push(`latency=${Math.round(record.latencyMs)}ms`);
 		if (record.reason) parts.push(`reason=${redact(record.reason, [...this.#secrets])}`);
 		this.#logger.debug(`${channel} ${parts.join(" ")}`);

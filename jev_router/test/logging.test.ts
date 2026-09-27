@@ -26,7 +26,7 @@ describe("secret redaction", () => {
 		const { pi, logs } = makeApi();
 		const logger = new RouteLogger(pi.logger);
 
-		logger.route("jev.task", { route: "TASK_CHALLENGE", confidence: 0.8, margin: 0.6 });
+		logger.route("jev.orchestration", { route: "ORCHESTRATE", confidence: 0.8, margin: 0.6 });
 		logger.note("something");
 
 		expect(logs).toEqual([]);

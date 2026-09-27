@@ -4,7 +4,8 @@
  * Subcommands: setup, status, test, stats, reset. No subcommand prints status.
  * Secrets are never rendered: the credential is reported by provenance only.
  */
-import { clearStoredConfig, DEFAULT_CONFIG } from "./config.ts";
+import path from "node:path";
+import { clearStoredConfig, DEFAULT_CONFIG, PLUGIN_NAME } from "./config.ts";
 import {
 	clearStoredCredential,
 	hasStoredCredential,
@@ -12,8 +13,10 @@ import {
 	TYPESAFE_ENV_VAR,
 	validateCredential,
 } from "./credentials.ts";
-import { EASY_AGENT_NAME, HARD_AGENT_NAME, CHALLENGE_AGENT_NAME } from "./deep-agent.ts";
-import { resolveRole, spawnableTaskAgents } from "./host.ts";
+import { mainSessionOf } from "./host.ts";
+import { JEV_ORCHESTRATE_NOTICE_TYPE } from "./orchestration-policy.ts";
+import { GENERIC_TASK_AGENT } from "./task-contract.ts";
+import { historySnapshotName, type OrchestrationCounters, type TelemetryState } from "./telemetry.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import type { JevRouterRuntime } from "./runtime.ts";
 
@@ -27,20 +30,14 @@ function row(label: string, value: string): string {
 	return `${label.padEnd(PAD)}${value}`;
 }
 
-/** Fixed probes for `/jev-router test`; they exercise both routers end to end. */
+/** Fixed probes for `/jev-router test`; they exercise the front-door classifier end to end. */
 const TEST_REQUEST =
 	"Rename the `retryCount` field to `attempts` in the HTTP client and update its two call sites.";
 const TEST_PARALLEL_REQUEST =
 	"Implement three independently specified features in disjoint subsystems: CLI export, database retention, and dashboard filtering. Each has its own tests and no shared interfaces; coordinate independent workers and integrate their results.";
-const TEST_SUBTASKS = [
-	{ id: "t0", instruction: "Rename the local variable retryCount to attempts in one function without changing behavior." },
-	{
-		id: "t1",
-		instruction:
-			"Users intermittently see stale balances after a concurrent transfer. Find the root cause across the ledger and cache layers and decide how to make reads consistent.",
-	},
-	{ id: "t2", instruction: "Implement paginated CLI output using the existing endpoint and pagination contract, including regression coverage." },
-];
+
+/** Model roles the retired tier router created; user-owned, never deleted or read. */
+const RETIRED_TIER_ROLES = ["task_easy", "task_hard", "task_challenge"] as const;
 
 function formatCredential(runtime: JevRouterRuntime, stored: boolean, source: string | undefined): string {
 	if (source === "env") return `configured (${TYPESAFE_ENV_VAR}, not persisted)`;
@@ -56,18 +53,10 @@ export async function renderStatus(
 ): Promise<string> {
 	const config = runtime.config;
 	const credential = await runtime.credential();
-	const easy = resolveRole(ctx, config.easyTaskRole);
-	const hard = resolveRole(ctx, config.hardTaskRole);
-	const challenge = resolveRole(ctx, config.challengeTaskRole);
-	const survey = runtime.survey;
-	// Spawnability, not mere existence: this is what the router actually gates on.
-	const spawnable = spawnableTaskAgents(pi);
-	const aliasState = (name: string) =>
-		spawnable.has(name)
-			? `${name} — discoverable and spawnable`
-			: survey.discoveredAliases.has(name)
-				? `${name} — on disk but NOT spawnable in this session`
-				: `${name} — MISSING`;
+	const session = mainSessionOf(ctx);
+	const taskModel = ctx.models.resolve(`@${GENERIC_TASK_AGENT}`);
+	const taskTool = pi.getAllTools().some(tool => tool.name === "task");
+	const taskEnabled = session?.getEnabledToolNames().includes("task");
 
 	const lines = [
 		row("Jev Router", config.enabled ? "enabled" : "disabled"),
@@ -77,19 +66,21 @@ export async function renderStatus(
 		row("Primary model", "unchanged — no model switching"),
 		row("Model", config.jevModel || "jev-latest (default)"),
 		row("Gate", `confidence ≥ ${config.orchestrationMinConfidence}, margin ≥ ${config.orchestrationMinMargin}`),
+		row("Coordination guidance", config.enabled ? `plugin-owned (${JEV_ORCHESTRATE_NOTICE_TYPE})` : "native (plugin disabled)"),
 		"",
-		row("TASK tier routing", config.taskRoutingEnabled ? "enabled" : "disabled"),
-		row("TASK_EASY", `${easy.alias} → ${easy.label}`),
-		row("TASK_HARD", `${hard.alias} → ${hard.label}`),
-		row("TASK_CHALLENGE", `${challenge.alias} → ${challenge.label}`),
-		row("Gate", `confidence ≥ ${config.taskMinConfidence}, margin ≥ ${config.taskMinMargin}`),
-		row("Easy tier agent", aliasState(EASY_AGENT_NAME)),
-		row("Hard tier agent", aliasState(HARD_AGENT_NAME)),
-		row("Challenge tier agent", aliasState(CHALLENGE_AGENT_NAME)),
+		row(
+			"Task worker",
+			!taskTool ? "task tool not registered" : taskEnabled === false ? "task tool disabled in this session" : "native `task` agent",
+		),
+		row(`  @${GENERIC_TASK_AGENT} role`, taskModel ? `${taskModel.provider}/${taskModel.id}` : "unresolved"),
 	];
+	if (!taskModel) {
+		lines.push(
+			`  @${GENERIC_TASK_AGENT} does not resolve in this session and no other model is substituted. Set modelRoles.${GENERIC_TASK_AGENT}.`,
+		);
+	}
 
 	const orchestration = runtime.orchestration.lastDecision;
-	const task = runtime.task.lastDecision;
 	lines.push(
 		"",
 		row(
@@ -98,84 +89,116 @@ export async function renderStatus(
 				? `${orchestration.outcome}${orchestration.confidence === undefined ? "" : ` ${orchestration.confidence.toFixed(2)}`}`
 				: "none this session",
 		),
-		row("Last TASK route", task ? `${task.route} ${task.confidence.toFixed(2)}` : "none this session"),
 		row("Review assessment", orchestration?.reviewRequired === undefined ? "not assessed" : orchestration.reviewRequired ? "required (see /review-status)" : "optional"),
 	);
 
-	const tiers = [easy, hard, challenge];
-	if (tiers.every(role => role.modelId) && new Set(tiers.map(role => role.modelId)).size < tiers.length) {
-		lines.push("", "Some worker tiers resolve to the same model; check role assignments for cost differentiation.");
-	}
-	const unresolved = tiers.filter(role => !role.modelId).map(role => role.alias);
-	if (unresolved.length > 0) {
+	if (runtime.retiredConfigKeys.length > 0) {
 		lines.push(
 			"",
-			`Unresolved role(s): ${unresolved.join(", ")}.`,
-			"Set them with `omp config set modelRoles.<role> <provider/model>` or the /model Roles view.",
+			`Retired settings still stored and ignored: ${runtime.retiredConfigKeys.join(", ")}.`,
+			`Remove each with \`omp plugin config delete ${PLUGIN_NAME} <key>\` (and any project override).`,
 		);
 	}
-	if (!survey.genericTaskIsBundled) {
+	const legacyRoles = session ? RETIRED_TIER_ROLES.filter(role => session.settings.getModelRole(role) !== undefined) : [];
+	if (legacyRoles.length > 0) {
 		lines.push(
 			"",
-			"An agent named `task` shadows OMP's bundled worker; tier routing is disabled so your definition is not replaced.",
+			`Model roles ${legacyRoles.map(role => `@${role}`).join(", ")} are no longer used by this plugin and were left as you set them.`,
 		);
-	}
-	if (survey.materialized.failed.length > 0) {
-		lines.push("", `Tier agent files could not be written: ${survey.materialized.failed.join(", ")}.`);
 	}
 	return lines.join("\n");
 }
 
-export function renderStats(runtime: JevRouterRuntime): string {
-	const snapshot = runtime.telemetry.snapshot();
-	const orchestration = snapshot.orchestration;
-	const task = snapshot.task;
-	const avg = (sum: number, count: number) => (count === 0 ? "—" : `${Math.round(sum / count)}ms`);
+/** How the persisted telemetry file is being treated in this process, or nothing when normal. */
+function telemetryStateNote(state: TelemetryState): string | undefined {
+	switch (state.kind) {
+		case "unloaded":
+		case "active":
+			return undefined;
+		case "deferred":
+			return `Telemetry is disabled: the v${state.version} file is shown read-only and migrates once telemetryEnabled=true.`;
+		case "suspended":
+			return state.reason === "future-version"
+				? `telemetry.json was written by a newer plugin version (v${state.version}); left untouched, recording suspended.`
+				: `Telemetry ${state.reason}: ${state.detail}. Recording suspended; /jev-router reset discards it.`;
+	}
+}
+
+function orchestrationRows(counters: OrchestrationCounters & { legacyDecisions?: number }): string[] {
+	const avg = counters.latencyCount === 0 ? "—" : `${Math.round(counters.latencySumMs / counters.latencyCount)}ms`;
 	const histogram = (buckets: readonly number[]) =>
 		buckets.map((count, index) => `${(index / 10).toFixed(1)}:${count}`).join(" ");
-
-	const lines = [
-		row("Orchestration decisions", String(orchestration.requests)),
-		...(orchestration.legacyDecisions > 0 ? [row("  retired labels", String(orchestration.legacyDecisions))] : []),
-		row("  DEFAULT", String(orchestration.DEFAULT)),
-		row("  ORCHESTRATE", String(orchestration.ORCHESTRATE)),
-		row("  errors / timeouts", `${orchestration.errors} / ${orchestration.timeouts}`),
-		row("  avg latency", avg(orchestration.latencySumMs, orchestration.latencyCount)),
-		row("  confidence", histogram(orchestration.confidence)),
-		row("  margin", histogram(orchestration.margin)),
-		"",
-		row("TASK batches", String(task.batches)),
-		row("  TASK_EASY", String(task.TASK_EASY)),
-		row("  TASK_HARD", String(task.TASK_HARD)),
-		row("  TASK_CHALLENGE", String(task.TASK_CHALLENGE)),
-		row("  CHALLENGE gate fallbacks", String(task.fallbackChallenge)),
-		...(task.legacyDecisions > 0 ? [row("  retired labels", String(task.legacyDecisions))] : []),
-		...(task.legacyFallbacks > 0 ? [row("  retired fallbacks", String(task.legacyFallbacks))] : []),
-		row("  errors / timeouts", `${task.errors} / ${task.timeouts}`),
-		row("  avg latency", avg(task.latencySumMs, task.latencyCount)),
-		row("  confidence", histogram(task.confidence)),
-		row("  margin", histogram(task.margin)),
+	return [
+		row("Orchestration decisions", String(counters.requests)),
+		...(counters.legacyDecisions ? [row("  retired labels", String(counters.legacyDecisions))] : []),
+		row("  DEFAULT", String(counters.DEFAULT)),
+		row("  ORCHESTRATE", String(counters.ORCHESTRATE)),
+		row("  errors / timeouts", `${counters.errors} / ${counters.timeouts}`),
+		row("  avg latency", avg),
+		row("  confidence", histogram(counters.confidence)),
+		row("  margin", histogram(counters.margin)),
 	];
+}
+
+export function renderStats(runtime: JevRouterRuntime): string {
+	const telemetry = runtime.telemetry;
+	const snapshot = telemetry.snapshot();
+	const lines: string[] = [];
+	const state = telemetry.state();
+	const note = telemetryStateNote(state);
+	if (note) lines.push(note, "");
+
+	lines.push(`Live epoch ${snapshot.epoch.id} since ${new Date(snapshot.epoch.startedAt).toISOString()}`, "");
+	lines.push(...orchestrationRows(snapshot.orchestration));
 
 	const workers = Object.entries(snapshot.workers);
-	if (workers.length > 0) {
+	lines.push("", "task workers — invocation path not separated (task tool, eval agent(), workpool)");
+	if (workers.length === 0) lines.push("  none observed in this epoch");
+	for (const [agent, counters] of workers) {
+		const settled = counters.completed + counters.failed + counters.aborted;
+		const coverage = settled === 0 ? "—" : `${Math.round((counters.usageSamples / settled) * 100)}%`;
+		const perSample = (sum: number) => (counters.usageSamples === 0 ? "—" : Math.round(sum / counters.usageSamples).toLocaleString());
+		const perCompleted =
+			counters.usageSamplesCompleted === 0 ? "—" : `$${(counters.costUsd / counters.usageSamplesCompleted).toFixed(4)}`;
+		lines.push(
+			row(`  ${agent} started`, `${counters.startedObserved} observed`),
+			row("  settled", `${counters.completed} completed / ${counters.failed} failed / ${counters.aborted} cancelled`),
+			row("  usage coverage", `${counters.usageSamples} measured / ${counters.usageUnknown} unknown (${coverage})`),
+			row("  measured usage", `${counters.tokens.toLocaleString()} tokens / $${counters.costUsd.toFixed(4)}`),
+			row("  avg per sample", `${perSample(counters.tokens)} tokens / ${perSample(counters.durationMs)}ms`),
+			row("  cost per completed", `${perCompleted} (measured completions only)`),
+		);
+	}
+	lines.push("  completed = worker run finished, not acceptance of its result.");
+
+	const historical = snapshot.historical;
+	if (historical) {
+		const tier = historical.taskRouting;
 		lines.push(
 			"",
-			"Worker cost by tier agent (settled spawns observed in this process)",
-			row("  agent", "spawns / settled / completed / tokens / cost / cost-per-completed"),
+			`Historical (pre-v5, v${historical.source.version}; never added to live numbers)`,
+			...orchestrationRows(historical.orchestration).map(line => `  ${line}`),
+			row("  retired TASK tier batches", String(tier.batches)),
+			row("    EASY / HARD / CHALLENGE", `${tier.TASK_EASY} / ${tier.TASK_HARD} / ${tier.TASK_CHALLENGE}`),
+			row("    gate fallbacks", String(tier.fallbackChallenge)),
+			row("    errors / timeouts", `${tier.errors} / ${tier.timeouts}`),
 		);
-		for (const [agent, counters] of workers) {
-			// The North Star metric: spend per successfully completed delegated task.
-			const perCompleted = counters.completed === 0 ? "—" : `$${(counters.costUsd / counters.completed).toFixed(4)}`;
+		for (const [agent, counters] of Object.entries(historical.workers)) {
 			lines.push(
 				row(
 					`  ${agent}`,
-					`${counters.spawns} / ${counters.results} / ${counters.completed} / ${counters.tokens.toLocaleString()} / $${counters.costUsd.toFixed(4)} / ${perCompleted}`,
+					`${counters.spawns} routed / ${counters.results} settled / ${counters.completed} completed / ${counters.tokens.toLocaleString()} tokens / $${counters.costUsd.toFixed(4)}`,
 				),
 			);
 		}
+		// A deferred (not yet migrated) file is still the active telemetry.json; no backup exists yet.
+		lines.push(
+			state.kind === "deferred"
+				? `  Source: ${telemetry.file} (not migrated while telemetry is disabled)`
+				: `  Source snapshot: ${path.join(telemetry.historyDir, historySnapshotName(historical.source.version, historical.source.sha256))}`,
+		);
 	}
-	lines.push("", `State file: ${runtime.telemetry.file}`, `Decision log: ${runtime.telemetry.decisionsFile}`);
+	lines.push("", `State file: ${telemetry.file}`, `Decision log: ${telemetry.decisionsFile}`);
 	return lines.join("\n");
 }
 
@@ -263,38 +286,21 @@ async function runTest(runtime: JevRouterRuntime): Promise<string> {
 			lines.push(row(`Front-door probe ${index}/2`, `failed: ${runtime.logger.describeError(error)}`));
 		}
 	}
-
-	try {
-		const batch = await runtime.engine.decideTaskTiers(
-			TEST_SUBTASKS,
-			"Probe from /jev-router test.",
-			options,
-			{ minConfidence: config.taskMinConfidence, minMargin: config.taskMinMargin },
-			config.maxRoutingInputChars,
-		);
-		for (const [index, decision] of batch.decisions.entries()) {
-			lines.push(
-				row(
-					`TASK probe ${index + 1}`,
-					`${decision.confident ? decision.top : "TASK_CHALLENGE (gate)"} confidence=${decision.confidence.toFixed(2)} margin=${decision.margin.toFixed(2)}`,
-				),
-			);
-		}
-		lines.push(
-			row("  (expected)", "1 = TASK_EASY (mechanical), 2 = TASK_CHALLENGE (root cause), 3 = TASK_HARD (implementation)"),
-			row("  batch latency", `${Math.round(batch.latencyMs)}ms for ${batch.decisions.length} decisions in 1 request`),
-		);
-	} catch (error) {
-		lines.push(row("TASK probe", `failed: ${runtime.logger.describeError(error)}`));
-	}
 	return lines.join("\n");
 }
 
 async function runReset(runtime: JevRouterRuntime, ctx: ExtensionCommandContext): Promise<string> {
-	await runtime.telemetry.reset();
+	let telemetryLine: string;
+	try {
+		const removed = await runtime.telemetry.reset();
+		telemetryLine = `Telemetry cleared (${removed.length} owned file(s) removed).`;
+	} catch (error) {
+		// Some owned files survived; say so rather than claiming a clean slate.
+		telemetryLine = `Telemetry reset incomplete: ${error instanceof Error ? error.message : String(error)}`;
+	}
 	await clearStoredConfig();
 	await runtime.reloadConfig(ctx.cwd);
-	const done = ["Telemetry cleared.", `Configuration reset to defaults (${Object.keys(DEFAULT_CONFIG).length} keys).`];
+	const done = [telemetryLine, `Configuration reset to defaults (${Object.keys(DEFAULT_CONFIG).length} keys; retired keys removed too).`];
 
 	if (hasStoredCredential(ctx)) {
 		const remove = ctx.hasUI

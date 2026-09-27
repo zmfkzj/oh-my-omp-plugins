@@ -1,15 +1,13 @@
 {
   "name": "omp-jev-router",
   "version": "1.0.0",
-  "description": "Keeps the primary model fixed while routing orchestration and three worker tiers with Jev; includes checkpoint reviews and independent verification.",
+  "description": "Keeps the primary model fixed while deciding orchestration and review needs with Jev; plugin-owned coordination guidance over OMP's native task worker, with checkpoint reviews and independent verification.",
   "license": "UNLICENSED",
   "type": "module",
   "files": [
     "src/",
-    "agents/",
     "bin/",
     "examples/",
-    "scripts/",
     "README.md"
   ],
   "bin": {
@@ -52,40 +50,6 @@
         "max": 1,
         "description": "Minimum top1 - top2 margin for orchestration; below the gate keep DEFAULT."
       },
-      "taskRoutingEnabled": {
-        "type": "boolean",
-        "default": true,
-        "description": "Pick task_easy, task_hard or task_challenge for generic task spawns."
-      },
-      "taskMinConfidence": {
-        "type": "number",
-        "default": 0.75,
-        "min": 0,
-        "max": 1,
-        "description": "Minimum tier confidence; uncertain EASY/HARD selects task_hard, CHALLENGE stays task_challenge."
-      },
-      "taskMinMargin": {
-        "type": "number",
-        "default": 0.2,
-        "min": 0,
-        "max": 1,
-        "description": "Minimum tier probability margin; uncertain EASY/HARD selects task_hard, CHALLENGE stays task_challenge."
-      },
-      "easyTaskRole": {
-        "type": "string",
-        "default": "task_easy",
-        "description": "Model role for mechanical, low-risk TASK_EASY work."
-      },
-      "hardTaskRole": {
-        "type": "string",
-        "default": "task_hard",
-        "description": "Model role for substantive TASK_HARD implementation."
-      },
-      "challengeTaskRole": {
-        "type": "string",
-        "default": "task_challenge",
-        "description": "Model role for TASK_CHALLENGE reasoning and failed or missing task classification."
-      },
       "routingTimeoutMs": {
         "type": "number",
         "default": 4000,
@@ -98,27 +62,26 @@
         "default": 12000,
         "min": 200,
         "max": 40000,
-        "description": "Combined character budget for task text, visible conversation and committed plan sent to Jev (excluding JSON framing and fixed classifier instructions)."
+        "description": "Combined character budget for the request, visible conversation and committed plan sent to Jev (excluding JSON framing and fixed classifier instructions)."
       },
       "telemetryEnabled": {
         "type": "boolean",
         "default": true,
-        "description": "Aggregate local route counts and worker cost. No prompt text is stored."
+        "description": "Aggregate local orchestration decisions and observed task-worker usage. No prompt text is stored."
       },
       "debugLogging": {
         "type": "boolean",
         "default": false,
-        "description": "Emit one metrics-only line per routing decision to the OMP log."
+        "description": "Emit one metrics-only line per orchestration decision to the OMP log."
       }
     }
   },
   "scripts": {
-    "gen:agents": "bun scripts/gen-deep-agent.ts",
     "check": "tsc --noEmit",
-    "lint": "oxlint src scripts test bin",
+    "lint": "oxlint src test bin",
     "test": "bun test",
-    "build": "bun run gen:agents && bun run check && bun run lint && bun test",
-    "format": "oxfmt src scripts test bin package.json tsconfig.json"
+    "build": "bun run check && bun run lint && bun test",
+    "format": "oxfmt src test bin package.json tsconfig.json"
   },
   "dependencies": {
     "@oh-my-pi/pi-ai": "18.3.1",

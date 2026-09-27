@@ -8,6 +8,7 @@
  */
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { getTaskSchema } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import type { Model } from "@oh-my-pi/pi-ai";
@@ -15,17 +16,14 @@ import type {
 	EngineOptions,
 	GateThresholds,
 	JevDecider,
-	JevSubtask,
 	OrchestrationDecision,
 	OrchestrationRoute,
 	ReviewRequirement,
 	RoutingContext,
-	TaskTierBatch,
-	TaskRoute,
 } from "../src/jev.ts";
 
 export interface FakeSessionOptions {
-	enabledTools?: string[];
+	enabledTools?: readonly string[];
 	magicKeywords?: boolean;
 	orchestrateKeyword?: boolean;
 	planMode?: boolean;
@@ -97,12 +95,27 @@ export function clearRegistry(): void {
 	AgentRegistry.resetGlobalForTests();
 }
 
-/** Minimal `ExtensionAPI` exposing the tool catalogue and logger the routers use. */
-export function makeApi(taskAgents: string[] = ["scout", "reviewer", "security-reviewer", "task", "sonic", "task-easy", "task-hard", "task-challenge"]): {
+/** The settings OMP's `task` tool derives its live parameter schema from. */
+export type TaskSchemaOptions = Parameters<typeof getTaskSchema>[0];
+
+/**
+ * Minimal `ExtensionAPI` exposing the tool catalogue and logger the plugin uses.
+ *
+ * The `task` entry carries OMP's real wire schema, built by the host's own
+ * `getTaskSchema` (defaults mirror `task.batch` on, isolation off). The
+ * returned `taskSchema` options are live: mutating them changes what the next
+ * `getAllTools()` reports, as a mid-session settings change would.
+ */
+export function makeApi(
+	taskAgents: string[] = ["scout", "reviewer", "security-reviewer", "task", "sonic"],
+	schema: Partial<TaskSchemaOptions> = {},
+): {
 	pi: ExtensionAPI;
 	logs: string[];
+	taskSchema: TaskSchemaOptions;
 } {
 	const logs: string[] = [];
+	const taskSchema: TaskSchemaOptions = { batchEnabled: true, isolationEnabled: false, ...schema };
 	const description = [
 		"Delegate work to background subagents.",
 		"",
@@ -116,9 +129,9 @@ export function makeApi(taskAgents: string[] = ["scout", "reviewer", "security-r
 			info: (message: string) => logs.push(`info ${message}`),
 			error: (message: string) => logs.push(`error ${message}`),
 		},
-		getAllTools: () => [{ name: "task", description, parameters: {}, sourceInfo: {} }],
+		getAllTools: () => [{ name: "task", description, parameters: getTaskSchema(taskSchema), sourceInfo: {} }],
 	} as unknown as ExtensionAPI;
-	return { pi, logs };
+	return { pi, logs, taskSchema };
 }
 
 export interface ScriptedReview {
@@ -141,17 +154,11 @@ const OPTIONAL_REVIEW: ScriptedReview = { top: "OPTIONAL", confidence: 0.95, mar
 /** A `JevDecider` returning canned answers and counting requests. */
 export class ScriptedDecider implements JevDecider {
 	orchestrationCalls = 0;
-	taskCalls = 0;
-	lastSubtasks: readonly JevSubtask[] = [];
 	lastOptions: EngineOptions | undefined;
 	lastContext: RoutingContext = { recentMessages: [] };
-	lastSharedContext: string | undefined;
 	#orchestrationQueue: (ScriptedOrchestration | Error)[];
 
-	constructor(
-		orchestration: ScriptedOrchestration | Error | (ScriptedOrchestration | Error)[],
-		private readonly tiers: Record<string, { top: TaskRoute; confidence: number; margin: number }> | Error = {},
-	) {
+	constructor(orchestration: ScriptedOrchestration | Error | (ScriptedOrchestration | Error)[]) {
 		this.#orchestrationQueue = Array.isArray(orchestration) ? [...orchestration] : [orchestration];
 	}
 
@@ -185,35 +192,6 @@ export class ScriptedDecider implements JevDecider {
 						probabilities: { [review.top]: review.confidence },
 					}
 				: { top: "REQUIRED", confidence: 0, margin: 0, confident: false, probabilities: {} },
-		};
-	}
-
-	async decideTaskTiers(
-		subtasks: readonly JevSubtask[],
-		sharedContext: string | undefined,
-		options: EngineOptions,
-		gates: GateThresholds,
-		_maxChars: number,
-	): Promise<TaskTierBatch> {
-		this.taskCalls++;
-		this.lastSubtasks = subtasks;
-		this.lastSharedContext = sharedContext;
-		this.lastOptions = options;
-		if (this.tiers instanceof Error) throw this.tiers;
-		const table = this.tiers;
-		return {
-			latencyMs: 9,
-			decisions: subtasks.map(subtask => {
-				const answer = table[subtask.id] ?? { top: "TASK_HARD" as TaskRoute, confidence: 0.95, margin: 0.9 };
-				return {
-					id: subtask.id,
-					top: answer.top,
-					confidence: answer.confidence,
-					margin: answer.margin,
-					confident: answer.confidence >= gates.minConfidence && answer.margin >= gates.minMargin,
-					probabilities: { [answer.top]: answer.confidence },
-				};
-			}),
 		};
 	}
 }

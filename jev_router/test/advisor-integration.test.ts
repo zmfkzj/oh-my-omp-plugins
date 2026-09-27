@@ -1,15 +1,28 @@
 import { afterEach, expect, test } from "bun:test";
 import { z } from "zod";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import example from "../examples/initial-plan.json";
 import { prepareReviewInput, runReview, ROLE, TOOL, type ReviewSelection } from "../src/advisor-review.ts";
 import { registerJevRouter } from "../src/index.ts";
 import { AUDITOR_NAME, VERIFICATION_AUDITOR } from "../src/verification-auditor.ts";
-import { registerOrcheAdvisor } from "../src/orche-advisor.ts";
+import { ORCHESTRATE_GUIDANCE, registerOrcheAdvisor } from "../src/orche-advisor.ts";
+import {
+  NATIVE_ORCHESTRATE_NOTICE_TYPE,
+  NATIVE_WORKFLOW_NOTICE_TYPE,
+  policyModeOf,
+} from "../src/orchestration-policy.ts";
 import { ReviewGate } from "../src/review-gate.ts";
-import { clearRegistry, makeSession, registerAsMain } from "./harness.ts";
+import { clearRegistry, makeApi, makeSession, registerAsMain, ScriptedDecider } from "./harness.ts";
+import type { ScriptedOrchestration } from "./harness.ts";
 import { findingRevision } from "../src/findings.ts";
+import { prepareDispatch } from "../src/task-contract.ts";
+
+/** A gate validating declarations against the live native `task` schema, as the runtime wires it. */
+function liveGate(): ReviewGate {
+  return new ReviewGate(() => true, input => prepareDispatch(makeApi().pi, input));
+}
 
 afterEach(clearRegistry);
 
@@ -46,11 +59,9 @@ test("one extension registers the checkpoint tool and an independent auditor rol
       if (event === "session_start") handlers.push(handler);
     },
   } as unknown as ExtensionAPI;
-  const runtime = registerJevRouter(pi, import.meta.dir);
+  const runtime = registerJevRouter(pi);
   runtime.reloadConfig = async () => runtime.config;
   runtime.telemetry.load = async () => {};
-  runtime.surveyAgents = async () => runtime.survey;
-  runtime.checkTierRoles = () => {};
 
   for (const handler of handlers) await handler({}, ctx);
   expect(checkpointTool?.name).toBe(TOOL);
@@ -154,8 +165,8 @@ test("tool retains omitted dispatch, withdraws explicitly, and re-reviews a revi
     },
   });
   registerAsMain(session);
-  const gate = new ReviewGate();
-  gate.stageDispatch(ctx, { tasks: [{ task: "Implement preview", name: "Preview" }] });
+  const gate = liveGate();
+  gate.stageDispatch(ctx, { context: "Preview feature", tasks: [{ task: "Implement preview", name: "Preview" }] });
   const staged = gate.scope(ctx);
   gate.complete(ctx, staged, false, "rejection", "review_rejected");
   let reviewer: Parameters<ExtensionAPI["registerTool"]>[0] | undefined;
@@ -209,7 +220,7 @@ function reviewExecutionFixture(verdict: "KEEP" | "REPLAN" = "KEEP") {
   session.settings.setModelRole(ROLE, `${model.provider}/${model.id}`);
   Object.assign(session.settings, { reloadFromDisk: async () => {} });
   Object.assign(ctx.modelRegistry, { getAvailable: () => [model], getApiKey: async () => "fixture-key" });
-  const gate = new ReviewGate();
+  const gate = liveGate();
   gate.noteDecision(ctx, true, "initial-plan", "Review required", "Integration");
   let tool!: Parameters<ExtensionAPI["registerTool"]>[0];
   registerOrcheAdvisor({ zod: z, on() {},
@@ -255,10 +266,10 @@ test("bookkeeping failure cannot downgrade an actual rejection to an unavailable
   expect(storage.modelCalls).toBe(1);
 });
 
-for (const dispatch of [null, { tasks: [{ name: "Replacement", task: "Replace existing contract" }] }]) {
+for (const dispatch of [null, { context: "Contract replacement", tasks: [{ name: "Replacement", task: "Replace existing contract" }] }]) {
   test(`oversized snapshot cannot ${dispatch === null ? "withdraw" : "replace"} an approved dispatch`, async () => {
     const { ctx, gate, tool, branch, storage } = reviewExecutionFixture();
-    gate.stageDispatch(ctx, { tasks: [{ name: "Original", task: "Preserve this contract" }] });
+    gate.stageDispatch(ctx, { context: "Original contract", tasks: [{ name: "Original", task: "Preserve this contract" }] });
     gate.complete(ctx, gate.scope(ctx), true);
     const before = gate.scope(ctx);
     const entries = branch.length;
@@ -283,4 +294,178 @@ test("legacy aggregate summaries require restaging or withdrawal before a review
     new AbortController().signal, () => {}, ctx);
   expect(result.isError).not.toBe(true);
   expect(gate.scope(ctx)).toMatchObject({ dispatchComplete: true, dispatchSummary: [], satisfied: true });
+});
+
+const PROMPT = "Refactor the ingestion pipeline.";
+const DEFAULT_ROUTE: ScriptedOrchestration = { top: "DEFAULT", confidence: 0.92, margin: 0.84, confident: true };
+const ORCHESTRATE_ROUTE: ScriptedOrchestration = { top: "ORCHESTRATE", confidence: 0.92, margin: 0.84, confident: true };
+type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
+
+function user(text: string): AgentMessage {
+  return { role: "user", content: [{ type: "text", text }], timestamp: 0 } as AgentMessage;
+}
+function assistant(text: string): AgentMessage {
+  return { role: "assistant", content: [{ type: "text", text }], timestamp: 0 } as unknown as AgentMessage;
+}
+function keywordNotice(customType: string, timestamp: number, content = customType): AgentMessage {
+  return { role: "custom", customType, content, display: false, attribution: "user", timestamp } as AgentMessage;
+}
+function guidanceCount(message: AgentMessage | undefined): number {
+  return message?.role === "custom" && typeof message.content === "string"
+    ? message.content.split(ORCHESTRATE_GUIDANCE).length - 1
+    : 0;
+}
+function totalGuidance(messages: AgentMessage[]): number {
+  return messages.reduce((total, message) => total + guidanceCount(message), 0);
+}
+function ofType(messages: AgentMessage[], customType: string): AgentMessage[] {
+  return messages.filter(message => message.role === "custom" && message.customType === customType);
+}
+
+/** The whole plugin as OMP loads it, with a scripted Jev decision and no network or disk writes. */
+function registeredPlugin(route: ScriptedOrchestration, enabled = true) {
+  const branch: SessionEntry[] = [];
+  const { session, ctx } = makeSession({ branch });
+  Object.assign(session.sessionManager, {
+    appendCustomEntry(customType: string, data: unknown) {
+      const id = `state-${branch.length}`;
+      branch.push({ type: "custom", id, parentId: null, timestamp: "2026-09-28T00:00:00Z", customType, data });
+      return id;
+    },
+  });
+  registerAsMain(session);
+  const handlers = new Map<string, Handler[]>();
+  const pi = {
+    zod: z,
+    logger: { debug() {}, warn() {}, info() {}, error() {} },
+    setLabel() {},
+    events: { on: () => () => {} },
+    registerCommand() {},
+    registerTool() {},
+    getActiveTools: () => [TOOL],
+    on(event: string, handler: Handler) {
+      handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+    },
+  } as unknown as ExtensionAPI;
+  const runtime = registerJevRouter(pi);
+  runtime.config.enabled = enabled;
+  runtime.telemetry.setEnabled(false);
+  runtime.apiKey = async () => "ts_test_key";
+  const decider = new ScriptedDecider(route);
+  Object.assign(runtime.engine, { decideOrchestration: decider.decideOrchestration.bind(decider) });
+  return {
+    async attemptMutation() {
+      for (const handler of handlers.get("tool_call") ?? []) {
+        const result = await handler({ type: "tool_call", toolName: "edit", toolCallId: "pending-edit", input: {} }, ctx);
+        if (result) return result;
+      }
+      return undefined;
+    },
+    async beginTurn(prompt: string) {
+      for (const handler of handlers.get("before_agent_start") ?? []) {
+        await handler({ type: "before_agent_start", prompt, systemPrompt: [] }, ctx);
+      }
+    },
+    /** Mirrors `ExtensionRunner.emitContext`: a cloned array flows through handlers in registration order. */
+    async context(messages: AgentMessage[]): Promise<AgentMessage[]> {
+      let current = structuredClone(messages);
+      for (const handler of handlers.get("context") ?? []) {
+        const result = await handler({ type: "context", messages: current }, ctx) as { messages?: AgentMessage[] } | undefined;
+        if (result?.messages) current = result.messages;
+      }
+      return current;
+    },
+  };
+}
+
+test("explicit and automatic orchestration compose one policy notice with Advisor guidance once", async () => {
+  const plugin = registeredPlugin(ORCHESTRATE_ROUTE);
+  await plugin.beginTurn(PROMPT);
+  const historical = keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 1, "earlier native");
+  const persisted = [historical, user("Earlier request"), assistant("done"),
+    keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 2), user(PROMPT)];
+  const snapshot = structuredClone(persisted);
+
+  const first = await plugin.context(persisted);
+  expect(persisted).toEqual(snapshot);
+  expect(first[0]).toEqual(historical);
+  expect(ofType(first, NATIVE_ORCHESTRATE_NOTICE_TYPE)).toEqual([historical]);
+  const policy = first.filter(message => policyModeOf(message) !== undefined);
+  expect(policy.map(policyModeOf)).toEqual(["orchestrate"]);
+  expect(first[3]).toBe(policy[0]!);
+  expect(guidanceCount(policy[0])).toBe(1);
+  expect(totalGuidance(first)).toBe(1);
+  // Initial assessment permits scoping; execution activates the pending-review notice.
+  expect(ofType(first, "jev-review-required")).toHaveLength(0);
+
+  // A later provider request re-runs every hook on persisted history, or on an already composed copy.
+  expect(await plugin.context(persisted)).toEqual(first);
+  expect(await plugin.context(first)).toEqual(first);
+  expect(await plugin.attemptMutation()).toMatchObject({ block: true });
+  const pending = await plugin.context(persisted);
+  expect(ofType(pending, "jev-review-required")).toHaveLength(1);
+  expect(totalGuidance(pending)).toBe(1);
+});
+
+test("a workflow turn keeps the native workflow notice and gets one guided supplement", async () => {
+  for (const [route, explicit] of [
+    [DEFAULT_ROUTE, false], [ORCHESTRATE_ROUTE, false], [DEFAULT_ROUTE, true], [ORCHESTRATE_ROUTE, true],
+  ] as const) {
+    const plugin = registeredPlugin(route);
+    await plugin.beginTurn(PROMPT);
+    const workflow = keywordNotice(NATIVE_WORKFLOW_NOTICE_TYPE, 3);
+    const persisted = [assistant("previous"),
+      ...(explicit ? [keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 3)] : []), workflow, user(PROMPT)];
+    for (const composed of [await plugin.context(persisted), await plugin.context(persisted)]) {
+      expect(ofType(composed, NATIVE_WORKFLOW_NOTICE_TYPE)).toEqual([workflow]);
+      expect(ofType(composed, NATIVE_ORCHESTRATE_NOTICE_TYPE)).toEqual([]);
+      const policy = composed.filter(message => policyModeOf(message) !== undefined);
+      expect(policy.map(policyModeOf)).toEqual(["workflow"]);
+      expect(guidanceCount(policy[0])).toBe(1);
+      expect(totalGuidance(composed)).toBe(1);
+    }
+  }
+});
+
+test("a direct turn carries the default policy without orchestration guidance", async () => {
+  const plugin = registeredPlugin(DEFAULT_ROUTE);
+  await plugin.beginTurn(PROMPT);
+  const composed = await plugin.context([user(PROMPT)]);
+  expect(composed.map(message => policyModeOf(message) ?? null).filter(Boolean)).toEqual(["default"]);
+  expect(totalGuidance(composed)).toBe(0);
+});
+
+test("master disable leaves native guidance unchanged and does not gate execution", async () => {
+  const plugin = registeredPlugin(ORCHESTRATE_ROUTE, false);
+  await plugin.beginTurn(PROMPT);
+  const messages = [keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 1), user(PROMPT)];
+  expect(await plugin.context(messages)).toEqual(messages);
+  expect(await plugin.attemptMutation()).toBeUndefined();
+});
+
+test("without a router policy, only the current turn's native notice is guided, by copy", async () => {
+  const branch: SessionEntry[] = [];
+  const { session, ctx } = makeSession({ branch });
+  registerAsMain(session);
+  let context: Handler | undefined;
+  registerOrcheAdvisor({
+    zod: z,
+    registerTool() {},
+    getActiveTools: () => [TOOL],
+    on(event: string, handler: Handler) { if (event === "context") context = handler; },
+  } as unknown as ExtensionAPI, new ReviewGate());
+  const historical = keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 1);
+  const current = keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 2);
+  const messages = [historical, user("Earlier request"), assistant("done"), current, user(PROMPT)]
+    .map(message => Object.freeze(message));
+  const snapshot = structuredClone(messages);
+  const result = await context!({ type: "context", messages }, ctx) as { messages: AgentMessage[] };
+  expect(messages).toEqual(snapshot);
+  expect(result.messages[0]).toBe(historical);
+  expect(guidanceCount(result.messages[3])).toBe(1);
+  expect(totalGuidance(result.messages)).toBe(1);
+  expect(await context!({ type: "context", messages: result.messages }, ctx)).toBeUndefined();
+  // A workflow notice alone carries no orchestration contract to annotate.
+  expect(await context!({ type: "context", messages: [keywordNotice(NATIVE_WORKFLOW_NOTICE_TYPE, 4), user(PROMPT)] }, ctx))
+    .toBeUndefined();
 });

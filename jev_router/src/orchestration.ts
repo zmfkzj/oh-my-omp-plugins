@@ -1,22 +1,26 @@
 /**
- * Front-door routing chooses whether to attach native orchestration guidance and,
- * independently, whether the turn's plan requires checkpoint review. Review is
- * assessed even when orchestration is unavailable; only the guidance is withheld.
+ * Front-door routing chooses whether to attach this plugin's orchestration policy
+ * and, independently, whether the turn's plan requires checkpoint review. Review
+ * is assessed even when orchestration is unavailable; only the guidance changes.
  * A successful todo init/append can promote a direct turn after its committed
  * plan reveals independent work. Once a turn is orchestrated its route is final,
  * so a changed plan requires review without another Jev request. Once a turn
  * requires review, each newly finished phase requires a phase-boundary review.
  * Without a risk assessment (no credential, failed request) review is required.
- * Provider context notices are never persisted; review requirements leave through
- * `onReviewDecision`, and the primary model never changes.
+ *
+ * Guidance precedence for the current turn: OMP's workflow notice, then OMP's
+ * explicit orchestrate notice, then an automatic ORCHESTRATE route, then DEFAULT.
+ * The explicit notice is replaced in place by this plugin's policy notice; the
+ * workflow notice is kept and only receives an auxiliary supplement. Notices are
+ * provider-context only: history is never persisted or mutated, requirements
+ * leave through `onReviewDecision`, and the primary model never changes.
  */
-import { renderOrchestrateNotice } from "@oh-my-pi/pi-coding-agent/modes/magic-keywords";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AgentSession, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { ToolResultEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import type { JevRouterConfig } from "./config.ts";
-import { mainSessionOf, orchestrateKeywordEnabled } from "./host.ts";
+import { mainSessionOf } from "./host.ts";
 import type {
 	GateOutcome,
 	JevDecider,
@@ -25,11 +29,16 @@ import type {
 	ReviewRequirement,
 } from "./jev.ts";
 import type { RouteLogger } from "./logging.ts";
+import {
+	buildPolicyNotice,
+	currentTurnNotices,
+	NATIVE_ORCHESTRATE_NOTICE_TYPE,
+	NATIVE_WORKFLOW_NOTICE_TYPE,
+	policyModeOf,
+	type PolicyMode,
+} from "./orchestration-policy.ts";
 import { buildRoutingContext, formatTodoPlan, isTodoPlan, latestCommittedTodoPlan, visibleText } from "./routing-context.ts";
 import type { Telemetry } from "./telemetry.ts";
-
-/** OMP's own notice type; reusing it keeps renderers and other extensions working. */
-export const ORCHESTRATE_NOTICE_TYPE = "orchestrate-notice";
 
 export type OrchestrationOutcome = OrchestrationRoute | "SKIP" | "ERROR";
 
@@ -48,26 +57,10 @@ export interface OrchestrationRecord {
 	at: number;
 }
 
-/**
- * Native keyword notices are prepended immediately before the current user's
- * message. A historical notice belongs to its own earlier user turn.
- */
-export function turnHasNativeOrchestrateNotice(messages: readonly AgentMessage[]): boolean {
-	let index = messages.length - 1;
-	while (index >= 0 && messages[index]?.role !== "user") index--;
-	if (index < 0) return false;
-	for (let cursor = index - 1; cursor >= 0; cursor--) {
-		const message = messages[cursor];
-		if (message?.role !== "custom") return false;
-		if (message.customType === ORCHESTRATE_NOTICE_TYPE) return true;
-	}
-	return false;
-}
-
-function turnHasOwnNotice(messages: readonly AgentMessage[], notice: AgentMessage): boolean {
-	return messages.some(message => message === notice || (message.role === "custom" &&
-		notice.role === "custom" && message.customType === ORCHESTRATE_NOTICE_TYPE &&
-		message.timestamp === notice.timestamp && message.content === notice.content));
+/** Identifies one persisted native notice even after later user messages move it out of the turn prefix. */
+function noticeKey(message: AgentMessage): string | undefined {
+	if (message.role !== "custom" || message.customType !== NATIVE_ORCHESTRATE_NOTICE_TYPE) return undefined;
+	return `${message.timestamp}\u0000${JSON.stringify(message.content)}`;
 }
 
 /** Initial notices precede the current user; promotions follow their own todo result. */
@@ -116,7 +109,10 @@ function turnOwnsTodoCall(session: AgentSession, prompt: string, toolCallId: str
 			part.type === "toolCall" && part.id === toolCallId && part.name === "todo"));
 }
 
-/** A gated-in request always has its review assessed; `orchestrationAllowed` only governs guidance. */
+/**
+ * A gated-in request always has its review assessed. `orchestrationAllowed` only
+ * governs automatic promotion; an explicit native request is handled regardless.
+ */
 type Gate =
 	| { ok: true; session: AgentSession; orchestrationAllowed: boolean; reason?: string }
 	| { ok: false; reason: string };
@@ -135,15 +131,11 @@ export function gateRequest(ctx: ExtensionContext, prompt: string, config: JevRo
 	if (text.startsWith("<system-")) return { ok: false, reason: "synthetic-notice" };
 	if (session.getPlanModeState?.()?.enabled === true) return { ok: false, reason: "plan-mode" };
 
+	// OMP's keyword settings only decide whether an explicit notice can appear; they never gate automatic routing.
 	const taskAvailable = session.getEnabledToolNames().includes("task");
-	const keywordEnabled = orchestrateKeywordEnabled(session);
-	const orchestrationAllowed = config.orchestrationRoutingEnabled && taskAvailable && keywordEnabled;
+	const orchestrationAllowed = config.orchestrationRoutingEnabled && taskAvailable;
 	if (!orchestrationAllowed) {
-		const reason = !config.orchestrationRoutingEnabled
-			? "orchestration-routing-disabled"
-			: !taskAvailable
-				? "task-tool-unavailable"
-				: "orchestrate-keyword-disabled";
+		const reason = !config.orchestrationRoutingEnabled ? "orchestration-routing-disabled" : "task-tool-unavailable";
 		return { ok: true, session, orchestrationAllowed, reason };
 	}
 	return { ok: true, session, orchestrationAllowed };
@@ -182,10 +174,18 @@ export interface OrchestrationRouterDeps {
 interface TurnState {
 	prompt: string;
 	session: AgentSession;
-	/** OMP's own orchestrate notice precedes this turn's user message. */
+	/** OMP's explicit orchestrate notice was seen in this turn; the route is then final. */
 	explicitLogged: boolean;
-	notice?: AgentMessage;
+	/** Keys of this turn's native orchestrate notices, replaced wherever they appear. */
+	natives: string[];
+	/** OMP's workflow notice was seen in this turn; it governs execution for the rest of the turn. */
+	workflow: boolean;
+	/** Jev routed this turn to ORCHESTRATE; the route is then final. */
+	orchestrated: boolean;
+	/** The todo call whose committed plan promoted the turn; absent for an initial route. */
 	noticeAnchor?: string;
+	/** One stable notice per policy mode, created on first use and reused on every request. */
+	notices: Partial<Record<PolicyMode, AgentMessage>>;
 	pending?: Promise<void>;
 	seenPlans: Set<string>;
 	/** The latest committed plan this turn has seen; finished phases are measured against it. */
@@ -223,7 +223,8 @@ export class OrchestrationRouter {
 		const priorPlan = latestCommittedTodoPlan(gate.session.sessionManager.getBranch());
 		const turn: TurnState = {
 			prompt, session: gate.session,
-			explicitLogged: false, seenPlans: new Set(priorPlan ? [JSON.stringify(priorPlan)] : []),
+			explicitLogged: false, natives: [], workflow: false, orchestrated: false, notices: {},
+			seenPlans: new Set(priorPlan ? [JSON.stringify(priorPlan)] : []),
 			phases: priorPlan ?? [], reviewRequired: false,
 		};
 		this.#turn = turn;
@@ -279,26 +280,89 @@ export class OrchestrationRouter {
 		await run;
 	}
 
-	/** Attach the turn's decided notice to each provider request, if needed. */
+	/**
+	 * Return a provider-context copy carrying exactly one policy notice for this
+	 * turn, or `undefined` when nothing changes. This turn's native orchestrate
+	 * notices are replaced in place; historical turns, the workflow notice and
+	 * other messages are left untouched, and no message object is mutated.
+	 */
 	async applyToContext(ctx: ExtensionContext, messages: AgentMessage[]): Promise<AgentMessage[] | undefined> {
 		const turn = this.#turn;
-		if (!turn || !mainSessionOf(ctx)) return undefined;
-
-		if (turn.notice && turnHasOwnNotice(messages, turn.notice)) return undefined;
-		if (turnHasNativeOrchestrateNotice(messages)) {
-			if (!turn.explicitLogged) {
-				this.#deps.logger.route("jev.orchestration", { route: "SKIP", reason: "explicit-orchestrate" });
-				turn.explicitLogged = true;
-				this.#notify(ctx, turn, true, "initial-plan", "explicit-orchestrate");
-			}
+		if (!turn || turn.session !== mainSessionOf(ctx) || !gateRequest(ctx, turn.prompt, this.#deps.config()).ok) {
 			return undefined;
 		}
-		if (!turn.notice) return undefined;
-		const index = noticeInsertIndex(messages, turn.noticeAnchor);
-		if (index < 0) return undefined;
-		const next = [...messages];
-		next.splice(index, 0, turn.notice);
-		return next;
+
+		// Record this turn's keyword notices while they still precede its user message.
+		for (const index of currentTurnNotices(messages, NATIVE_ORCHESTRATE_NOTICE_TYPE)) {
+			const key = noticeKey(messages[index]!);
+			if (key && !turn.natives.includes(key)) turn.natives.push(key);
+		}
+		if (currentTurnNotices(messages, NATIVE_WORKFLOW_NOTICE_TYPE).length > 0) turn.workflow = true;
+		if (turn.natives.length > 0 && !turn.explicitLogged) {
+			this.#deps.logger.route("jev.orchestration", { route: "SKIP", reason: "explicit-orchestrate" });
+			turn.explicitLogged = true;
+			this.#notify(ctx, turn, true, "initial-plan", "explicit-orchestrate");
+		}
+
+		const tools = turn.session.getEnabledToolNames();
+		const mode: PolicyMode | undefined = turn.workflow
+			? "workflow"
+			: turn.explicitLogged || turn.orchestrated
+				? "orchestrate"
+				: tools.includes("task") ? "default" : undefined;
+		const isNative = (message: AgentMessage) => {
+			const key = noticeKey(message);
+			return key !== undefined && turn.natives.includes(key);
+		};
+		const firstNative = messages.find(isNative);
+		// Rendered once per turn and mode, so content and timestamp stay stable across requests.
+		const notice = mode && (turn.notices[mode] ??= buildPolicyNotice(mode, tools,
+			firstNative?.role === "custom" ? firstNative.timestamp : Date.now()));
+		const present = messages.some(message => this.#ownMode(turn, message) === mode);
+
+		const next: AgentMessage[] = [];
+		let placed = false;
+		let changed = false;
+		for (const message of messages) {
+			if (isNative(message)) {
+				// The native and plugin policies are never shown together.
+				changed = true;
+				if (notice && !present && !placed) {
+					next.push(notice);
+					placed = true;
+				}
+				continue;
+			}
+			const own = this.#ownMode(turn, message);
+			if (own !== undefined) {
+				if (own === mode && !placed) {
+					next.push(message);
+					placed = true;
+				} else changed = true; // Superseded by a promotion, or a duplicate.
+				continue;
+			}
+			next.push(message);
+		}
+		if (notice && !placed) {
+			// A promotion stays behind its todo result; every other notice precedes the current user.
+			const anchor = mode === "orchestrate" && !turn.explicitLogged ? turn.noticeAnchor : undefined;
+			const index = noticeInsertIndex(next, anchor);
+			if (index >= 0) {
+				next.splice(index, 0, notice);
+				changed = true;
+			}
+		}
+		return changed ? next : undefined;
+	}
+
+	/** The mode of a notice this turn created, including a copy later hooks extended. */
+	#ownMode(turn: TurnState, message: AgentMessage): PolicyMode | undefined {
+		const mode = policyModeOf(message);
+		const own = mode && turn.notices[mode];
+		if (!own || own.role !== "custom" || message.role !== "custom" || message.timestamp !== own.timestamp) return undefined;
+		return typeof message.content === "string" && typeof own.content === "string" && message.content.startsWith(own.content)
+			? mode
+			: undefined;
 	}
 
 	async #decide(
@@ -310,11 +374,11 @@ export class OrchestrationRouter {
 	): Promise<void> {
 		if (this.#turn !== turn) return;
 		// An orchestrated route is final for the turn, so Jev cannot change its review requirement.
-		const result = turn.notice || turn.explicitLogged ? undefined : await this.#classify(turn, phases);
+		const result = turn.orchestrated || turn.explicitLogged ? undefined : await this.#classify(turn, phases);
 		if (this.#turn !== turn) return;
 		const gate = gateRequest(ctx, turn.prompt, this.#deps.config());
 		if (!gate.ok) return;
-		if (turn.notice || turn.explicitLogged) {
+		if (turn.orchestrated || turn.explicitLogged) {
 			// Also covers native guidance that arrived while Jev was deciding.
 			this.#notify(ctx, turn, true, checkpoint, turn.explicitLogged ? "explicit-orchestrate" : "orchestrate");
 			return;
@@ -367,7 +431,7 @@ export class OrchestrationRouter {
 			at: Date.now(),
 		};
 		if (outcome === "ORCHESTRATE") {
-			turn.notice = this.#buildNotice(turn.session);
+			turn.orchestrated = true;
 			turn.noticeAnchor = todoToolCallId;
 		}
 		this.#notify(ctx, turn, reviewRequired, checkpoint, outcome === "ORCHESTRATE" ? "orchestrate" : reviewReason,
@@ -412,16 +476,5 @@ export class OrchestrationRouter {
 		if (required) turn.reviewRequired = true;
 		const inherited = this.#deps.onReviewDecision?.(ctx, required, checkpoint, reason, turn.prompt, workScope);
 		if (inherited === true) turn.reviewRequired = true;
-	}
-
-	#buildNotice(session: AgentSession): AgentMessage {
-		return {
-			role: "custom",
-			customType: ORCHESTRATE_NOTICE_TYPE,
-			content: renderOrchestrateNotice({ tools: session.getEnabledToolNames() }),
-			display: false,
-			attribution: "user",
-			timestamp: Date.now(),
-		} as AgentMessage;
 	}
 }

@@ -7,7 +7,7 @@
  * deleted by `omp plugin uninstall`, so no configuration outlives the plugin.
  *
  * Users edit it with the native CLI:
- *   omp plugin config omp-jev-router set taskMinConfidence 0.8
+ *   omp plugin config set omp-jev-router orchestrationMinConfidence 0.7
  */
 import { getPluginSettings } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/loader";
 import { PluginManager } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/manager";
@@ -22,15 +22,6 @@ export interface JevRouterConfig {
 	orchestrationRoutingEnabled: boolean;
 	orchestrationMinConfidence: number;
 	orchestrationMinMargin: number;
-
-	taskRoutingEnabled: boolean;
-	taskMinConfidence: number;
-	taskMinMargin: number;
-
-	/** Model roles for the three generic worker tiers. */
-	easyTaskRole: string;
-	hardTaskRole: string;
-	challengeTaskRole: string;
 
 	routingTimeoutMs: number;
 	maxRoutingInputChars: number;
@@ -47,14 +38,6 @@ export const DEFAULT_CONFIG: Readonly<JevRouterConfig> = Object.freeze({
 	orchestrationMinConfidence: 0.6,
 	orchestrationMinMargin: 0.2,
 
-	taskRoutingEnabled: true,
-	taskMinConfidence: 0.75,
-	taskMinMargin: 0.2,
-
-	easyTaskRole: "task_easy",
-	hardTaskRole: "task_hard",
-	challengeTaskRole: "task_challenge",
-
 	routingTimeoutMs: 4000,
 	maxRoutingInputChars: 12000,
 
@@ -63,6 +46,24 @@ export const DEFAULT_CONFIG: Readonly<JevRouterConfig> = Object.freeze({
 });
 
 export const CONFIG_KEYS = Object.keys(DEFAULT_CONFIG) as (keyof JevRouterConfig)[];
+
+/**
+ * Keys removed with per-task tier routing. Stored values are never read into
+ * the config; status only reports them so the user can delete them.
+ */
+export const RETIRED_CONFIG_KEYS = Object.freeze([
+	"taskRoutingEnabled",
+	"taskMinConfidence",
+	"taskMinMargin",
+	"easyTaskRole",
+	"hardTaskRole",
+	"challengeTaskRole",
+] as const);
+
+/** Retired keys present in a raw settings record, in declaration order. */
+export function retiredConfigKeys(raw: Record<string, unknown> | undefined): string[] {
+	return raw ? RETIRED_CONFIG_KEYS.filter(key => Object.hasOwn(raw, key)) : [];
+}
 
 function asBoolean(value: unknown, fallback: boolean): boolean {
 	if (typeof value === "boolean") return value;
@@ -75,13 +76,6 @@ function asNumber(value: unknown, fallback: number, min: number, max: number): n
 	const raw = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
 	if (!Number.isFinite(raw)) return fallback;
 	return Math.min(max, Math.max(min, raw));
-}
-
-function asRole(value: unknown, fallback: string): string {
-	if (typeof value !== "string") return fallback;
-	// Accept both `task_hard` and `@task_hard`; roles are stored bare.
-	const trimmed = value.trim().replace(/^@/, "");
-	return /^[A-Za-z0-9_-]+$/.test(trimmed) ? trimmed : fallback;
 }
 
 /** Coerce a raw settings record into a complete, range-clamped config. */
@@ -102,14 +96,6 @@ export function normalizeConfig(raw: Record<string, unknown> | undefined): JevRo
 			1,
 		),
 		orchestrationMinMargin: asNumber(r.orchestrationMinMargin, DEFAULT_CONFIG.orchestrationMinMargin, 0, 1),
-
-		taskRoutingEnabled: asBoolean(r.taskRoutingEnabled, DEFAULT_CONFIG.taskRoutingEnabled),
-		taskMinConfidence: asNumber(r.taskMinConfidence, DEFAULT_CONFIG.taskMinConfidence, 0, 1),
-		taskMinMargin: asNumber(r.taskMinMargin, DEFAULT_CONFIG.taskMinMargin, 0, 1),
-
-		easyTaskRole: asRole(r.easyTaskRole, DEFAULT_CONFIG.easyTaskRole),
-		hardTaskRole: asRole(r.hardTaskRole, DEFAULT_CONFIG.hardTaskRole),
-		challengeTaskRole: asRole(r.challengeTaskRole, DEFAULT_CONFIG.challengeTaskRole),
 
 		routingTimeoutMs: asNumber(r.routingTimeoutMs, DEFAULT_CONFIG.routingTimeoutMs, 250, 20_000),
 		maxRoutingInputChars: asNumber(r.maxRoutingInputChars, DEFAULT_CONFIG.maxRoutingInputChars, 200, 40_000),
@@ -134,14 +120,22 @@ export function parseConfigValue(key: keyof JevRouterConfig, value: string): boo
 	return value.trim();
 }
 
+export interface LoadedConfig {
+	config: JevRouterConfig;
+	/** Retired keys still stored for this plugin; they have no effect. */
+	retiredKeys: string[];
+}
+
 /** Read the merged (global + project-override) plugin settings record. */
-export async function loadConfig(cwd: string): Promise<JevRouterConfig> {
+export async function loadConfig(cwd: string): Promise<LoadedConfig> {
+	let raw: Record<string, unknown> | undefined;
 	try {
-		return normalizeConfig(await getPluginSettings(PLUGIN_NAME, cwd));
+		raw = await getPluginSettings(PLUGIN_NAME, cwd);
 	} catch {
 		// Loaded outside the plugin manager (e.g. `--extension ./src/index.ts`): defaults apply.
-		return normalizeConfig(undefined);
+		raw = undefined;
 	}
+	return { config: normalizeConfig(raw), retiredKeys: retiredConfigKeys(raw) };
 }
 
 /** Drop every stored key, restoring defaults. */

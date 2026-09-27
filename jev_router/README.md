@@ -1,16 +1,22 @@
 # omp-jev-router
 
-Two bounded decision calls for [OMP](https://omp.sh), made by TypeSafe's
-[Jev](https://typesafe.ai) System One model:
+A coordination layer for [OMP](https://omp.sh). One bounded decision call per
+request, made by TypeSafe's [Jev](https://typesafe.ai) System One model, chooses
+DEFAULT or ORCHESTRATE and independently assesses review risk. The primary model
+stays fixed. The plugin then supplies its **own** execution guidance and
+enforces checkpoint review, while every worker runs through OMP's native `task`
+tool unchanged.
 
-1. **Orchestration** — choose DEFAULT or OMP's native ORCHESTRATE contract.
-   An independent review-risk question runs in the same call. The primary model stays fixed.
-2. **TASK tier** — route generic `task` workers through `@task_easy`,
-   `@task_hard`, or `@task_challenge`.
+Generic workers are OMP's native `task` agent; their model comes from your
+`@task` role. The plugin does not classify, rewrite, alias or re-route task
+calls, and specialized (`scout`, `reviewer`, `sonic`, …) and custom agents keep
+their identity and tool permissions. This package also provides an explicit
+`orche_advisor` checkpoint-review tool and a passive Verification Auditor.
+Actual review execution is separate from Jev classification.
 
-OMP's own SMOL/TASK decision and explicit agent choices are preserved. This package
-also provides an explicit `orche_advisor` checkpoint-review tool and a passive
-Verification Auditor. Actual review execution is separate from Jev classification.
+> **Breaking change (single-task cutover).** The `task-easy`, `task-hard` and
+> `task-challenge` aliases, per-task Jev tier classification and their settings
+> are gone; see [Migrating from tier routing](#migrating-from-tier-routing).
 
 ---
 
@@ -18,17 +24,17 @@ Verification Auditor. Actual review execution is separate from Jev classificatio
 
 ```text
 USER → Jev (bounded dialogue + committed plan)
-  DEFAULT     → keep current primary model; ordinary delegation remains available
-  ORCHESTRATE → keep current primary model + native orchestration/review guidance
-  uncertain   → DEFAULT, no model switch
+  DEFAULT     → plugin DEFAULT guidance: work directly, delegate only when useful
+  ORCHESTRATE → plugin ORCHESTRATE guidance: coordinated delegation
+  uncertain   → DEFAULT; primary model never changes
 
 Successful todo init/append → reconsider changed plan → optionally promote to ORCHESTRATE
 Independent review REQUIRED → scope-bound gate → successful review or explicit user waiver
 Multiple implementation workers → pre-dispatch gate even when route is DEFAULT
 
-Primary → OMP's native SMOL/TASK choice
-  SMOL → untouched
-  TASK → Jev EASY / HARD / CHALLENGE → derived tier worker
+Primary → native `task` call (task text carries the work contract)
+  → review gate (live native schema, exact dispatch hash, single-use spawn permits)
+  → OMP preflight / spawn / async / cancel → worker result → primary verifies acceptance
 ```
 
 ## Architecture
@@ -40,8 +46,12 @@ reuse the decision. Jev sees the current request, recent visible user/assistant
 messages, the earliest user goal still on the active branch, and the latest
 committed todo plan. It never receives hidden thinking or raw tool-result bodies.
 
-- **DEFAULT** permits direct work or ordinary delegation; it does not mean review is optional.
-- **ORCHESTRATE** injects OMP's hidden, user-attributed `orchestrate-notice`.
+- **DEFAULT** injects the plugin's light DEFAULT guidance (when `task` is
+  enabled): work directly, delegate one unit only when a separate context helps.
+  It does not mean review is optional.
+- **ORCHESTRATE** injects the plugin's own coordinated-delegation guidance as a
+  hidden, user-attributed `jev-orchestrate-notice`. OMP's native orchestrate
+  prompt is not reused as execution policy.
 - In the **same Jev request**, an independent REQUIRED/OPTIONAL question assesses
   review risk: release gates, persistent data, compensation/payment/security,
   material redesign or scope expansion, and repeated failures. Ambiguous/missing
@@ -69,12 +79,48 @@ The mandatory review gate independently blocks unreviewed implementation and
 dispatch, including a worker batch submitted alongside todo. It cannot undo an
 operation already started before a new requirement existed.
 
-Existing native keyword notices are not duplicated. Injected notices live only
-in provider context, not in the transcript. Subagents, plan mode, slash commands,
-synthetic notices and the master disable switch skip classification.
-Disabling orchestration, its keyword or the task tool suppresses the parallel
-route only: inline work still receives the independent review assessment.
-There is no primary model switch or end-of-turn model restoration path.
+Execution guidance precedence for the current turn is: native `workflow-notice`
+(`workflowz`) > native explicit `orchestrate-notice` > automatic ORCHESTRATE >
+DEFAULT. A current-turn native `orchestrate-notice` is replaced in place by the
+plugin's ORCHESTRATE notice, so native and plugin execution guidance never both
+appear. A current-turn `workflow-notice` is kept verbatim; the plugin adds only
+an auxiliary notice with the task-body contract and verification rules, never
+its own dispatch or fan-out instruction. Earlier turns, the user's text and
+other extensions' messages are never changed. Injected notices live only in
+provider context, not in the transcript. The Orche-Advisor review guidance is
+attached once to the plugin's orchestrate/workflow notice.
+
+Subagents, plan mode, slash commands, synthetic notices and the master disable
+switch skip classification and guidance; with `enabled=false` OMP's native
+behavior is untouched. Disabling `orchestrationRoutingEnabled` or the task tool
+suppresses automatic ORCHESTRATE only: inline work still receives the
+independent review assessment, and an explicit native `orchestrate` request is
+still handled by the plugin's policy. OMP's magic-keyword settings only decide
+whether an explicit native notice appears; they never gate automatic routing.
+With `task` disabled, no delegation is advertised. There is no primary model
+switch or end-of-turn model restoration path.
+
+### Task body contract
+
+The plugin defines no separate `solutionSpace` or contract field and does not
+replace the task tool. Host versions may expose their own additional metadata;
+that stays under host validation. The guidance asks the primary to write each
+`task` item (or workflow item prompt) as plain text with these sections:
+
+```text
+# Goal                          observable outcome
+# Scope and non-goals           owned files, interfaces, areas not to touch
+# Decided and open              fixed decisions / judgments left to the worker
+# Inputs and dependencies       referenced files/artifacts, verified upstream contracts
+# Acceptance and verification   success/error/boundary behavior, worker vs coordinator checks
+# Return                        done/blocked, actual changes, checks run, remaining issues
+```
+
+Shared `context` carries only constraints common to every item; `outputSchema`
+is used only when a structured result is needed. The layout is guidance, not a
+runtime schema: free-form task calls are never rejected for missing sections.
+Because the whole `task`/`context` text is inside the review hash, design
+decisions written into the body are covered by the approval.
 
 ### Checkpoint reviewer and Verification Auditor
 
@@ -90,14 +136,27 @@ Otherwise routine work can still use an optional review.
 - A required-review scope blocks inline mutation and arbitrary execution too:
   edit/write/bash/eval and unknown tools are blocked. Native read/search, todo,
   ask, finding management and the reviewer remain available for scoping.
+- Task declarations are normalized through the **live** native `task` schema
+  (`pi.getAllTools()` parameters) and the host's own `validateToolArguments`:
+  the session's effective default agent and unknown-field handling come from
+  that schema, not from a copy. The intent field `i` is excluded, as the host
+  does. If `task` is missing or its schema cannot be validated, declarations are
+  refused rather than guessed; invalid shapes get no staging or permit.
 - The shared `before_subagent_spawn` hook checks actual task and eval
   `agent()`/workpool dispatches before child execution. Every native worker,
   including one in an approved required-review batch, needs a single-use permit
-  from an accepted `task` preflight. Parent-only approval is not a spawn permit.
-  Permits bind the current scope, worker type and requested name; host collision
-  suffixes are accepted. Unnamed workers consume a scope/type-bound allowance
-  because the host generates their handle after preflight. Reload loses permits:
-  resubmit the exact task input, reusing its review if the scope is unchanged.
+  issued for the actual `task` tool call. Parent-only approval is not a spawn
+  permit. The spawn event exposes only the agent and a `spawnKey`, so permits
+  are matched against the worker identities OMP derives from the approved
+  arguments (a requested `name`, its `-2`/`-3` collision suffixes, or
+  `<toolCallId>:<index>` for unnamed synchronous items). When OMP's async mode
+  preallocates random IDs, implementation items must carry a unique `name`;
+  overlapping or ambiguous identities are refused before execution instead of
+  guessed. Permits are discarded on error/blocked results, after synchronous
+  completion, and on session switch/branch/tree navigation or shutdown; a normal
+  async return keeps pending permits for its queued workers. Reload loses
+  permits: resubmit the exact task input, reusing its review if the scope is
+  unchanged.
 - Programmatic implementation spawns require review. The eval hook binds the
   caller's recorded eval arguments, spawn identity and model patterns; the host
   event does not expose its expanded assignment or mutable kernel state. Use
@@ -166,11 +225,13 @@ mutation. Outstanding requirements are not erased by conversational follow-ups.
 Known observation-only Studio devices (discovery, state, logs, instance/
 script/tree inspection) bypass the mutation gate despite using the `write` transport.
 Arbitrary Luau, shell/eval execution and unknown devices remain gated.
-Receipt format v4 does not accept earlier receipts, so existing sessions need a
-fresh review before subsequent required-review execution. Legacy aggregate
-dispatch summaries may already have lost worker text: restage the exact task
-input, or use `dispatch: null` to withdraw them. They cannot be reviewed as if
-complete. Neither recovery path requires a user waiver.
+The single-task cutover bumped the review receipt/dispatch format: earlier
+receipts (including ones approving tier-alias dispatches) are never reused, so
+resumed sessions need a fresh review before subsequent required-review
+execution. Legacy aggregate dispatch summaries may already have lost worker
+text: restage the exact task input, or use `dispatch: null` to withdraw them.
+They cannot be reviewed as if complete. Neither recovery path requires a user
+waiver.
 
 Failure is not permission, but an unavailable reviewer is not a rejected plan:
 
@@ -239,71 +300,39 @@ The standalone `orche-advisor` CLI remains available from this package:
 input and model selection without requesting a review. The CLI uses
 `modelRoles.orche-advisor` unless `--model` is supplied.
 
-### TASK tier (`tool_call`)
+### Native `task` worker (`tool_call`)
 
-The `tool_call` hook fires from the agent loop's prepare phase with **validated**
-arguments, and OMP's task schema declares `agent: "string = '<spawn-policy
-default>'"`. So `input.agent` is always the session's authoritative effective
-agent. The router acts only on items whose `agent` is exactly `task`; anything
-else — `sonic`, `scout`, `reviewer`, `security-reviewer`, project/user/plugin
-agents, `^`-tagged model pseudonyms — passes through untouched. A restricted
-session whose default agent is `sonic` therefore never looks like a generic task
-spawn.
+The `tool_call` hook only enforces review; it never returns a revised task
+input. `agent` is never changed, so a restricted session whose spawn-policy
+default is `sonic` keeps that default, and explicit `sonic`, `scout`,
+`reviewer`, `security-reviewer`, project/user/plugin agents and `^`-tagged model
+pseudonyms run exactly as requested. OMP keeps owning task execution, spawn
+policy, concurrency, async results, cancellation, tool permissions, isolation
+and workpool. There is no automatic model escalation after a failure.
 
-A `task.batch` call is classified in **one** Jev request carrying one question
-per item, and only the `agent` field is ever changed: `name`, `task`, `context`,
-`effort`, `isolated`, `tools`, `outputSchema` and `schemaMode` survive verbatim.
-
-### Why worker tiers need alias agents
-
-OMP's task wire schema deletes unknown keys (`"+": "delete"`), and the only
-invocation-local model override (`runSubprocess`'s `modelOverride`) is reachable
-from the eval bridge, not from a tool-call input revision. Changing the model for
-one spawn therefore has to go through the `agent` field.
-
-The plugin **derives** `task-easy`, `task-hard`, and `task-challenge` at runtime
-from OMP's bundled `task` definition: same prompt, `spawns`, thinking level and
-tool policy; only the model role differs. Files live under `<plugin>/agents/`
-and are updated when the bundled prompt or configuration changes.
-Per-agent `task.agentPrewalk.task`, `task.agentAdvisor.task`, and `task.prewalk`
-choices are mirrored onto all three aliases. Stale/unwritable aliases and agents
-not advertised by the live spawn policy are not targeted.
-
-The plugin never mutates `task.agentModelOverrides` per spawn: that is global
-state and concurrent spawns would race on it.
-
-## Why OMP's native SMOL/TASK routing is preserved
-
-Explicit `sonic`, `scout`, reviewer, and custom-agent choices remain untouched.
-Jev only refines an already-selected generic `task` into the least expensive tier
-likely to finish correctly. It does not expand a task into more workers.
+Task execution needs no Jev call or credential. Only the front-door decision
+uses Jev; its failures follow the conservative review policy below.
 
 ## Recommended model topology
 
 ```yaml
 modelRoles:
   default: <chosen session primary>         # never changed by this plugin
-  task: <capable worker>                    # OMP's generic task baseline
-  smol: <lightweight model>                 # OMP's lightweight baseline
-  slow: <strong reasoning model>            # optional role used by challenge default
-  task_easy: "@smol"                        # mechanical, low-risk work
-  task_hard: "@task"                        # substantive implementation
-  task_challenge: "@slow"                   # high-risk or unresolved reasoning
+  task: <capable worker>                    # OMP's generic task worker
+  smol: <lightweight model>                 # OMP's lightweight baseline (sonic)
   advisor: <general advisor model>          # only if declared in WATCHDOG.yml
   verification-auditor: "@smol"            # distinct from ADVISOR
   orche-advisor: <checkpoint reviewer>      # explicitly configured
 ```
 
-No vendor/model name is hard-coded. Missing tier roles are registered on primary
-session startup as `@smol`, `@task`, and `@slow` respectively; existing assignments
-are preserved. `verification-auditor` defaults to `@smol`. Child sessions never
-register roles. If you configure custom role names, those names receive the same
-missing-role defaults.
+No vendor/model name is hard-coded. `verification-auditor` is registered as
+`@smol` on primary-session startup if unset; existing assignments are preserved
+and child sessions never register roles. `@task` is never written: if it does
+not resolve, `/jev-router status` says so and OMP reports its own spawn error;
+no other role (such as `@slow`) is substituted.
 
-Assign distinct authenticated models in OMP's model selector or `config.yml`.
-`/jev-router status` reports missing roles and tier roles resolving to the same
-model. Keeping one primary model avoids router-induced full-context provider
-switches; it does not guarantee provider cache hits or prevent OMP/user fallback.
+Keeping one primary model avoids router-induced full-context provider switches;
+it does not guarantee provider cache hits or prevent OMP/user fallback.
 
 ## Install
 
@@ -317,9 +346,9 @@ From a checkout:
 omp plugin link /path/to/jev_router
 ```
 
-Nothing else is required. No `AGENTS.md` edit, no agent files to copy, no
-`models.yml` surgery, no routing prompt, no separate SDK install, no OMP patch.
-The TypeSafe SDK ships as a plugin dependency.
+Nothing else is required. No `AGENTS.md` edit, no agent files, no `models.yml`
+surgery, no routing prompt, no separate SDK install, no OMP patch. The TypeSafe
+SDK ships as a plugin dependency; the package ships no agent definitions.
 
 ## First-run credential setup
 
@@ -350,10 +379,10 @@ plugin leaves your account credential exactly where you put it.
 | Command | Effect |
 | --- | --- |
 | `/jev-router setup` | Configure or remove the TypeSafe credential. |
-| `/jev-router status` | Fixed-primary policy, resolved worker roles, aliases and last decisions. |
-| `/jev-router test` | Live DEFAULT/ORCHESTRATE and three-tier classification probes. |
-| `/jev-router stats` | Aggregated counts, latencies, distributions, worker cost. |
-| `/jev-router reset` | Clear telemetry and stored configuration. |
+| `/jev-router status` | Fixed-primary policy, native `task` worker and `@task` role, last decision, retired leftovers. |
+| `/jev-router test` | Live DEFAULT/ORCHESTRATE probes (front door only; no task classification exists). |
+| `/jev-router stats` | Live-epoch decisions and observed task-worker usage, kept apart from pre-v5 history. |
+| `/jev-router reset` | Clear plugin-owned telemetry files and stored configuration. |
 | `/review-status` | Current required-review scope, receipt and failure state. |
 | `/review-retry <key> <reason>` | User-authorized new attempt for an unchanged rejected plan; not needed for infrastructure recovery. |
 | `/review-waive <key> <reason>` | Explicit user waiver for exactly that scope. |
@@ -368,19 +397,19 @@ Orchestration routing  enabled
 Primary model          unchanged — no model switching
 Model                  jev-latest (default)
 Gate                   confidence ≥ 0.6, margin ≥ 0.2
+Coordination guidance  plugin-owned (jev-orchestrate-notice)
 
-TASK tier routing      enabled
-TASK_EASY              @task_easy → provider/lightweight
-TASK_HARD              @task_hard → provider/coding
-TASK_CHALLENGE         @task_challenge → provider/reasoning
-Gate                   confidence ≥ 0.75, margin ≥ 0.2
-Easy tier agent        task-easy — discoverable and spawnable
-Hard tier agent        task-hard — discoverable and spawnable
-Challenge tier agent   task-challenge — discoverable and spawnable
+Task worker            native `task` agent
+  @task role           provider/coding
 
 Last orchestration     DEFAULT 0.91
-Last TASK route        TASK_HARD 0.87
+Review assessment      optional
 ```
+
+If `@task` does not resolve, status says so; the plugin does not route around
+it. Retired tier settings still stored for the plugin, and leftover
+`@task_easy`/`@task_hard`/`@task_challenge` roles, are listed as unused and
+left in place.
 
 No secret is ever printed: the credential is reported by provenance only.
 
@@ -392,7 +421,6 @@ max(probabilities)` and `margin = p(top1) - p(top2)`:
 | | confidence | margin |
 | --- | --- | --- |
 | orchestration (2 labels) | `≥ 0.60` | `≥ 0.20` |
-| TASK tier (3 labels) | `≥ 0.75` | `≥ 0.20` |
 
 These gates are configurable, not measured guarantees of classifier accuracy.
 Use `/jev-router test` for live probes; only records with stored probabilities
@@ -410,47 +438,23 @@ The classifier evaluates the conversation and plan, not just the latest terse
 follow-up. Difficulty, file count, or merely having a todo list do not mandate
 orchestration. Neither branch selects a different primary model.
 
-## TASK_EASY / TASK_HARD / TASK_CHALLENGE
-
-- **TASK_EASY** — exact procedure, settled design, local mechanical edits or
-  collection; low correctness risk and easily detected errors.
-- **TASK_HARD** — substantive feature implementation, normal debugging,
-  regression coverage and integration within clear boundaries.
-- **TASK_CHALLENGE** — unresolved root cause/design, ambiguity, concurrency,
-  security/authorization, data integrity or migration semantics, distributed
-  behavior, or a retry after a capable worker failed.
-
-When a valid EASY or HARD answer misses the confidence/margin gate, the router
-selects HARD. A CHALLENGE-leading answer remains CHALLENGE even below the gate.
-Missing answers, credentials, or provider failures still select CHALLENGE when
-its alias is available. Explicit non-generic agents are never rewritten.
-
-When the host supplies a task's `solutionSpace`, it is sent as `solution_space`
-alongside the task instruction. It describes settled versus unresolved decisions;
-it is evidence, not permission to override classification rules. The installed
-OMP 18.3.1 task schemas remove unknown fields before `tool_call`, including
-`solutionSpace`. On that host, this separate field requires an upstream schema
-change; callers must put settled/unresolved decisions in supported `task` text
-for them to reach the classifier. Optional-field support here alone does not
-enable the field in the host task tool.
-
 ## Failure behavior
 
-| failure | front door | TASK tier |
-| --- | --- | --- |
-| credential missing | current model; no automatic orchestration | `@task_challenge` |
-| 401 / 403 | current model; no automatic orchestration | `@task_challenge` |
-| 429 / 5xx | current model; no automatic orchestration | `@task_challenge` |
-| timeout | current model; no automatic orchestration | `@task_challenge` |
-| network failure | current model; no automatic orchestration | `@task_challenge` |
-| malformed response | current model; no automatic orchestration | `@task_challenge` |
-| SDK exception | current model; no automatic orchestration | `@task_challenge` |
-| unknown Jev model | current model; no automatic orchestration | `@task_challenge` |
-| gate not cleared | DEFAULT; current model | HARD for EASY/HARD-leading answers; otherwise CHALLENGE |
+| failure | front door |
+| --- | --- |
+| credential missing | current model; no automatic orchestration; review required |
+| 401 / 403 | current model; no automatic orchestration; review required |
+| 429 / 5xx | current model; no automatic orchestration; review required |
+| timeout | current model; no automatic orchestration; review required |
+| network failure | current model; no automatic orchestration; review required |
+| malformed response | current model; no automatic orchestration; review required |
+| SDK exception | current model; no automatic orchestration; review required |
+| unknown Jev model | current model; no automatic orchestration; review required |
+| gate not cleared | DEFAULT; current model |
 
-Front-door failure leaves the model and native orchestration behavior unchanged.
-Provider/answer failure degrades to the strongest safe worker. Ordinary tier
-uncertainty selects HARD rather than treating uncertainty itself as high risk.
+Front-door failure never changes the model. Missing or failed assessments keep
+the conservative review requirement. Task workers are unaffected: they never
+depend on Jev.
 
 Every decision runs under a hard `routingTimeoutMs` budget with retries
 disabled: a router that retries costs more than the routing saves.
@@ -465,11 +469,7 @@ within the same text budget (at most 1200 characters for these goals).
 Dialogue entries are clipped to 700 characters (the retained goal to 1600);
 plan text is clipped to 3200. The engine applies a combined
 `maxRoutingInputChars` text budget, default 12000, excluding JSON framing and
-fixed classifier instructions. Task classification also includes the batch's
-shared context and bounded branch/plan context; one third of the text budget is
-reserved for shared context, the rest split across tasks. Each task reserves up
-to one third of its budget for `solutionSpace` when supplied, with the remaining
-budget used by its instruction. The combined text limit is unchanged.
+fixed classifier instructions. Task bodies are never sent to Jev.
 
 The router does not read source files or send raw tool results, images, hidden
 thinking, or complete transcripts. Visible dialogue/plan text can itself contain
@@ -488,41 +488,57 @@ scrubbed of any tracked credential and of key-shaped tokens before it is written
 ## Telemetry
 
 Local data only — no prompt text, no task text, no source, no transcript — under
-`<omp agent dir>/jev-router/`, deleted by `/jev-router reset` and disabled by
-`telemetryEnabled=false`.
+`<omp agent dir>/jev-router/`, cleared by `/jev-router reset`. With
+`telemetryEnabled=false` nothing is written (existing data is shown read-only).
 
-`telemetry.json` holds aggregate counters:
+`telemetry.json` (v5) holds a **live epoch** and, after an upgrade, a separate
+**historical** block. Live and historical numbers are never added together.
 
-- orchestration decisions (including todo rechecks); DEFAULT / ORCHESTRATE
-- TASK batches; EASY / HARD / CHALLENGE counts; CHALLENGE gate fallbacks
-- Jev errors and timeouts; average routing latency
-- confidence and margin distributions (10 buckets each, one entry per decision)
-- per-tier-agent spawns, settled and completed spawns, tokens, cost and
-  **cost per completed task**
+- live orchestration decisions (including todo rechecks); DEFAULT / ORCHESTRATE;
+  Jev errors, timeouts, average latency; confidence and margin distributions
+- live task workers — **invocation path not separated**: any worker named
+  `task` counts, whether it came from the task tool, eval `agent()` or workpool.
+  Observed starts, completed/failed/cancelled settlements, measured usage
+  samples and settlements whose usage was never observed (`usageUnknown`,
+  never zero-filled). Tokens, cost and duration are summed over measured
+  samples only; cost per completed uses measured completions as denominator,
+  with sample coverage shown. `completed` means the worker run finished, not
+  that its result was accepted.
+- historical (pre-v5): front-door counters, the retired task-tier counters
+  (`historical.taskRouting`), and every old per-agent worker row
+  (`historical.workers`, including the old `task` row). Old `spawns` were
+  routing selections, not observed starts.
 
 `decisions.jsonl` has one line per Jev decision: `kind`, applied `route`, the
 pre-gate `top` label, per-label `probabilities`, `confidence`, `margin`,
-`confident`, latency, and TASK batch size. Orchestration rows also carry
-`reviewRequired` and the independent `review` distribution. Errors log
-`route: "ERROR"` and `timedOut`; no primary model action is emitted. For decisions with probabilities,
-the pre-gate label and distribution let a different confidence/margin gate be
-replayed exactly offline — the buckets cannot resolve a threshold inside a
-bucket. Errors and missing answers carry no distribution. The log records what
-was routed, not whether the route was right.
+`confident`, latency, `reviewRequired`, the independent `review` distribution,
+and the decision `policy` and live `epoch`. Errors log `route: "ERROR"` and
+`timedOut`. No task-tier rows are written; earlier rows are never rewritten.
+For decisions with probabilities, a different confidence/margin gate can be
+replayed exactly offline. The log records what was routed, not whether the
+route was right.
 
-Worker usage is attributed by agent name, which is exactly the tier the router
-selected. It is read from OMP's `task:subagent:progress` and
+Worker usage is read from OMP's `task:subagent:progress` and
 `task:subagent:lifecycle` frames on the session event bus, which fire for sync
-and background (`async.enabled`) spawns alike; the `task` tool result of a
-background spawn carries no usage. Each spawn is counted once when it settles.
-`ctx.sessionManager.getUsageStatistics()` is a single session-wide total with no
-per-role breakdown, so it cannot substitute.
+and background (`async.enabled`) spawns alike. A settlement is counted once
+even when it arrives on several buses; a late measured frame upgrades an
+unknown sample once. The host's `aborted` status is shown as cancelled.
 
-Telemetry v4 retains retired orchestration labels as `legacyDecisions`, and old
-task decisions/fallbacks as historical totals rather than relabeling them as
-new tiers. Historical worker names and decision-log rows remain unchanged.
-Already-lost counters cannot be recovered. v2 split token fields fold into
-`tokens`; a snapshot from a newer plugin is moved to `telemetry.v<N>.json`.
+Upgrading from v4 is automatic, idempotent and non-destructive: the original
+file is first copied to `telemetry-history/v<version>-<sha256>.json` (exclusive
+create, never overwritten), then the v5 file replaces it atomically. A failed
+backup or write leaves the original active and suspends recording. A file
+written by a newer plugin version is left untouched and recording is suspended
+until `/jev-router reset`. `reset` deletes only plugin-owned files
+(`telemetry.json`, `decisions.jsonl`, migration temporaries, `telemetry.v<N>.json`
+backups and `telemetry-history/` snapshots) and reports any it could not remove.
+
+Rollback to a tier-routing release: stop all OMP processes, preserve the v5
+`telemetry.json` and `decisions.jsonl` as copies in `telemetry-history/`
+(`v5-<sha256>.json`, `decisions-<sha256>.jsonl`), restore the desired v4 snapshot
+as `telemetry.json`, then start the old package. Do not let an old release read
+a v5 file directly. Re-upgrading starts a fresh live epoch; overlapping periods
+are never merged.
 
 ## Configuration
 
@@ -531,40 +547,51 @@ uninstall`:
 
 ```bash
 omp plugin config list omp-jev-router
-omp plugin config set omp-jev-router taskMinConfidence 0.85
-omp plugin config get omp-jev-router challengeTaskRole
+omp plugin config set omp-jev-router orchestrationMinConfidence 0.7
+omp plugin config get omp-jev-router orchestrationRoutingEnabled
 ```
 
 | key | default | meaning |
 | --- | --- | --- |
-| `enabled` | `true` | master switch for both routers |
+| `enabled` | `true` | master switch for classification, guidance and mandatory review enforcement |
 | `jevModel` | `""` | TypeSafe model id; empty = `jev-latest` |
-| `orchestrationRoutingEnabled` | `true` | enable native orchestration notices when allowed |
+| `orchestrationRoutingEnabled` | `true` | allow automatic ORCHESTRATE; explicit requests still use plugin policy |
 | `orchestrationMinConfidence` | `0.60` | confidence gate; below it keep DEFAULT |
 | `orchestrationMinMargin` | `0.20` | top1 - top2 gate; below it keep DEFAULT |
-| `taskRoutingEnabled` | `true` | TASK tier routing |
-| `taskMinConfidence` | `0.75` | `max(probabilities)` gate |
-| `taskMinMargin` | `0.20` | `top1 - top2` gate |
-| `easyTaskRole` | `task_easy` | role for TASK_EASY |
-| `hardTaskRole` | `task_hard` | role for TASK_HARD |
-| `challengeTaskRole` | `task_challenge` | role for TASK_CHALLENGE |
 | `routingTimeoutMs` | `4000` | hard per-decision budget |
 | `maxRoutingInputChars` | `12000` | combined text budget; see privacy section |
 | `telemetryEnabled` | `true` | local aggregate counters |
 | `debugLogging` | `false` | one metrics-only line per decision |
 
-### Migrating from the two-tier/main-switching version
+### Migrating from tier routing
 
-`mainModelRoutingEnabled`, `mainNormalRole`, `mainDeepRole`, `normalTaskRole`,
-and `deepTaskRole` are removed and no longer consulted. Re-enter any customized
-worker role choices using the three new tier keys. Old `task-deep`/`task-normal`
-agent definitions are retired; update explicit callers to a supported tier or,
-preferably, dispatch generic `task` and let Jev select it.
+Finish or cancel running workers and start a new session after upgrading; do
+not cut over with live workers.
 
-Existing `modelRoles.task_hard` is preserved; it is now the middle tier.
-Choose `modelRoles.task_challenge` separately for the strongest worker.
-Reload the plugin (`/reload-plugins`) or start a new session after updating.
-Uninstall leaves role assignments and credentials intact.
+- **Removed:** `task-easy`, `task-hard`, `task-challenge` agents; per-task Jev
+  classification; the `taskRoutingEnabled`, `taskMinConfidence`,
+  `taskMinMargin`, `easyTaskRole`, `hardTaskRole`, `challengeTaskRole` settings;
+  the `gen:agents` build step; the tier probe in `/jev-router test`. Calls
+  naming a removed alias are not silently turned into `task`; dispatch `task`
+  (or a specialist) instead.
+- **Stored retired settings** are ignored and never rewritten by the plugin.
+  `/jev-router status` lists any that remain; delete them with
+  `omp plugin config delete omp-jev-router <key>`.
+- **Model roles** `task_easy`, `task_hard` and `task_challenge` are yours and
+  are left untouched; status marks them unused. Worker model choice is now your
+  `@task` role. Set it before upgrading if you relied on a tier's model.
+- **Task contract:** put goal, scope, fixed/open decisions, inputs, acceptance
+  and return format in the `task` text (see [Task body contract](#task-body-contract)).
+  The plugin does not introduce or classify a `solutionSpace` field.
+- **Notice:** coordination guidance is the plugin's `jev-orchestrate-notice`;
+  OMP's native orchestrate notice is replaced for the current turn only.
+- **Reviews:** old receipts are not reused; resumed sessions review again.
+- **Telemetry:** v4 counters become the `historical` block; the live epoch
+  starts empty. See [Telemetry](#telemetry) for rollback.
+
+Earlier releases' `mainModelRoutingEnabled`, `mainNormalRole`, `mainDeepRole`,
+`normalTaskRole`, `deepTaskRole` and `task-deep`/`task-normal` agents are also
+unused. Uninstall leaves role assignments and credentials intact.
 
 ## Troubleshooting
 
@@ -572,8 +599,6 @@ Turn on `debugLogging` and read the OMP log:
 
 ```text
 jev.orchestration route=ORCHESTRATE confidence=0.91 margin=0.82 latency=300ms
-jev.task route=TASK_EASY confidence=1.00 margin=1.00 latency=250ms
-jev.task route=TASK_CHALLENGE confidence=0.99 margin=0.98 latency=250ms
 jev.orchestration route=SKIP reason=not-main-session
 ```
 
@@ -581,17 +606,12 @@ jev.orchestration route=SKIP reason=not-main-session
 | --- | --- |
 | `route=SKIP reason=credential-missing` | no TypeSafe key; run `/jev-router setup` |
 | `route=SKIP reason=not-main-session` | expected — a subagent hit the front door and was rejected |
-| `route=SKIP reason=explicit-orchestrate` | native notice is already present; no duplicate injected |
-| `route=SKIP reason=orchestrate-keyword-disabled` | keyword is off; automatic orchestration is disabled |
+| `route=SKIP reason=explicit-orchestrate` | a native orchestrate notice is present; it is replaced by the plugin's notice, not duplicated |
 | `route=SKIP reason=plan-mode` | plan mode owns the turn |
-| `route=SKIP reason=generic-task-overridden` | an agent named `task` shadows OMP's bundled worker; tier routing stands down so your definition is not replaced |
-| `route=SKIP reason=challenge-alias-unspawnable` | challenge alias unavailable or disallowed; generic task stays native |
-| `TASK_CHALLENGE` everywhere | check credential availability and gate thresholds |
-| `Unresolved role(s)` in status | configure the named role with an authenticated model |
-
-The same check runs once at session start and writes
-`jev.router model role(s) @task_challenge do not resolve; …` to the OMP log, so a broken
-role mapping surfaces without opening `status`.
+| gate reason `orchestration-routing-disabled` / `task-tool-unavailable` | automatic ORCHESTRATE suppressed; review assessment still runs |
+| `@task role unresolved` in status | assign `modelRoles.task`; OMP reports the spawn error and nothing is substituted |
+| task call blocked for a missing `name` | async mode needs a unique `name` per implementation item to bind its permit |
+| `Retired settings still stored` in status | delete the listed keys; they have no effect |
 
 ## Uninstall
 
@@ -599,10 +619,11 @@ role mapping surfaces without opening `status`.
 omp plugin uninstall omp-jev-router
 ```
 
-Removes the package, its derived tier agents, the checkpoint tool,
-and the bundled auditor. OMP model-role assignments (`task_easy`, `task_hard`,
-`task_challenge`, `verification-auditor`, `orche-advisor`) remain
-until removed explicitly. The `typesafe` credential and
+Removes the package, the checkpoint tool, the bundled auditor and the plugin's
+guidance and gates; OMP's native `task` behavior and orchestrate notice return
+unchanged. OMP model-role assignments (including `verification-auditor`,
+`orche-advisor`, and any leftover `task_easy`/`task_hard`/`task_challenge`)
+remain until removed explicitly. The `typesafe` credential and
 `<omp agent dir>/jev-router/` telemetry files also remain; use
 `/jev-router reset` before uninstalling if those should be cleared.
 
@@ -610,7 +631,6 @@ until removed explicitly. The `typesafe` credential and
 
 ```bash
 bun install
-bun run gen:agents   # regenerate all three shipped tier aliases
 bun run check        # tsc --noEmit
 bun run lint         # oxlint
 bun test             # unit + integration suite
@@ -625,15 +645,21 @@ it into place once:
 cp node_modules/@oh-my-pi/pi-natives-linux-x64/*.node node_modules/@oh-my-pi/pi-natives/native/
 ```
 
-`bun test` covers the gate arithmetic, input clipping, both routers' guards and
-fallbacks, batch classification, field preservation, deduplication, alias
-derivation round-tripped through OMP's own frontmatter parser, credential
-priority, secret redaction, telemetry persistence, and status rendering.
+`bun test` covers the gate arithmetic, input clipping, front-door guards and
+fallbacks, policy notice precedence, task-contract normalization against OMP's
+real task schema, review gating and permits, credential priority, secret
+redaction, telemetry migration/reset, and status rendering.
 
-Live verification against a real OMP binary (`omp plugin link`, print-mode runs)
-is what proves the seams: extension load, agent discovery, command registration,
-front-door and tier decisions in a real session, the subagent recursion guard,
-and uninstall restoration.
+Native smoke runs on OMP 18.3.1 (the pinned dependency) and 18.3.4 exercised
+task-body delivery to a real `task`/`@task` worker, reviewed asynchronous
+dispatch, native queued-job cancellation and same-name retry, workflow notice
+precedence, and master-disable restoration. Workers produced and read back
+the expected files; the main agent did not substitute for them. The detailed
+acceptance matrix is in `docs/plans/self-orchestration.md`.
+
+These runs do not certify every provider/settings combination or a cost
+improvement over tier routing. They did not uninstall the user's global plugin
+or reset the user's telemetry. New host versions still need their own smoke.
 
 ### Known API constraints
 
@@ -643,13 +669,14 @@ Recorded rather than worked around:
   (only the package root does, and it does not re-export `containsOrchestrate`).
   Initial classification happens at `before_agent_start`; `context` handles
   native notices. Thinking-level types are imported only as erased types.
-- **No per-invocation model override on the task wire schema.** Unknown keys are
-  deleted by the schema, so the tier is expressed through a derived alias agent.
+- **`BeforeSubagentSpawnEvent` carries no parent tool call or task text**, only
+  the agent, invocation kind, model patterns and a `spawnKey`, so spawn permits
+  are matched by the identity OMP derives from the approved call; ambiguous
+  identities are refused.
 - **`ExtensionUIDialogOptions` has no masked-input mode**, so `/jev-router setup`
   routes you to OMP's native `/login typesafe` for masked entry and labels its
   own paste dialog as unmasked.
-- **`task.agentServiceTierOverrides` is keyed by agent name** and has no
-  frontmatter equivalent, so an override configured for `task` does not follow
-  the derived tier agents. Add entries for each tier alias if you use this setting.
+- **Cost per completed task is not acceptance rate**: `completed` is the
+  worker's own settlement.
 - **Spawns that settle after the process exits** are not in `stats`: usage is
   read from in-process subagent frames.

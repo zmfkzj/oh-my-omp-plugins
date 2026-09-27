@@ -4,7 +4,8 @@ import example from "../examples/initial-plan.json";
 import { AUDITOR_NAME } from "../src/verification-auditor.ts";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { ReviewGate } from "../src/review-gate.ts";
-import { makeSession, registerAsMain, clearRegistry } from "./harness.ts";
+import { prepareDispatch } from "../src/task-contract.ts";
+import { makeApi, makeSession, registerAsMain, clearRegistry } from "./harness.ts";
 import {
   prepareReviewInput,
   runReview,
@@ -407,8 +408,9 @@ describe("review completion boundary", () => {
     } });
     registerAsMain(session);
     try {
-      const gate = new ReviewGate();
-      gate.stageDispatch(ctx, { tasks: [
+      const { pi } = makeApi();
+      const gate = new ReviewGate(() => true, input => prepareDispatch(pi, input));
+      gate.stageDispatch(ctx, { context: "Payment storage migration.", tasks: [
         ...Array.from({ length: 4 }, (_, index) => ({ name: `Worker${index}`, task: "x".repeat(500) })),
         { name: "CriticalLast", task: "Migrate production payment storage" },
       ] });
@@ -433,12 +435,12 @@ describe("review completion boundary", () => {
         key: "scope-key",
         checkpoint: "fan-out",
         planHash: "plan-hash",
-        dispatchSummary: Array.from({ length: 30 }, (_, index) => `task-hard: slice ${index} ${"x".repeat(200)}`),
+        dispatchSummary: Array.from({ length: 30 }, (_, index) => `task: slice ${index} ${"x".repeat(200)}`),
       },
     };
     const { content } = await promptFor(scoped);
     const block = content.split("\n\n").find((part) => part.startsWith("Execution scope")) ?? "";
-    const dispatches = block.split("\n").filter((line) => line.startsWith("  - task-hard"));
+    const dispatches = block.split("\n").filter((line) => line.startsWith("  - task: slice"));
 
     expect(content).toContain(JSON.stringify(prepared.snapshot, null, 2));
     expect(block).toContain("- Plan hash: plan-hash");
