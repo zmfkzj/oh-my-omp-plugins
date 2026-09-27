@@ -314,7 +314,7 @@ export class Telemetry {
 		if (!this.#enabled) return;
 		const bucket = this.#snapshot.task;
 		bucket[route]++;
-		if (!confident) bucket.fallbackChallenge++;
+		if (!confident && route === "TASK_CHALLENGE") bucket.fallbackChallenge++;
 		bucket.confidence[bucketOf(confidence)]!++;
 		bucket.margin[bucketOf(margin)]!++;
 		this.#touch();

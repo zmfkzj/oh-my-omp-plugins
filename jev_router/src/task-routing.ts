@@ -44,6 +44,7 @@ export interface TaskRouteRecord {
 interface RoutableItem {
 	index: number;
 	instruction: string;
+	solutionSpace?: string;
 }
 
 export interface NormalizedCall {
@@ -76,7 +77,8 @@ export function routableItems(items: readonly Record<string, unknown>[]): Routab
 		if (typeof item.agent !== "string" || item.agent.trim() !== GENERIC_TASK_AGENT) continue;
 		const instruction = typeof item.task === "string" ? item.task : "";
 		if (!instruction.trim()) continue;
-		routable.push({ index, instruction });
+		const solutionSpace = typeof item.solutionSpace === "string" ? item.solutionSpace.trim() : "";
+		routable.push({ index, instruction, ...(solutionSpace ? { solutionSpace } : {}) });
 	}
 	return routable;
 }
@@ -201,7 +203,7 @@ export class TaskRouter {
 					: extraContext
 				: sharedContext;
 			const batch = await this.#deps.engine.decideTaskTiers(
-				routable.map(item => ({ id: `t${item.index}`, instruction: item.instruction })),
+				routable.map(({ index, ...subtask }) => ({ id: `t${index}`, ...subtask })),
 				context,
 				{ apiKey, model: config.jevModel, timeoutMs: config.routingTimeoutMs },
 				{ minConfidence: config.taskMinConfidence, minMargin: config.taskMinMargin },
@@ -212,9 +214,10 @@ export class TaskRouter {
 				if (!/^t\d+$/.test(decision.id)) continue;
 				const index = Number(decision.id.slice(1));
 				if (!routable.some(item => item.index === index)) continue;
-				// Uncertainty fails quality-safe: a wrong cheap worker costs a retry,
-				// which is more expensive than one stronger run.
-				const route: TaskRoute = decision.confident ? decision.top : "TASK_CHALLENGE";
+				// Ambiguity between ordinary tiers needs a competent worker, not
+				// automatic escalation. Missing answers retain the engine's CHALLENGE top.
+				const route: TaskRoute = decision.confident ? decision.top
+					: decision.top === "TASK_EASY" || decision.top === "TASK_HARD" ? "TASK_HARD" : "TASK_CHALLENGE";
 				routes.set(index, route);
 				this.#deps.telemetry.recordTaskDecision(route, decision.confidence, decision.margin, decision.confident);
 				this.#deps.telemetry.appendDecision({

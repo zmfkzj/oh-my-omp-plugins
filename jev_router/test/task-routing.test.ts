@@ -153,11 +153,18 @@ describe("TASK tier routing", () => {
 		expect(decider.taskCalls).toBe(0);
 	});
 
-	test("a low-confidence easy decision fails quality-safe to challenge", async () => {
-		const { router, pi } = build({ t0: { top: "TASK_EASY", confidence: 0.6, margin: 0.2 } });
+	test.each(["TASK_EASY", "TASK_HARD"] as const)("an uncertain %s selects hard rather than challenge", async top => {
+		const { router, pi } = build({ t0: { top, confidence: 0.6, margin: 0.2 } });
 
 		const result = await router.route(pi, "call-7", batch({ agent: "task", task: "Ambiguous work." }));
 
+		expect(revisedAgents(result)[0]).toBe("task-hard");
+		expect(router.lastDecision?.confident).toBe(false);
+	});
+
+	test("an uncertain challenge decision retains the strongest worker", async () => {
+		const { router, pi } = build({ t0: { top: "TASK_CHALLENGE", confidence: 0.56, margin: 0.12 } });
+		const result = await router.route(pi, "uncertain-challenge", batch({ agent: "task", task: "Resolve a race." }));
 		expect(revisedAgents(result)[0]).toBe("task-challenge");
 		expect(router.lastDecision?.confident).toBe(false);
 	});

@@ -62,14 +62,14 @@
         "default": 0.75,
         "min": 0,
         "max": 1,
-        "description": "Minimum tier confidence; uncertainty selects task_challenge."
+        "description": "Minimum tier confidence; uncertain EASY/HARD selects task_hard, CHALLENGE stays task_challenge."
       },
       "taskMinMargin": {
         "type": "number",
         "default": 0.2,
         "min": 0,
         "max": 1,
-        "description": "Minimum tier probability margin; uncertainty selects task_challenge."
+        "description": "Minimum tier probability margin; uncertain EASY/HARD selects task_hard, CHALLENGE stays task_challenge."
       },
       "easyTaskRole": {
         "type": "string",
@@ -84,7 +84,7 @@
       "challengeTaskRole": {
         "type": "string",
         "default": "task_challenge",
-        "description": "Model role for TASK_CHALLENGE reasoning and uncertain task decisions."
+        "description": "Model role for TASK_CHALLENGE reasoning and failed or missing task classification."
       },
       "routingTimeoutMs": {
         "type": "number",

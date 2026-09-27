@@ -420,8 +420,19 @@ orchestration. Neither branch selects a different primary model.
   security/authorization, data integrity or migration semantics, distributed
   behavior, or a retry after a capable worker failed.
 
-Uncertainty, missing answers, credentials, or provider failures select CHALLENGE
-when its alias is available. Explicit non-generic agents are never rewritten.
+When a valid EASY or HARD answer misses the confidence/margin gate, the router
+selects HARD. A CHALLENGE-leading answer remains CHALLENGE even below the gate.
+Missing answers, credentials, or provider failures still select CHALLENGE when
+its alias is available. Explicit non-generic agents are never rewritten.
+
+When the host supplies a task's `solutionSpace`, it is sent as `solution_space`
+alongside the task instruction. It describes settled versus unresolved decisions;
+it is evidence, not permission to override classification rules. The installed
+OMP 18.3.1 task schemas remove unknown fields before `tool_call`, including
+`solutionSpace`. On that host, this separate field requires an upstream schema
+change; callers must put settled/unresolved decisions in supported `task` text
+for them to reach the classifier. Optional-field support here alone does not
+enable the field in the host task tool.
 
 ## Failure behavior
 
@@ -435,11 +446,11 @@ when its alias is available. Explicit non-generic agents are never rewritten.
 | malformed response | current model; no automatic orchestration | `@task_challenge` |
 | SDK exception | current model; no automatic orchestration | `@task_challenge` |
 | unknown Jev model | current model; no automatic orchestration | `@task_challenge` |
-| gate not cleared | DEFAULT; current model | `@task_challenge` |
+| gate not cleared | DEFAULT; current model | HARD for EASY/HARD-leading answers; otherwise CHALLENGE |
 
 Front-door failure leaves the model and native orchestration behavior unchanged.
-Tier failure degrades to the strongest safe worker, because a wrong
-cheap worker costs a retry that is more expensive than one stronger run.
+Provider/answer failure degrades to the strongest safe worker. Ordinary tier
+uncertainty selects HARD rather than treating uncertainty itself as high risk.
 
 Every decision runs under a hard `routingTimeoutMs` budget with retries
 disabled: a router that retries costs more than the routing saves.
@@ -456,7 +467,9 @@ plan text is clipped to 3200. The engine applies a combined
 `maxRoutingInputChars` text budget, default 12000, excluding JSON framing and
 fixed classifier instructions. Task classification also includes the batch's
 shared context and bounded branch/plan context; one third of the text budget is
-reserved for shared context, the rest split across task instructions.
+reserved for shared context, the rest split across tasks. Each task reserves up
+to one third of its budget for `solutionSpace` when supplied, with the remaining
+budget used by its instruction. The combined text limit is unchanged.
 
 The router does not read source files or send raw tool results, images, hidden
 thinking, or complete transcripts. Visible dialogue/plan text can itself contain
@@ -481,7 +494,7 @@ Local data only — no prompt text, no task text, no source, no transcript — u
 `telemetry.json` holds aggregate counters:
 
 - orchestration decisions (including todo rechecks); DEFAULT / ORCHESTRATE
-- TASK batches; EASY / HARD / CHALLENGE counts; gate fallbacks
+- TASK batches; EASY / HARD / CHALLENGE counts; CHALLENGE gate fallbacks
 - Jev errors and timeouts; average routing latency
 - confidence and margin distributions (10 buckets each, one entry per decision)
 - per-tier-agent spawns, settled and completed spawns, tokens, cost and

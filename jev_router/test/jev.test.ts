@@ -103,6 +103,24 @@ describe("front-door classifier request", () => {
 	};
 	const options = { apiKey: "ts_test_key_0123456789", model: "", timeoutMs: 5000 };
 	const gates = { minConfidence: 0.6, minMargin: 0.2 };
+
+	test("task and solution-space text stay within the shared budget without losing either field", async () => {
+		const requests = serve({});
+		await new JevEngine().decideTaskTiers(
+			[{ id: "t0", instruction: "task ".repeat(1000), solutionSpace: "settled ".repeat(1000) }],
+			"context ".repeat(1000), options, gates, 300,
+		);
+		const state = requests[0]!.body.state as {
+			shared_context: string;
+			subtasks: { instruction: string; solution_space: string }[];
+		};
+		const item = state.subtasks[0]!;
+		expect(state.shared_context.length + item.instruction.length + item.solution_space.length).toBeLessThanOrEqual(300);
+		expect(item.instruction).toContain("task");
+		expect(item.solution_space).toContain("settled");
+		expect(item.instruction).toContain("[truncated]");
+		expect(item.solution_space).toContain("[truncated]");
+	});
 	const route = { type: "choice", choice: "DEFAULT", confidence: 0.9, probabilities: { DEFAULT: 0.9, ORCHESTRATE: 0.1 } };
 
 	test("one request asks separate route and review questions over the same bounded state", async () => {

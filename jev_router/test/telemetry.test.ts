@@ -25,6 +25,7 @@ describe("telemetry aggregation", () => {
 		telemetry.recordOrchestration("DEFAULT", 0.54, 0.08, 20);
 		telemetry.recordTaskBatch(9);
 		telemetry.recordTaskDecision("TASK_CHALLENGE", 0.6, 0.2, false);
+		telemetry.recordTaskDecision("TASK_HARD", 0.62, 0.26, false);
 		telemetry.recordFailure("task", true);
 		telemetry.recordSpawn("task-challenge");
 		telemetry.recordWorkerSettled("call:a", "task-challenge", { tokens: 150, costUsd: 0.25, durationMs: 1500, completed: true });
@@ -37,7 +38,7 @@ describe("telemetry aggregation", () => {
 		expect(snapshot.orchestration).toMatchObject({ requests: 3, DEFAULT: 2, ORCHESTRATE: 1, latencySumMs: 46 });
 		expect(snapshot.orchestration.confidence[9]).toBe(1);
 		expect(snapshot.orchestration.confidence[5]).toBe(1);
-		expect(snapshot.task).toMatchObject({ batches: 1, TASK_CHALLENGE: 1, fallbackChallenge: 1, errors: 1, timeouts: 1 });
+		expect(snapshot.task).toMatchObject({ batches: 1, TASK_CHALLENGE: 1, TASK_HARD: 1, fallbackChallenge: 1, errors: 1, timeouts: 1 });
 		expect(snapshot.workers["task-challenge"]).toMatchObject({ spawns: 1, results: 1, completed: 1, tokens: 150, costUsd: 0.25 });
 	});
 

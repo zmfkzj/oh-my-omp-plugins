@@ -148,7 +148,7 @@ export function renderStats(runtime: JevRouterRuntime): string {
 		row("  TASK_EASY", String(task.TASK_EASY)),
 		row("  TASK_HARD", String(task.TASK_HARD)),
 		row("  TASK_CHALLENGE", String(task.TASK_CHALLENGE)),
-		row("  gate fallbacks", String(task.fallbackChallenge)),
+		row("  CHALLENGE gate fallbacks", String(task.fallbackChallenge)),
 		...(task.legacyDecisions > 0 ? [row("  retired labels", String(task.legacyDecisions))] : []),
 		...(task.legacyFallbacks > 0 ? [row("  retired fallbacks", String(task.legacyFallbacks))] : []),
 		row("  errors / timeouts", `${task.errors} / ${task.timeouts}`),
