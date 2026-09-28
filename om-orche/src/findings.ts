@@ -308,12 +308,21 @@ export function collectFindings(branch: readonly SessionEntry[]): VerificationFi
 
 function findTracked(ledger: Ledger, findingId: string): Tracked {
   const tracked = ledger.byId.get(findingId);
-  if (!tracked) {
-    throw new Error(
-      `No ${AUDITOR_NAME} finding ${findingId} on the active branch; \`list\` shows current finding ids.`,
-    );
-  }
-  return tracked;
+  if (tracked) return tracked;
+  // Name the real ids so a guessed id (a label, "all") is corrected in one step, unresolved first.
+  const ordered = [
+    ...ledger.tracked.filter((candidate) => isUnresolved(candidate.finding.status)),
+    ...ledger.tracked.filter((candidate) => !isUnresolved(candidate.finding.status)),
+  ];
+  const named = ordered
+    .slice(0, LISTED_IDS)
+    .map((candidate) => `${candidate.id} ${candidate.finding.severity} ${candidate.finding.status}`);
+  const more = ordered.length > named.length ? `, and ${ordered.length - named.length} more` : "";
+  const known =
+    named.length === 0
+      ? "The ledger has no findings on this branch."
+      : `Current finding ids: ${named.join(", ")}${more}. Omit findingId to list the whole ledger.`;
+  throw new Error(`No ${AUDITOR_NAME} finding ${findingId} on the active branch. ${known}`);
 }
 
 /** A finding as `list` shows it: the reviewer's rendering plus the ids of merged repeats. */

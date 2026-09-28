@@ -85,6 +85,17 @@ describe("review_findings", () => {
     await expect(resolve([passing])).rejects.toThrow("is resolved");
   });
 
+  test("names the real finding ids when a guessed id is used", async () => {
+    const session = primarySession();
+    await expect(session.call({ action: "list", findingId: "all" })).rejects.toThrow("no findings");
+    const id = `${session.audit(blocker("Claimed the install worked; only a click Success."))}:0`;
+    for (const action of ["list", "resolve"]) {
+      await expect(
+        session.call({ action, findingId: "runtime-evidence", reason: "Captured.", evidence: [] }),
+      ).rejects.toThrow(`Current finding ids: ${id} blocker open`);
+    }
+  });
+
   test("waives only after the user explicitly confirms", async () => {
     const prompts: string[] = [];
     let answer = false;

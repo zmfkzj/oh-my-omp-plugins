@@ -66,20 +66,21 @@ export function currentTurnNotices(messages: readonly AgentMessage[], customType
 
 function taskBodyContract(tools: ReadonlySet<string>, subject: string): string {
 	return [
+		...(tools.has("task") ? [
+			"Required on every `task` item when the host's task schema exposes `effort`: set it explicitly — `lo` for a fixed mechanical change, `med` for bounded implementation choices, `hi` for substantial unresolved design or correctness questions. Match the solution space, not file count or task length; preserve explicit user choices. If the field is absent, omit it rather than inventing a parameter.",
+		] : []),
 		`Write each ${subject} as self-contained plain text with these sections (there is no separate contract field):`,
 		"  # Goal: the observable outcome.",
 		"  # Scope and non-goals: owned files and interfaces, areas not to touch.",
 		"  # Decided and open: decisions already fixed (do not redesign them) and judgments left to the worker.",
 		"  # Inputs and dependencies: referenced files or artifacts and verified upstream contracts.",
-		"  # Acceptance and verification: success, error and boundary behavior; worker-local checks; what the coordinator verifies.",
+		"  # Acceptance and verification: success, error and boundary behavior, including environment failures the change must survive (unavailable storage, network, credentials or services must not block unrelated core flows); worker-local checks; what the coordinator verifies.",
 		"  # Return: done or blocked, actual changes, checks run with results, remaining issues.",
 		"Keep shared context to constraints common to every item; never copy the conversation or earlier reports." +
 			(tools.has("task")
 				? " Use the existing outputSchema only when a structured result is needed."
 				: ""),
-		...(tools.has("task") ? [
-			"When the host's task schema exposes `effort`, explicitly set it on each task item: `lo` for a fixed mechanical change, `med` for bounded implementation choices, `hi` for substantial unresolved design or correctness questions. Match the solution space, not file count or task length; preserve explicit user choices. If the field is absent, omit it rather than inventing a parameter.",
-		] : []),
+		"Workers run static checks and their own tests scoped to the files they own; do not forbid those wholesale in the item text. The coordinator owns shared runtimes (a single app, editor or game session, a shared server, global checks) and says so in the item.",
 		"A worker that finds a defect in a fixed decision, an ownership conflict, or an invalid prerequisite pauses affected changes and reports evidence, touched files and partial work immediately; it does not redesign the contract, expand its scope, or overwrite another owner's edits.",
 	].join("\n");
 }
@@ -97,6 +98,7 @@ function verification(tools: ReadonlySet<string>): string {
 		"Classify a failure first: implementation defect, ambiguous contract, missing environment or permission, integration conflict, or unresolved design.",
 		"Fix small obvious gaps directly. Never repeat an unchanged failure without new input or a new hypothesis; with no executable next step, report the exact blocker.",
 		"Before declaring completion, reconcile every requested outcome with the integrated result and run the relevant end-to-end or boundary checks. Report actual verification and unresolved blockers explicitly; partial success is not overall completion.",
+		"Runtime evidence must be auditable as text: an input tool's bare `Success` does not show its effect, and screenshots reach reviewers only as placeholders. Back each runtime claim with an extracted state, value or log read after the action, or report it explicitly as visual observation only.",
 		"No automatic model escalation, reviewer loops, or out-of-scope reviewer demands.",
 	].join("\n");
 }

@@ -153,9 +153,10 @@ OMP validates and executes the native task input. The plugin neither stages nor
 hashes task calls for approval.
 
 When the host task schema exposes `effort` (`task.enableEffort=true`), the
-guidance requires an explicit value per task item: `lo` for fixed mechanical
-work, `med` for bounded implementation choices, and `hi` for substantial open
-design or correctness questions. Selection follows the solution space, not
+guidance states first, before the section list, that each task item requires an
+explicit value: `lo` for fixed mechanical work, `med` for bounded implementation
+choices, and `hi` for substantial open design or correctness questions.
+Selection follows the solution space, not
 file count or task length, and preserves explicit user choices. If the host
 does not expose the field, it must be omitted. The plugin does not rewrite task
 arguments or change model roles; OMP maps the hint to supported thinking levels.
@@ -182,6 +183,15 @@ Execution guidance also covers recovery and final acceptance:
 - Completion requires reconciling every requested outcome with the integrated
   result and relevant end-to-end or boundary checks. Partial success and unresolved
   blockers must not be presented as overall completion.
+- Runtime claims need text-auditable evidence: an input tool's bare `Success`
+  does not show its effect and screenshots reach reviewers only as placeholders,
+  so each claim is backed by state, values or logs read after the action, or is
+  reported as visual observation only.
+- Workers run static checks and their own tests scoped to owned files; task text
+  should not forbid them wholesale. The coordinator owns shared runtimes (one
+  app/editor/game session, a shared server, global checks). Acceptance names the
+  environment failures a change must survive, e.g. unavailable storage must not
+  block unrelated core flows.
 
 These are model instructions, not automatic cancellation, scheduling or approval
 mechanisms. Workflow mode retains the native workflow's execution-method and
@@ -274,14 +284,26 @@ instruction is not itself a direct user instruction; scope and evidence must be
 weighed before superseding restrictions.
 
 The bundled auditor is instructed to stay silent on confirmations, praise,
-progress reminders and checks that already passed. It reports concrete remaining
-contradictions or evidenced irreversible-operation risks, not unfinished tasks
-that have not been called complete. It must identify the snapshot or result it
-actually checked; a growing transcript's last observed entry is not proof that
-the session ended. These are model instructions, not a semantic runtime filter:
-existing notes are not silently dropped based on phrase matching or automatically
-marked resolved. The reviewer likewise assesses evidence against the claim and
-revision, not against the note's delivery time.
+progress commentary and checks that already passed, and never to emit `nit`
+notes. It reports concrete remaining contradictions or evidenced
+irreversible-operation risks, not unfinished tasks that have not been called
+complete. Updates OMP marks `[in progress — more steps follow]` get no note
+except an irreversible-operation risk; claims are judged on the turn's final
+state, because OMP holds mid-turn non-blockers and releases them together at the
+turn boundary. It never directs the primary's pace or method ("stop", "wrap
+up", "answer now"). A `blocker` must quote the completion claim it contradicts.
+Screenshots reach the auditor only as placeholders, so a placeholder is not
+counter-evidence; a screenshot-only claim should be labeled as visual
+observation or backed by extracted state. The bundled entry also sets
+`maxNotesPerUpdate: 1` (blockers are exempt in OMP). It must identify the
+snapshot or result it actually checked; a growing transcript's last observed
+entry is not proof that the session ended. These are model instructions, not a
+semantic runtime filter: existing notes are not silently dropped based on phrase
+matching or automatically marked resolved. The reviewer likewise assesses
+evidence against the claim and revision, not against the note's delivery time.
+
+`review_findings` with an unknown `findingId` fails with the current ids
+(unresolved first, bounded) so a guessed id is corrected in one step.
 
 The bundled Verification Auditor runs through OMP's WATCHDOG roster only while
 advisors are enabled. Its model is `@verification-auditor`, a custom role
