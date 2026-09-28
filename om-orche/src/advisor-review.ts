@@ -615,8 +615,12 @@ export async function runReview(
 ): Promise<ReviewResult> {
   const { model, thinkingLevel } = selection;
   const requestId = Bun.randomUUIDv7();
-  const resolvedApiKey = await registry.getApiKey(model, requestId);
-  const apiKey = typeof resolvedApiKey === "string" ? resolvedApiKey : undefined;
+  const apiKey = await registry.getApiKey(model, requestId);
+  // Undefined/empty keys let pi-ai fall back to environment credentials, bypassing
+  // host denial (including disabledProviders). The explicit keyless sentinel is valid.
+  if (!apiKey) {
+    throw new Error(`No request credential authorized by the model registry for "${model.provider}".`);
+  }
   const timeout = AbortSignal.timeout(180_000);
   const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
   requestSignal.throwIfAborted();

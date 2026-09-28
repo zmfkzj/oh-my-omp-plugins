@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { Effort, AssistantMessage, Usage } from "@oh-my-pi/pi-ai";
+import { kNoAuth } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import example from "../examples/initial-plan.json";
 import { AUDITOR_NAME } from "../src/verification-auditor.ts";
 import {
@@ -110,6 +112,51 @@ function expectFailure(result: ReviewResult, failureKind: ReviewFailureKind) {
 }
 
 describe("review completion boundary", () => {
+  test.each([undefined, ""])("rejects a denied credential (%j) before any model request", async (apiKey) => {
+    const { completion, calls } = completionSequence(response());
+    await expect(runReview(
+      prepared, selection, { getApiKey: async () => apiKey }, undefined, completion,
+    )).rejects.toThrow(/credential/i);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("completes a keyless request through the real SDK", async () => {
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch() {
+        const chunks = [
+          { choices: [{ index: 0, delta: { role: "assistant", content: structuredReview }, finish_reason: null }] },
+          { choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+            usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 } },
+        ];
+        return new Response(
+          chunks.map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join("") + "data: [DONE]\n\n",
+          { headers: { "Content-Type": "text/event-stream" } },
+        );
+      },
+    });
+    try {
+      const result = await runReview(
+        prepared,
+        { model: buildModel({
+          id: "keyless-review", name: "Local keyless reviewer", provider: "openai",
+          api: "openai-completions", baseUrl: `http://127.0.0.1:${server.port}/v1`,
+          reasoning: false, input: ["text"], contextWindow: 100000, maxTokens: 4096,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        }) },
+        { getApiKey: async () => kNoAuth },
+        AbortSignal.timeout(5000),
+      );
+      expect(result.isError).toBe(false);
+      expect(result.text.startsWith(structuredReview)).toBe(true);
+      expect(result.details.usage.input).toBe(10);
+      expect(result.details.usage.output).toBe(20);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
   test("accepts a structured first completion without retrying", async () => {
     const message = response();
     const { completion, calls } = completionSequence(message);

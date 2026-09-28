@@ -6,8 +6,14 @@ DEFAULT or ORCHESTRATE. The primary model stays fixed. The plugin supplies its
 own execution guidance while every worker runs through OMP's native `task` tool
 unchanged. There is no plugin review gate or execution-approval state.
 
-Compatibility target: **OMP 18.3.5**. The host peer dependency and the OMP
-development/model-SDK packages are pinned to 18.3.5.
+Compatibility target: **OMP 18.4.1**. The host peer dependency and the OMP
+development/model-SDK packages are pinned to 18.4.1.
+
+Advisor requests require a credential authorized by OMP's model registry.
+If the registry returns no credential (including for a disabled provider), the
+request fails before contacting the model; the SDK cannot fall back to an
+environment key. The host's explicit no-auth sentinel remains supported for
+keyless providers.
 
 Generic workers are OMP's native `task` agent; their model comes from your
 `@task` role. The plugin does not classify, rewrite, alias or re-route task
