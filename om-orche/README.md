@@ -109,6 +109,27 @@ whether an explicit native notice appears; they never gate automatic routing.
 With `task` disabled, no delegation is advertised. There is no primary model
 switch or end-of-turn model restoration path.
 
+### Parallel execution policy
+
+ORCHESTRATE first identifies worthwhile independent implementation units and
+establishes the shared contracts needed to run them. When at least two units
+are ready, it instructs the primary to launch them together in one `tasks[]`
+batch when supported, or dispatch without waiting between independent workers.
+Host concurrency limits, ownership boundaries and runtime-resource constraints
+still apply. Sequential work must have an actual prerequisite or conflict,
+identified in the plan; there is no worker quota or artificial task splitting.
+
+The coordinator concentrates on shared contracts, minimal prerequisite changes,
+integration and final verification. Once contracts are stable, independent
+consumers belong to workers rather than leaving most implementation on the
+coordinator. While workers run, the coordinator advances non-overlapping work;
+newly ready units do not wait for unrelated workers or a whole phase to finish.
+A shared final test environment does not serialize unrelated implementation.
+
+DEFAULT retains its direct-work-first policy. Routing thresholds are unchanged,
+and native workflow mode still controls its own dispatch. These are instructions
+to the primary model, not an automatic scheduler or a guarantee of parallelism.
+
 ### Task body contract
 
 The plugin defines no separate `solutionSpace` or contract field and does not
@@ -130,6 +151,14 @@ is used only when a structured result is needed. The layout is guidance, not a
 runtime schema: free-form task calls are never rejected for missing sections.
 OMP validates and executes the native task input. The plugin neither stages nor
 hashes task calls for approval.
+
+When the host task schema exposes `effort` (`task.enableEffort=true`), the
+guidance requires an explicit value per task item: `lo` for fixed mechanical
+work, `med` for bounded implementation choices, and `hi` for substantial open
+design or correctness questions. Selection follows the solution space, not
+file count or task length, and preserves explicit user choices. If the host
+does not expose the field, it must be omitted. The plugin does not rewrite task
+arguments or change model roles; OMP maps the hint to supported thinking levels.
 
 Execution guidance also covers recovery and final acceptance:
 
@@ -156,7 +185,8 @@ Execution guidance also covers recovery and final acceptance:
 
 These are model instructions, not automatic cancellation, scheduling or approval
 mechanisms. Workflow mode retains the native workflow's execution-method and
-fan-out authority; the supplement adds recovery and acceptance duties only.
+fan-out authority; the supplement adds task-contract, recovery and acceptance
+guidance, not dispatch.
 
 ### Plan advice and Verification Auditor
 
@@ -537,7 +567,7 @@ Before removing an old installation, record its desired settings with
 `omp plugin config list omp-jev-router`. Finish active work, remove the old
 `omp-jev-router` installation/link, then install or link `om-oche` and reapply
 those settings with `omp plugin config set om-oche <key> <value>`. Do not load
-both installations at once. Start a new session on OMP 18.3.5.
+both installations at once. Start a new session on OMP 18.4.1.
 
 The rename does not modify global configuration, credentials or model roles.
 Telemetry retains the existing `<omp agent dir>/jev-router/` directory.
@@ -646,9 +676,16 @@ guards/fallbacks, notice precedence, advice verdicts and real error handling,
 absence of plugin executionom-orche (including old persisted approval records),
 finding evidence/lifecycle, credential priority, telemetry and status rendering.
 
-The renamed plugin was checked against OMP 18.3.5 with `bun run build`:
-133 tests across 14 files passed. Existing `no-control-regex` lint warnings
-remain in the advice parser and its tests.
+The OMP 18.4.1 upgrade passed `bun run build`: 143 tests across 14 files,
+with no type errors and two existing `no-control-regex` lint warnings.
+The credential-boundary regressions reject absent/empty registry credentials
+and exercise an explicit keyless credential through the real SDK.
+A separate real-registry smoke confirmed that a disabled provider made zero
+requests even with an environment key present; the actual extension loader
+registered both tools without errors. No paid model requests were made.
+
+Historical verification: the earlier rename was checked against OMP 18.3.5
+with 133 tests across 14 files passing.
 
 During the advice-only cutover, a disposable local OpenAI-compatible server
 exercised the actual advice CLI: KEEP, REPLAN and ESCALATE each returned exit 0
@@ -664,9 +701,9 @@ approval; the workers wrote four expected files. Native tool approval was
 auto-approved only for this isolated smoke. Temporary state was removed.
 
 These runs verify the exercised host/tool paths, not model reasoning quality
-or every provider/settings combination. OMP 18.3.5 is the compatibility target;
-earlier 18.3.1/18.3.4 smoke results in `docs/plans/self-orchestrom-orched` are
-historical, not the current support target.
+or every provider/settings combination. OMP 18.4.1 is the compatibility target;
+the 18.3.5 runs above and earlier smoke results in
+`docs/plans/self-orchestration.md` are historical, not the current support target.
 
 ### Known API constraints
 

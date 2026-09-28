@@ -77,6 +77,9 @@ function taskBodyContract(tools: ReadonlySet<string>, subject: string): string {
 			(tools.has("task")
 				? " Use the existing outputSchema only when a structured result is needed."
 				: ""),
+		...(tools.has("task") ? [
+			"When the host's task schema exposes `effort`, explicitly set it on each task item: `lo` for a fixed mechanical change, `med` for bounded implementation choices, `hi` for substantial unresolved design or correctness questions. Match the solution space, not file count or task length; preserve explicit user choices. If the field is absent, omit it rather than inventing a parameter.",
+		] : []),
 		"A worker that finds a defect in a fixed decision, an ownership conflict, or an invalid prerequisite pauses affected changes and reports evidence, touched files and partial work immediately; it does not redesign the contract, expand its scope, or overwrite another owner's edits.",
 	].join("\n");
 }
@@ -126,9 +129,12 @@ function renderOrchestrate(tools: ReadonlySet<string>): string {
 		"<system-notice>",
 		"Execution policy for this request (om-orche): coordinated delegation. You stay responsible for planning, integration, verification and completion.",
 		planning,
-		"Choose per unit: direct work for cohesive, sequential, or small changes; one `task` for a sufficient unit that benefits from separate context; parallel `task` items only for units that need none of each other's unfinished output and whose ownership, interfaces and runtime resources do not collide.",
-		"File count or prompt length is not evidence of independence. Submit dependent work only after its prerequisite contract is verified.",
-		"Concurrency limits come from the host's task settings; there is no required worker count. Start an independent follow-up once its own prerequisites are verified, without waiting for unrelated workers.",
+		"Identify independent, worthwhile implementation units first; establish only the shared contracts and prerequisites needed to make them runnable. Give each unit a clear owner, inputs and acceptance criteria. File count or prompt length alone does not establish independence.",
+		"When two or more units are ready and need none of each other's unfinished output, start them together in one `tasks[]` batch when the host supports batching; otherwise dispatch them without waiting for earlier independent workers. Respect the host's concurrency limit and non-overlapping file ownership, interfaces and runtime resources.",
+		"Do not serialize ready independent units. Sequence work only for an actual prerequisite or ownership/resource conflict, and name that dependency or conflict in the plan. Verify a prerequisite contract before releasing its dependent units.",
+		"Keep the coordinator focused on shared contracts, the minimal shared changes needed to unblock workers, integration and final verification. Once a contract is stable, delegate its independent consumers instead of keeping most implementation on the coordinator. Shared infrastructure or a single final test environment is not a reason to serialize unrelated implementation.",
+		"While workers run, advance non-overlapping coordinator work. Release each newly ready unit as soon as its own prerequisites are verified; do not wait for unrelated workers or an entire phase to finish. Wait only when no runnable coordinator work remains.",
+		"Do not pad the plan to reach a worker quota or delegate trivial work. Keep cohesive, small or genuinely sequential changes direct; one useful worker is valid when only one independent unit exists. Do not bypass host permissions, required checks or ownership boundaries to increase concurrency.",
 		taskBodyContract(tools, "`task` item"),
 		verification(tools),
 		"</system-notice>",
