@@ -366,6 +366,11 @@ approval. It is primary-only and uses `modelRoles.orche-advisor` without falling
 back to the primary model. It accepts a `checkpoint` and the seven snapshot
 fields shown in `examples/initial-plan.json`; there is no `dispatch` argument.
 
+The role `modelRoles.orche-advisor` is required: if it is unset, the tool returns
+an error rather than falling back. The [OMP setup](#omp-setup) fills it once with
+`@slow`, your Thinking model. If `slow` is unset, OMP resolves `@slow` to your
+default model, so the advisor then runs on the same model as the main session.
+
 - Advice is optional in every policy mode. Lifecycle
   hooks do not invoke the model. Do not request advice merely because a new
   turn, phase completion, worker result or auditor note arrived.
@@ -487,8 +492,11 @@ withheld.
 (unresolved first, bounded) so a guessed id is corrected in one step.
 
 The bundled Verification Auditor runs through OMP's WATCHDOG roster only while
-advisors are enabled. Its model is `@verification-auditor`, a custom role
-registered as `@smol` on primary-session startup if unset. It does not use or
+advisors are enabled (OMP's `advisor.enabled`, default `false`). Its model is
+`@verification-auditor`, a custom role. The [OMP setup](#omp-setup) turns
+`advisor.enabled` on and fills that role with `@smol` once, if they are unset. If
+`smol` is unset, OMP resolves `@smol` to your default model. The auditor is a
+per-turn review, so enabling it costs a model call each turn. It does not use or
 change `modelRoles.advisor` (ADVISOR); set its role independently to choose a
 different model. A same-named `WATCHDOG.yml` entry overrides the bundled
 auditor. Its evidence-backed concern/blocker notes feed the next checkpoint
@@ -519,26 +527,27 @@ a worker type. Task execution needs no external routing call or credential.
 
 ## Model roles and presets
 
-The plugin never sets, switches or recommends models at runtime. Models come
-from your OMP config: `modelRoles.default` selects the main model and
-`modelRoles.task` the generic worker. Switching between Judgment and Production
-inside a session needs no model change.
+The plugin never switches your models and never writes a concrete model ID. Models
+come from your OMP config: `modelRoles.default` selects the main model and
+`modelRoles.task` the generic worker. The one-time [OMP setup](#omp-setup) only
+fills two role aliases, `verification-auditor: "@smol"` and
+`orche-advisor: "@slow"`, and only when they are unset. Switching between
+Judgment and Production inside a session needs no model change.
 
 ```yaml
 modelRoles:
   default: <your primary model>              # never changed by this plugin
-  task: <capable worker>                    # OMP's generic task worker
+  task: <capable worker>                    # optional; unset = workers use the main session's active model
   smol: <lightweight model>                 # OMP's lightweight baseline (sonic)
   advisor: <general advisor model>          # only if declared in WATCHDOG.yml
-  verification-auditor: "@smol"            # distinct from ADVISOR
-  orche-advisor: <checkpoint reviewer>      # explicitly configured
+  verification-auditor: "@smol"            # filled by the OMP setup if unset; distinct from ADVISOR
+  orche-advisor: "@slow"                   # filled by the OMP setup if unset
 ```
 
-`verification-auditor` is registered as `@smol` on primary-session startup if
-unset; existing assignments are preserved and child sessions never register
-roles. `@task` is never written: if it does not resolve, `/om-orche status` says
-so and OMP reports its own spawn error; no other role (such as `@slow`) is
-substituted.
+Child sessions never fill roles. `@task` is never written: `modelRoles.task` is
+optional, and if it does not resolve, `/om-orche status` says task workers use the
+main session's active model. No other role (such as `@slow`) is substituted for
+it.
 
 ### Starting presets
 
@@ -614,18 +623,107 @@ omp plugin link /path/to/om-orche
 Nothing else is required: no `AGENTS.md` edit, no agent files, no `models.yml`
 surgery, no routing prompt, no separate SDK install, no OMP patch, and no
 Jev/TypeSafe account or credential. The package ships no agent definitions.
+Installing or linking also configures the OMP settings om-orche uses; see the
+next section.
+
+### OMP setup
+
+OMP has no install hook, so the setup runs at the first main-session start after
+the plugin is installed or linked (that is, when OMP first starts a main session
+with om-orche loaded). It never runs in a subagent session, and not while
+om-orche is disabled (`enabled=false`).
+
+It is **fill-only and runs once per installation**. Each item is handled by where
+its value currently comes from:
+
+- unset in every config layer → the setup writes the value to your global config;
+- set in your global or project config → kept untouched, whatever the value;
+- set only for this session (CLI flag, `--config`, protocol pin) → nothing is
+  written and that item stays pending, so a later session start tries again.
+
+The three items:
+
+| OMP key | value | why |
+| --- | --- | --- |
+| `advisor.enabled` | `true` | starts the bundled Verification Auditor. This is OMP's own advisor switch (default `false`), so it also applies to any advisors you declare in `WATCHDOG.yml` |
+| `modelRoles.verification-auditor` | `"@smol"` | the auditor's model. With `smol` unset, OMP resolves `@smol` to your default model |
+| `modelRoles.orche-advisor` | `"@slow"` | the plan advisor uses your Thinking model. With `slow` unset, OMP resolves `@slow` to your default model, so the advisor runs on the main model |
+
+**Cost.** With the auditor on, every turn adds a model call on
+`@verification-auditor`. In OMP 18.4.x, writing `advisor.enabled` during startup
+does not switch an already running session on by itself, so when the setup wrote
+that value it also switches the running session's advisor on through OMP's public
+session API; the auditor then runs in that same first session. To opt out or
+change it, set explicit values yourself: `omp config set advisor.enabled false`
+(the `omp config` CLI supports `list`, `get`, `set` and `reset`), or edit
+`~/.omp/agent/config.yml`. Individual `modelRoles` entries cannot be set with
+`omp config set`; edit them in `config.yml`. Values you set before the first
+start are kept; values you change afterwards stick, because the setup never
+re-enables or rewrites anything once it has finished.
+
+**Not set, on purpose:**
+
+- `modelRoles.task` is not needed: task workers use the main session's active
+  model unless you assign one.
+- `task.enableEffort` is optional; opt in with
+  `omp config set task.enableEffort true` (see [Task `effort`](#task-effort)).
+- No other OMP setting or role is touched, and OMP's own `advisor` role is never
+  written.
+
+**Once, and how it is recorded.** When every item is resolved (written or kept),
+om-orche stores an internal marker, `hostSetupVersion: 1`, in its plugin settings.
+It is not one of the [three settings](#configuration) and does not appear in
+`omp plugin config list`. With the marker present the setup does nothing, even if
+you later delete one of those OMP keys. If a write fails, the setup logs a
+warning and tries again at the next start, and writes no marker:
+
+```text
+om-orche OMP setup failed and will be retried at the next session start: <error>
+```
+
+**What you see.** Only when the setup wrote something, and only in the
+interactive UI, a notification lists just the keys it wrote:
+
+```text
+om-orche configured OMP once, filling only what was unset (existing values were kept):
+  advisor.enabled: true
+  modelRoles.verification-auditor: "@smol"
+  modelRoles.orche-advisor: "@slow"
+The Verification Auditor now reviews each turn with @verification-auditor.
+Edit roles in ~/.omp/agent/config.yml; `advisor.enabled` can also be changed with `omp config set advisor.enabled <true|false>`.
+```
+
+The last line varies with what was written: `Edit roles in
+~/.omp/agent/config.yml.` when only roles were written, and ``Change it with `omp
+config set advisor.enabled <true|false>`.`` when only `advisor.enabled` was
+written. In every mode an info line goes to the OMP log, again listing only what
+was written:
+
+```text
+om-orche OMP setup wrote advisor.enabled=true, modelRoles.verification-auditor="@smol", modelRoles.orche-advisor="@slow"
+```
+
+**Re-running.** Remove the marker, then start a new main session; the setup runs
+again and is still fill-only. Any of these removes it: reinstalling the plugin
+(`omp plugin uninstall om-orche` first), `/om-orche reset`, or
+`omp plugin config delete om-orche hostSetupVersion`.
+
+**Existing installs.** If om-orche is already installed, the setup runs once at the
+next main-session start after you upgrade (fill-only).
 
 ## Commands
 
 | Command | Effect |
 | --- | --- |
-| `/om-orche status` | Whether the plugin is enabled; execution policy (`judgment/production (om-orche-policy-notice)`, or `native (plugin disabled)`); primary model unchanged; native `task` worker and `@task` role; retired settings and leftover tier roles still present. |
+| `/om-orche status` | Whether the plugin is enabled; execution policy (`judgment/production (om-orche-policy-notice)`, or `native (plugin disabled)`); primary model unchanged; native `task` worker and `@task` role; the `OMP setup` row: `applied (v1)` (the stored version, shown even when the plugin is disabled), `pending — applies at the next main session start`, or `skipped — plugin disabled`; retired settings and leftover tier roles still present. |
 | `/om-orche stats` | Live-epoch task-worker usage, plus the read-only Jev-routing-era and tier-era history. |
 | `/om-orche reset` | Clear plugin-owned telemetry files and stored configuration. |
 
 `status` reports no credential, model or gate rows and no last decision: the
-plugin makes none. If `@task` does not resolve, status says so; the plugin does
-not route around it. Retired settings still stored for the plugin (see
+plugin makes none. If `@task` does not resolve, status says `@task does not
+resolve in this session; task workers use the main session's active model.`; the
+plugin does not route around it. Retired
+settings still stored for the plugin (see
 [Migrating from Jev routing](#migrating-from-jev-routing)) and leftover
 `@task_easy`/`@task_hard`/`@task_challenge` roles are listed as unused and left
 in place. Unknown subcommands get a warning.
@@ -733,12 +831,15 @@ These three are the only settings:
 
 | key | default | meaning |
 | --- | --- | --- |
-| `enabled` | `true` | master switch for the execution policy and automatic guidance; with `false`, OMP's native behavior is untouched. Manual advice/finding tools remain available |
+| `enabled` | `true` | master switch for the execution policy and automatic guidance; with `false`, OMP's native behavior is untouched and the [OMP setup](#omp-setup) is skipped. Manual advice/finding tools remain available |
 | `telemetryEnabled` | `true` | local aggregate task-worker counters |
 | `debugLogging` | `false` | one metrics-only line per turn and mode in the OMP log: `om-orche.policy mode=<default\|orchestrate\|workflow>` or `om-orche.policy skip=<reason>`; never prompt text |
 
 There is no setting to choose a policy mode or to turn delegation on or off.
-`examples/config.yml` shows the model roles to merge into your OMP config.
+The one-time setup keeps an internal marker, `hostSetupVersion`, in the same
+settings map; it is not a setting, is not listed by `omp plugin config list`, and
+is described under [Re-running](#omp-setup). `examples/config.yml` shows the
+model roles you can customize in your OMP config.
 
 ## Migrating from Jev routing
 
@@ -868,7 +969,10 @@ Turn on `debugLogging` and read the OMP log. Each governed turn logs
 | both a native notice and the plugin's seem missing | with `enabled=false` OMP's native behavior is untouched and the plugin adds nothing |
 | a native `orchestrate` request shows only one notice | expected: the plugin's `orchestrate` notice replaces the native one in place |
 | a worker cannot be messaged | the host reported it isolated or hard-aborted, or delivery failed; a new worker with the contract, changes and artifact references is the correct path. A missing "now idle" hint alone does not mean it cannot be continued |
-| `@task role unresolved` in status | assign `modelRoles.task`; OMP reports the spawn error and nothing is substituted |
+| `OMP setup` is not `applied (v1)` in status | `skipped — plugin disabled`: om-orche is disabled (`enabled=false`). `pending — applies at the next main session start`: no main session has started since install; an item is set only for the current session (CLI flag, `--config`, protocol pin), which leaves it pending until a session start without it; or a write failed, in which case the OMP log has the `om-orche OMP setup failed and will be retried at the next session start` warning and the next start retries |
+| the Verification Auditor does not run | `advisor.enabled` is off (the setup only fills it once; if you turned it off, it stays off), or `modelRoles.verification-auditor` is unset, or the plugin is disabled |
+| `orche_advisor` returns an error about a missing role | `modelRoles.orche-advisor` is unset. The setup fills it once with `@slow`; if the role was removed since, set it again under `modelRoles` in `~/.omp/agent/config.yml` |
+| `@task does not resolve in this session` in status | expected when `modelRoles.task` is unset: task workers use the main session's active model. Assign `modelRoles.task` in `config.yml` only if you want a different worker model |
 | `Retired settings still stored` in status | delete the listed keys with `omp plugin config delete om-orche <key>`; they have no effect |
 | telemetry suspended | the file was written by a newer plugin version, or a migration backup/write failed; `/om-orche reset` clears it |
 
@@ -880,11 +984,15 @@ omp plugin uninstall om-orche
 
 Removes the package, the plan-advice tool, the bundled auditor and the plugin's
 guidance; OMP's native `task` behavior and orchestrate notice return unchanged.
-OMP model-role assignments (including `verification-auditor`, `orche-advisor`,
-and any leftover `task_easy`/`task_hard`/`task_challenge`) remain until removed
-explicitly, as do any `typesafe` credential in OMP's store and the
+The OMP settings the [OMP setup](#omp-setup) wrote stay in your config:
+`advisor.enabled: true`, `modelRoles.verification-auditor: "@smol"` and
+`modelRoles.orche-advisor: "@slow"`. Remove or change them yourself (for example
+`omp config set advisor.enabled false`). Other OMP model-role assignments
+(including any leftover `task_easy`/`task_hard`/`task_challenge`) also remain
+until removed explicitly, as do any `typesafe` credential in OMP's store and the
 `<omp agent dir>/jev-router/` telemetry files; use `/om-orche reset` before
-uninstalling if those files should be cleared.
+uninstalling if those files should be cleared. The plugin's stored settings,
+including the setup marker, are removed with the plugin.
 
 ## Development / test
 
@@ -944,6 +1052,33 @@ notice mechanism was not changed in the Judgment/Production cutover.
   `telemetry-history/v5-<sha256>.json` backup, its live epoch moved to
   `jevRouting`, the tier era carried over, an empty live epoch, and an idempotent
   reload.
+
+**OMP setup (2026-09-29).** `bun run check` clean; `bun run lint` 0 errors (2
+existing `no-control-regex` warnings); `bun test` 208 pass, 0 fail across 14
+files. The full suite also passes with a temporary HOME and the real config roots
+sandbox-denied. Host scenarios, on the real OMP 18.4.3 CLI (and the pinned 18.4.1
+CLI for the fresh case), with an isolated HOME and agent directory,
+`omp plugin link`, print-mode sessions, a local fake model and no paid calls:
+
+- Fresh install, first session: `config.yml` received the three items, the plugin
+  lock received `hostSetupVersion: 1`, the info line reached the OMP log, and the
+  Verification Auditor ran in that same first session (one auditor model request
+  after the main turn).
+- Explicit user values (`advisor.enabled: false`, a concrete `orche-advisor`)
+  were kept; only the missing auditor role was filled, and no auditor ran.
+- With the marker present, keys the user deleted afterwards were not re-added.
+- After `omp plugin config delete om-orche hostSetupVersion`, the next session
+  re-applied the missing items (fill-only) and the auditor ran in that session.
+- With the plugin disabled (project override `enabled: false`), nothing was
+  written and no marker was set.
+- `omp plugin uninstall om-orche` removed the plugin's settings including the
+  marker; the written OMP keys stayed in `config.yml`.
+
+Not verified on a live host: the interactive notification display (print mode has
+no UI; the log line is verified); the `/om-orche status` row (unit-tested only);
+`omp plugin install` from npm (only `link` was exercised; OMP's install path calls
+no plugin code either way); and the pending path for session-scoped values such
+as RPC/ACP protocol pins (unit-tested only).
 
 **Real-model smoke.** Setup: the OMP 18.4.2 CLI with the user's model roles (main
 `anthropic/claude-opus-5-5`, `task` worker `anthropic/claude-sonnet-5-5:medium`);

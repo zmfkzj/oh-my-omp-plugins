@@ -4,7 +4,8 @@
  * Every line is a fixed-shape metric record: the policy mode chosen for a turn or
  * the reason the plugin stayed out of it. Prompts, task bodies, source code and
  * transcripts never reach the log. `debugLogging` gates emission; the file sink
- * is OMP's own logger.
+ * is OMP's own logger. `info` and `warn` are always on and reserved for rare
+ * one-time events (the OMP setup report, a failure).
  */
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import type { PolicyMode } from "./orchestration-policy.ts";
@@ -33,6 +34,11 @@ export class RouteLogger {
 	policy(record: PolicyLogRecord): void {
 		if (!this.#enabled) return;
 		this.#logger.debug(`om-orche.policy ${"mode" in record ? `mode=${record.mode}` : `skip=${record.skip}`}`);
+	}
+
+	/** A rare always-on notice (a one-time event), never emitted per turn. */
+	info(message: string): void {
+		this.#logger.info(`om-orche ${message}`);
 	}
 
 	warn(message: string): void {

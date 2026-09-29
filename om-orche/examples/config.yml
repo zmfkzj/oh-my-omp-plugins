@@ -1,13 +1,16 @@
-# Merge these roles into the active OMP config.yml; do not overwrite other settings.
+# om-orche fills these roles automatically once, at the first main-session start after install,
+# and only if they are unset: advisor.enabled: true, verification-auditor: "@smol",
+# orche-advisor: "@slow". This file is for customizing them; nothing here is required.
+# Merge the roles you want into the active OMP config.yml; do not overwrite other settings.
 # om-orche's Judgment/Production execution policies need no model role, credential or setting
 # here; they never change the primary model, `@default`, `@task` or task inputs.
 # Any supported authenticated model selector may be used for the roles below.
 # Orche-Advisor gives optional advice on an established plan, never execution approval.
 # Reload with /reload-plugins after changes.
 modelRoles:
-  # task: <provider/model> # OMP's native task worker model; keep any existing assignment
-  orche-advisor: openai-codex/gpt-6-astra:xhigh
-  verification-auditor: "@smol" # separate from ADVISOR; customize independently
+  # task: <provider/model> # optional: unset = task workers use the main session's active model
+  orche-advisor: openai-codex/gpt-6-astra:xhigh # default filled by om-orche: "@slow"
+  verification-auditor: "@smol" # default filled by om-orche; separate from ADVISOR; customize independently
 
 # Optional starting presets for the main (`default`) and generic worker (`task`) models.
 # They are starting choices you set yourself, not routing: the plugin never switches

@@ -6,6 +6,7 @@
 import path from "node:path";
 import { clearStoredConfig, DEFAULT_CONFIG, PLUGIN_NAME } from "./config.ts";
 import { mainSessionOf } from "./host.ts";
+import { HOST_SETUP_VERSION, type HostSetupStore, pluginSetupStore } from "./omp-setup.ts";
 import { POLICY_NOTICE_TYPE } from "./orchestration-policy.ts";
 import {
 	type HistoricalJevRouting,
@@ -32,6 +33,13 @@ function row(label: string, value: string): string {
 	return `${label.padEnd(PAD)}${value}`;
 }
 
+/** Whether the one-time OMP setup has run, from its marker. An unreadable marker counts as not run. */
+async function ompSetupStatus(enabled: boolean, store: HostSetupStore): Promise<string> {
+	const version = await store.version().catch(() => undefined);
+	if (version !== undefined && version >= HOST_SETUP_VERSION) return `applied (v${version})`;
+	return enabled ? "pending — applies at the next main session start" : "skipped — plugin disabled";
+}
+
 /** Model roles the retired tier router created; user-owned, never deleted or read. */
 const RETIRED_TIER_ROLES = ["task_easy", "task_hard", "task_challenge"] as const;
 
@@ -39,6 +47,7 @@ export async function renderStatus(
 	pi: ExtensionAPI,
 	runtime: OrcheRuntime,
 	ctx: ExtensionCommandContext,
+	setupStore: HostSetupStore = pluginSetupStore(),
 ): Promise<string> {
 	const config = runtime.config;
 	const session = mainSessionOf(ctx);
@@ -50,6 +59,7 @@ export async function renderStatus(
 		row(PLUGIN_NAME, config.enabled ? "enabled" : "disabled"),
 		row("Execution policy", config.enabled ? `judgment/production (${POLICY_NOTICE_TYPE})` : "native (plugin disabled)"),
 		row("Primary model", "unchanged — no model switching"),
+		row("OMP setup", await ompSetupStatus(config.enabled, setupStore)),
 		"",
 		row(
 			"Task worker",
@@ -59,7 +69,7 @@ export async function renderStatus(
 	];
 	if (!taskModel) {
 		lines.push(
-			`  @${GENERIC_TASK_AGENT} does not resolve in this session and no other model is substituted. Set modelRoles.${GENERIC_TASK_AGENT}.`,
+			`  @${GENERIC_TASK_AGENT} does not resolve in this session; task workers use the main session's active model.`,
 		);
 	}
 

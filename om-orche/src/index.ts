@@ -5,14 +5,15 @@
  *      (the main analyzes) and Production (workers build), chosen by the main
  *      per stage. It needs no network and no credentials, and the primary
  *      model never changes.
- *   2. Generic workers stay OMP's native `task` agent. Its model comes from the
- *      user's `@task` role; task calls are never classified or rewritten.
+ *   2. Generic workers stay OMP's native `task` agent: it uses the user's `@task`
+ *      role when set, else the main session's active model. Task calls are never
+ *      classified or rewritten.
  *
  * Specialized and custom agents, and every explicit user choice, are left
  * exactly as they are.
  */
 import { registerOrcheAdvisor } from "./orche-advisor.ts";
-import { AUDITOR_ROLE } from "./verification-auditor.ts";
+import { type HostSetupStore, pluginSetupStore, runOmpSetup } from "./omp-setup.ts";
 import { registerCommands } from "./commands.ts";
 import { PLUGIN_NAME } from "./config.ts";
 import { mainSessionOf } from "./host.ts";
@@ -21,7 +22,7 @@ import { OrcheRuntime } from "./runtime.ts";
 import { trackWorkerUsage } from "./worker-usage.ts";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
-export function registerOmOrche(pi: ExtensionAPI): OrcheRuntime {
+export function registerOmOrche(pi: ExtensionAPI, setupStore: HostSetupStore = pluginSetupStore()): OrcheRuntime {
 	const runtime = new OrcheRuntime(pi);
 	pi.setLabel(PLUGIN_NAME);
 	registerCommands(pi, runtime);
@@ -29,13 +30,10 @@ export function registerOmOrche(pi: ExtensionAPI): OrcheRuntime {
 
 	pi.on("session_start", async (_event, ctx) => {
 		await runtime.reloadConfig(ctx.cwd);
-		// Register the auditor role without changing user assignments.
-		// Child sessions inherit settings and must not write global configuration.
-		const settings = mainSessionOf(ctx)?.settings;
-		if (settings && settings.getModelRole(AUDITOR_ROLE) === undefined) {
-			settings.setModelRole(AUDITOR_ROLE, "@smol");
-			await settings.flush();
-		}
+		// One-time OMP setup. It must finish before the auditor installer registered by
+		// `registerOrcheAdvisor` runs in this same session_start, so OMP's live
+		// `advisor.enabled` toggle can start the auditor in the first session.
+		await runOmpSetup(ctx, { enabled: runtime.config.enabled, store: setupStore, logger: runtime.logger });
 		await runtime.telemetry.load();
 	});
 	// Live usage covers workers named `task`, whichever native path spawned them.

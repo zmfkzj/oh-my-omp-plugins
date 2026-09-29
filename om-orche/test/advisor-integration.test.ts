@@ -1,4 +1,7 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { z } from "zod";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
@@ -8,6 +11,8 @@ import example from "../examples/initial-plan.json";
 import { runReview, ROLE, TOOL, type ReviewSelection } from "../src/advisor-review.ts";
 import { registerOmOrche } from "../src/index.ts";
 import { AUDITOR_NAME, VERIFICATION_AUDITOR } from "../src/verification-auditor.ts";
+import { cfgAdvisorEnabled } from "@oh-my-pi/pi-coding-agent/advisor/settings";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ORCHESTRATE_GUIDANCE, registerOrcheAdvisor } from "../src/orche-advisor.ts";
 import {
   NATIVE_ORCHESTRATE_NOTICE_TYPE,
@@ -15,28 +20,53 @@ import {
   policyModeOf,
 } from "../src/orchestration-policy.ts";
 import { clearRegistry, makeSession, registerAsMain } from "./harness.ts";
+import type { HostSetupStore } from "../src/omp-setup.ts";
+import type { AdvisorConfig } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 
-afterEach(clearRegistry);
+const tempRoots: string[] = [];
+afterEach(() => {
+  clearRegistry();
+  for (const root of tempRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
 
 type Tool = Parameters<ExtensionAPI["registerTool"]>[0];
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 
-test("one extension registers the advice tool and an independent auditor role, without review commands", async () => {
+/**
+ * The whole plugin on a main session with real settings, its session_start handlers in registration order.
+ *
+ * The fake session models what a real host was observed to do: writing `advisor.enabled` does not toggle an
+ * already-built session, only `setAdvisorEnabled` does. `timeline` records the live advisor calls in order.
+ */
+function plugin(store: HostSetupStore, settings = Settings.isolated()) {
   const handlers: Handler[] = [];
   const commands: string[] = [];
+  const timeline: string[] = [];
+  let roster: AdvisorConfig[] = [];
+  let advisorLive = false;
   let adviceTool: Tool | undefined;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "om-orche-plugin-"));
+  tempRoots.push(root);
   const { session, ctx } = makeSession();
-  const branch: SessionEntry[] = [];
-  Object.assign(session.sessionManager, { getBranch: () => branch });
-  const roles = new Map<string, string>([["advisor", "existing-advisor-model"]]);
-  let flushes = 0;
-  Object.assign(session.settings, {
-    getModelRole: (role: string) => roles.get(role),
-    setModelRole: (role: string, model: string) => roles.set(role, model),
-    flush: async () => { flushes++; },
+  Object.assign(session.sessionManager, { getBranch: () => [], getCwd: () => root });
+  Object.assign(settings, { getAgentDir: () => root });
+  Object.assign(session, {
+    settings,
+    isAdvisorEnabled: () => {
+      timeline.push(`isAdvisorEnabled=${advisorLive}`);
+      return advisorLive;
+    },
+    setAdvisorEnabled: (enabled: boolean) => {
+      timeline.push(`setAdvisorEnabled(${enabled})`);
+      advisorLive = enabled;
+      return false;
+    },
+    applyAdvisorConfigs: (configs: AdvisorConfig[]) => {
+      timeline.push("roster");
+      roster = configs;
+    },
   });
   registerAsMain(session);
-  Object.assign(session, { isAdvisorEnabled: () => false });
   const pi = {
     zod: z,
     logger: { debug() {}, warn() {}, info() {}, error() {} },
@@ -48,22 +78,114 @@ test("one extension registers the advice tool and an independent auditor role, w
       if (event === "session_start") handlers.push(handler);
     },
   } as unknown as ExtensionAPI;
-  const runtime = registerOmOrche(pi);
+  const runtime = registerOmOrche(pi, store);
   runtime.reloadConfig = async () => runtime.config;
   runtime.telemetry.load = async () => {};
+  return {
+    session, ctx, settings, runtime, commands, timeline,
+    get roster() { return roster.map(config => config.name); },
+    get adviceTool() { return adviceTool; },
+    async start() { for (const handler of handlers) await handler({}, ctx); },
+  };
+}
 
-  for (const handler of handlers) await handler({}, ctx);
+function markerStore(initial?: number) {
+  const written: number[] = [];
+  let version = initial;
+  const store: HostSetupStore = {
+    async version() { return version; },
+    async markApplied(next) { version = next; written.push(next); },
+  };
+  return { store, written };
+}
+
+test("the first main session start configures OMP and turns the live advisor on before the auditor installs", async () => {
+  const { store, written } = markerStore();
+  const settings = Settings.isolated();
+  settings.setModelRole("advisor", "existing-advisor-model");
+  const app = plugin(store, settings);
+
+  await app.start();
+
+  expect(settings.getModelRole("verification-auditor")).toBe("@smol");
+  expect(settings.getModelRole("orche-advisor")).toBe("@slow");
+  expect(settings.getModelRole("advisor")).toBe("existing-advisor-model");
+  expect(written).toEqual([1]);
+  // The live flag is switched on first, so the installer in the same start sees advisors enabled and installs.
+  expect(app.timeline).toEqual(["isAdvisorEnabled=false", "setAdvisorEnabled(true)", "isAdvisorEnabled=true", "roster"]);
+  expect(app.roster).toEqual([AUDITOR_NAME]);
+});
+
+describe("the live advisor is only switched on for a value this run wrote", () => {
+  test("a user-configured advisor.enabled is left alone", async () => {
+    const settings = Settings.isolated();
+    cfgAdvisorEnabled.set(settings, false);
+    const app = plugin(markerStore().store, settings);
+
+    await app.start();
+
+    expect(cfgAdvisorEnabled.get(settings)).toBe(false);
+    expect(app.timeline).toEqual(["isAdvisorEnabled=false"]);
+    expect(app.roster).toEqual([]);
+  });
+
+  test("a session-scoped advisor.enabled stays pending and the live flag is untouched", async () => {
+    const { store, written } = markerStore();
+    const app = plugin(store, Settings.isolated({ "advisor.enabled": false }));
+
+    await app.start();
+
+    expect(app.timeline).toEqual(["isAdvisorEnabled=false"]);
+    expect(written).toEqual([]);
+  });
+});
+
+test("once the setup has run, a start registers no roles and enables nothing", async () => {
+  const { store, written } = markerStore(1);
+  const settings = Settings.isolated();
+  const app = plugin(store, settings);
+
+  await app.start();
+  await app.start();
+
+  expect(app.timeline).toEqual(["isAdvisorEnabled=false", "isAdvisorEnabled=false"]);
+  expect(settings.getModelRole("verification-auditor")).toBeUndefined();
+  expect(settings.getModelRole("orche-advisor")).toBeUndefined();
+  expect(written).toEqual([]);
+});
+
+test("a disabled plugin leaves OMP unconfigured, the live advisor off and the marker unset", async () => {
+  const { store, written } = markerStore();
+  const settings = Settings.isolated();
+  const app = plugin(store, settings);
+  app.runtime.reloadConfig = async () => {
+    app.runtime.config.enabled = false;
+    return app.runtime.config;
+  };
+
+  await app.start();
+
+  expect(settings.getModelRole("verification-auditor")).toBeUndefined();
+  expect(cfgAdvisorEnabled.get(settings)).toBe(false);
+  expect(app.timeline).toEqual(["isAdvisorEnabled=false"]);
+  expect(written).toEqual([]);
+});
+
+test("one extension registers the advice tool and an independent auditor role, without review commands", async () => {
+  // Setup already applied, so `orche-advisor` stays unset and the advice tool reports it.
+  const { store } = markerStore(1);
+  const settings = Settings.isolated();
+  settings.setModelRole("advisor", "existing-advisor-model");
+  const app = plugin(store, settings);
+  const { session, ctx } = app;
+
+  await app.start();
+  const adviceTool = app.adviceTool;
   expect(adviceTool?.name).toBe(TOOL);
-  expect(roles.get("verification-auditor")).toBe("@smol");
   expect(VERIFICATION_AUDITOR.model).toBe("@verification-auditor");
-  expect(roles.get("advisor")).toBe("existing-advisor-model");
-  expect(flushes).toBe(1);
-
-  roles.set("verification-auditor", "custom-auditor-model");
-  for (const handler of handlers) await handler({}, ctx);
-  expect(roles.get("verification-auditor")).toBe("custom-auditor-model");
-  expect(flushes).toBe(1);
-  expect(commands.filter(name => /review|waive|approv/i.test(name))).toEqual([]);
+  expect(settings.getModelRole("advisor")).toBe("existing-advisor-model");
+  expect(settings.getModelRole("verification-auditor")).toBeUndefined();
+  expect(app.commands.filter(name => /review|waive|approv/i.test(name))).toEqual([]);
 
   // The schema accepts only the checkpoint and seven-field snapshot: no dispatch staging.
   const schema = adviceTool!.parameters as unknown as z.ZodType;
