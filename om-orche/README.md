@@ -297,10 +297,30 @@ counter-evidence; a screenshot-only claim should be labeled as visual
 observation or backed by extracted state. The bundled entry also sets
 `maxNotesPerUpdate: 1` (blockers are exempt in OMP). It must identify the
 snapshot or result it actually checked; a growing transcript's last observed
-entry is not proof that the session ended. These are model instructions, not a
-semantic runtime filter: existing notes are not silently dropped based on phrase
-matching or automatically marked resolved. The reviewer likewise assesses
-evidence against the claim and revision, not against the note's delivery time.
+entry is not proof that the session ended. Findings are never automatically
+marked resolved. The reviewer likewise assesses evidence against the claim and
+revision, not against the note's delivery time.
+
+Instructions alone did not hold on a small watchdog model (one session: 105
+`nit` notes and 17 "stop and answer now" blockers), and OMP offers plugins no hook
+on the advisor's `advise` call. The plugin therefore enforces the note contract
+mechanically on the bundled auditor's notes, in the primary's provider context
+and in the findings ledger:
+
+- `nit` notes are withheld.
+- A concern or blocker with no quotation (`"…"`, `“…”`, `‘…’`, `「…」`), no
+  backticked output/identifier and no `path.ext:line` is withheld as uncited.
+- A blocker without a quotation is treated as a concern.
+
+Other advisors' notes and the persisted transcript are untouched; the TUI still
+shows every card OMP delivered, and OMP's own delivery (steering, deferred
+flushes, idle wake-ups) is unchanged. A card left empty is dropped, except when
+it woke an idle primary after its answer: then a one-line withheld notice keeps
+the request well formed. Replayed on two recorded sessions, the primary would
+have read 12 of 121 and 42 of 160 cards. The rules are string checks, not a
+semantic judgment: a process directive that happens to cite a backticked value
+still arrives, as a concern, and a well-founded concern with no citation is
+withheld.
 
 `review_findings` with an unknown `findingId` fails with the current ids
 (unresolved first, bounded) so a guessed id is corrected in one step.
@@ -446,14 +466,26 @@ unlogged decisions.
 
 ## DEFAULT / ORCHESTRATE
 
-- **DEFAULT** — one coherent or sequential body of work, including difficult
-  reasoning, routine delegation, or a single bounded worker.
-- **ORCHESTRATE** — genuinely independent workstreams with enough context locality
-  and benefit to justify coordination and duplicated context.
+- **DEFAULT** — answering a question, one focused feature/change/fix, a
+  single-thread review or investigation, or work that is strictly sequential in
+  the same files or one shared component.
+- **ORCHESTRATE** — multi-part implementation whose deliverables or plan items
+  touch different files, screens, subsystems or layers and can proceed in
+  parallel once shared contracts are fixed, or several independent
+  investigations useful on their own.
 
-The classifier evaluates the conversation and plan, not just the latest terse
-follow-up. Difficulty, file count, or merely having a todo list do not mandate
-orchestration. Neither branch selects a different primary model.
+The classifier evaluates the whole work implied by the conversation and plan,
+not just the latest terse follow-up. ORCHESTRATE only adds coordinated-delegation
+guidance, which itself keeps small or sequential parts direct, so a plan with
+several items across layers is routed there. Neither branch selects a different
+primary model.
+
+The criteria were rebalanced after a replay of real routing points: the earlier
+wording gave `P(ORCHESTRATE) ≤ 0.18` even to plans the primary then fanned out to
+parallel workers, and no live decision had ever routed ORCHESTRATE. On the same
+20 labeled points the current wording routes 19 as labeled (the miss is a
+request whose todo plan is then promoted), and it routed 1 of 43 prompts from
+other projects to ORCHESTRATE.
 
 ## Failure behavior
 

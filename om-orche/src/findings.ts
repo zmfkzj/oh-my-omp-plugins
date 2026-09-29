@@ -11,7 +11,6 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { slugifyAdvisorName } from "@oh-my-pi/pi-coding-agent/advisor/config";
 import type { CustomEntry, SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import {
-  AUDITOR_SLUG,
   FINDING_LIMITS,
   TOOL as REVIEW_TOOL,
   collapse,
@@ -21,6 +20,7 @@ import {
   type FindingStatus,
   type VerificationFinding,
 } from "./advisor-review.ts";
+import { type AuditorSeverity, admittedSeverity, isOwnedAuditor } from "./auditor-contract.ts";
 import { mainSessionOf } from "./host.ts";
 import { visibleText } from "./routing-context.ts";
 import { AUDITOR_NAME } from "./verification-auditor.ts";
@@ -123,18 +123,16 @@ function classifyEvidence(entry: SessionEntry): FindingEvidence | string {
   };
 }
 
-/** A persisted note the ledger tracks: the owned auditor's concern or blocker. */
+/** A persisted note the ledger tracks: the owned auditor's concern or blocker, under its contract. */
 function trackedNote(
   raw: unknown,
-): { note: string; severity: "concern" | "blocker"; advisor: string } | undefined {
+): { note: string; severity: AuditorSeverity; advisor: string } | undefined {
   if (raw === null || typeof raw !== "object") return undefined;
   const { note, severity, advisor } = raw as Record<string, unknown>;
   if (typeof note !== "string" || typeof advisor !== "string") return undefined;
-  if (severity !== "concern" && severity !== "blocker") return undefined;
-  if (slugifyAdvisorName(advisor) !== AUDITOR_SLUG || !collapse(note, FINDING_LIMITS.note)) {
-    return undefined;
-  }
-  return { note, severity, advisor };
+  if (!isOwnedAuditor(advisor) || !collapse(note, FINDING_LIMITS.note)) return undefined;
+  const admitted = admittedSeverity(note, severity);
+  return admitted && { note, severity: admitted, advisor };
 }
 
 /**

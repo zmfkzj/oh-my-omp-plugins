@@ -22,6 +22,7 @@ import {
   runReview,
 } from "./advisor-review.ts";
 import { collectFindings } from "./findings.ts";
+import { enforceAuditorContract } from "./auditor-contract.ts";
 
 const DEFAULT_GUIDANCE = `Orche-Advisor gives optional model advice on orchestration, not code; it is not a worker,
 a second orchestrator, or an approval authority. You retain planning, delegation, implementation
@@ -118,6 +119,13 @@ export function registerOrcheAdvisor(pi: ExtensionAPI, reviewer: typeof runRevie
     if (guidanceEnabled() && primarySession(ctx) && pi.getActiveTools().includes(TOOL)) {
       return { systemPrompt: [...event.systemPrompt, DEFAULT_GUIDANCE] };
     }
+  });
+  // Enforce the auditor's note contract in what the primary reads; runs whether or not the
+  // advice tool is active, because the auditor keeps running either way.
+  pi.on("context", (event, ctx) => {
+    if (!primarySession(ctx)) return;
+    const messages = enforceAuditorContract(event.messages);
+    return messages && { messages };
   });
   pi.on("context", (event, ctx) => {
     if (!guidanceEnabled() || !primarySession(ctx) || !pi.getActiveTools().includes(TOOL)) return;

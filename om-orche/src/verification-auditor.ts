@@ -76,7 +76,11 @@ When a check could not run, ask for it to be reported as unexecuted —
 never for new tooling, installs, or other environment changes.
 
 Use \`blocker\` only for a completion claim the evidence contradicts, and quote
-that claim. With no quotable completion claim, it is not a blocker.
+that claim in quotation marks. With no quotable completion claim, it is not a blocker.
+
+These rules are enforced mechanically on what the primary reads: \`nit\` notes and
+notes without a quotation, a backticked output/identifier, or a \`file:line\` are
+withheld, and a blocker without a quotation is shown as a concern.
 
 Your notes are forwarded as evidence to optional plan-advice requests. They do not
 grant or withhold execution permission, require a review receipt, or halt tool use.

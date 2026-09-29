@@ -46,8 +46,10 @@ function transcript() {
   };
 }
 
-const blocker = (note: string): AdvisorNote => ({ note, severity: "blocker", advisor: AUDITOR_NAME });
-const concern = (note: string): AdvisorNote => ({ note, severity: "concern", advisor: AUDITOR_NAME });
+// Contract-compliant notes: the quoted claim keeps a blocker a blocker and cites evidence for a concern.
+const CLAIM = ' Re: "the work is complete".';
+const blocker = (note: string): AdvisorNote => ({ note: note + CLAIM, severity: "blocker", advisor: AUDITOR_NAME });
+const concern = (note: string): AdvisorNote => ({ note: note + CLAIM, severity: "concern", advisor: AUDITOR_NAME });
 
 describe("verification finding ledger", () => {
   test("gives each tracked note a stable id and the user's own words as scope", () => {
@@ -66,7 +68,7 @@ describe("verification finding ledger", () => {
       id: `${source}:2`,
       sourceEntryId: source,
       occurredAt: session.manager.getEntry(source)?.timestamp,
-      note: "User said the API may change; the diff renames parse().",
+      note: `User said the API may change; the diff renames parse().${CLAIM}`,
       severity: "blocker",
       advisor: AUDITOR_NAME,
       scopeUserEntryId: scope,

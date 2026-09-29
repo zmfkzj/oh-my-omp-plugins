@@ -55,7 +55,8 @@ function primarySession(ui: { hasUI: boolean; confirm?: Confirm } = { hasUI: fal
   };
 }
 
-const blocker = (note: string): AdvisorNote => ({ note, severity: "blocker", advisor: AUDITOR_NAME });
+// Contract-compliant: the quoted claim keeps a blocker a blocker.
+const blocker = (note: string): AdvisorNote => ({ note: `${note} Re: "the work is complete".`, severity: "blocker", advisor: AUDITOR_NAME });
 
 describe("review_findings", () => {
   test("accepts successful evidence before delayed delivery without admitting failed results", async () => {
@@ -107,7 +108,7 @@ describe("review_findings", () => {
       },
     });
     session.user("Build the importer.");
-    const id = `${session.audit({ note: "Rollback path is untested.", severity: "concern", advisor: AUDITOR_NAME })}:0`;
+    const id = `${session.audit({ note: "Rollback path is untested. `rollback.test.ts` never ran.", severity: "concern", advisor: AUDITOR_NAME })}:0`;
     const output = session.result("rollback skipped");
     const waive = (evidence?: string[]) =>
       session.call({ action: "waive", findingId: id, reason: "Rollback is out of scope.", evidence });
