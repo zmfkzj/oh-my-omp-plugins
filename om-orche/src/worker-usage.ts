@@ -102,6 +102,12 @@ export interface WorkerUsageOptions {
 	 * reaches more than one of them counts once.
 	 */
 	scope?: string;
+	/**
+	 * Asked for every frame; a frame is dropped while it answers false, as if it had never been published. The
+	 * process's sessions share one `Telemetry` but not one telemetry choice, so each subscription carries its own
+	 * session's. Defaults to always recording.
+	 */
+	enabled?: () => boolean;
 }
 
 /**
@@ -117,8 +123,10 @@ export interface WorkerUsageOptions {
 export function trackWorkerUsage(events: EventBusLike, telemetry: Telemetry, options: WorkerUsageOptions = {}): () => void {
 	const source: WorkerSource = Symbol("task-worker-frames");
 	const scope = options.scope ?? scopeOfBus(events);
+	const recording = () => options.enabled?.() ?? true;
 
 	const offProgress = events.on(SUBAGENT_PROGRESS_CHANNEL, data => {
+		if (!recording()) return;
 		const payload = data as Partial<SubagentProgressPayload> | null | undefined;
 		const progress = payload?.progress;
 		if (typeof progress?.id !== "string" || progress.agent !== GENERIC_TASK_AGENT) return;
@@ -133,6 +141,7 @@ export function trackWorkerUsage(events: EventBusLike, telemetry: Telemetry, opt
 	});
 
 	const offLifecycle = events.on(SUBAGENT_LIFECYCLE_CHANNEL, data => {
+		if (!recording()) return;
 		const payload = data as Partial<SubagentLifecyclePayload> | null | undefined;
 		if (typeof payload?.id !== "string" || payload.agent !== GENERIC_TASK_AGENT) return;
 		const key = workerKey(scope, payload.parentToolCallId, payload.id);

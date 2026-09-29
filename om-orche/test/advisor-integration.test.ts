@@ -449,7 +449,9 @@ function registeredPlugin(enabled = true, branch: SessionEntry[] = []) {
       return id;
     },
   });
-  Object.assign(session, { isAdvisorEnabled: () => false });
+  // The router reads the model's context off the session, as the host's `AgentSession.messages` getter does.
+  const messages: AgentMessage[] = [];
+  Object.assign(session, { isAdvisorEnabled: () => false, messages });
   registerAsMain(session);
   const handlers = new Map<string, Handler[]>();
   const pi = {
@@ -466,9 +468,11 @@ function registeredPlugin(enabled = true, branch: SessionEntry[] = []) {
   } as unknown as ExtensionAPI;
   const runtime = registerOmOrche(pi);
   runtime.config.enabled = enabled;
+  // `syncConfig` would replace the config with the real stored one on every turn.
+  runtime.syncConfig = async () => {};
   runtime.telemetry.setEnabled(false);
   return {
-    branch, session, ctx, runtime,
+    branch, session, ctx, runtime, messages,
     async endTurn() {
       for (const handler of handlers.get("agent_end") ?? []) await handler({ type: "agent_end", willContinue: false }, ctx);
     },
@@ -480,10 +484,22 @@ function registeredPlugin(enabled = true, branch: SessionEntry[] = []) {
       }
       return undefined;
     },
-    async beginTurn(prompt: string) {
+    /**
+     * Deliver a prompt as the host does: the user message joins the session's context, then the hidden
+     * message a `before_agent_start` handler returned is appended after it. Returns that appended message.
+     */
+    async beginTurn(prompt: string): Promise<AgentMessage[]> {
+      messages.push(user(prompt));
+      const appended: AgentMessage[] = [];
       for (const handler of handlers.get("before_agent_start") ?? []) {
-        await handler({ type: "before_agent_start", prompt, systemPrompt: [] }, ctx);
+        const result = await handler({ type: "before_agent_start", prompt, systemPrompt: [] }, ctx) as
+          { message?: Record<string, unknown> } | undefined;
+        if (result?.message) {
+          appended.push({ role: "custom", ...result.message, attribution: "user", timestamp: 0 } as AgentMessage);
+        }
       }
+      messages.push(...appended);
+      return appended;
     },
     /** Mirrors `ExtensionRunner.emitContext`: a cloned array flows through handlers in registration order. */
     async context(messages: AgentMessage[]): Promise<AgentMessage[]> {
@@ -549,9 +565,8 @@ for (const explicit of [false, true]) {
   });
 }
 
-test("explicit orchestration composes one policy notice with Advisor guidance once", async () => {
+test("explicit orchestration composes stand-in policy notices with Advisor guidance once", async () => {
   const plugin = registeredPlugin();
-  await plugin.beginTurn(PROMPT);
   const historical = keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 1, "earlier native");
   const persisted = [historical, user("Earlier request"), assistant("done"),
     keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 2), user(PROMPT)];
@@ -559,11 +574,13 @@ test("explicit orchestration composes one policy notice with Advisor guidance on
 
   const first = await plugin.context(persisted);
   expect(persisted).toEqual(snapshot);
-  expect(first[0]).toEqual(historical);
-  expect(ofType(first, NATIVE_ORCHESTRATE_NOTICE_TYPE)).toEqual([historical]);
+  // Every native notice, historical or current, becomes a stand-in in place; the default copy trails.
+  expect(ofType(first, NATIVE_ORCHESTRATE_NOTICE_TYPE)).toEqual([]);
   const policy = first.filter(message => policyModeOf(message) !== undefined);
-  expect(policy.map(policyModeOf)).toEqual(["orchestrate"]);
-  expect(first[3]).toBe(policy[0]!);
+  expect(policy.map(policyModeOf)).toEqual(["orchestrate", "orchestrate", "default"]);
+  expect(first[0]).toBe(policy[0]!);
+  expect(first[3]).toBe(policy[1]!);
+  expect(first.at(-1)).toBe(policy[2]!);
   expect(guidanceCount(policy[0])).toBe(1);
   expect(totalGuidance(first)).toBe(1);
 
@@ -578,7 +595,6 @@ test("explicit orchestration composes one policy notice with Advisor guidance on
 test("a workflow turn keeps the native workflow notice and gets one guided supplement", async () => {
   for (const explicit of [false, true]) {
     const plugin = registeredPlugin();
-    await plugin.beginTurn(PROMPT);
     const workflow = keywordNotice(NATIVE_WORKFLOW_NOTICE_TYPE, 3);
     const persisted = [assistant("previous"),
       ...(explicit ? [keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 3)] : []), workflow, user(PROMPT)];
@@ -586,7 +602,7 @@ test("a workflow turn keeps the native workflow notice and gets one guided suppl
       expect(ofType(composed, NATIVE_WORKFLOW_NOTICE_TYPE)).toEqual([workflow]);
       expect(ofType(composed, NATIVE_ORCHESTRATE_NOTICE_TYPE)).toEqual([]);
       const policy = composed.filter(message => policyModeOf(message) !== undefined);
-      expect(policy.map(policyModeOf)).toEqual(["workflow"]);
+      expect(policy.map(policyModeOf)).toEqual(["workflow", "default"]);
       expect(guidanceCount(policy[0])).toBe(1);
       expect(totalGuidance(composed)).toBe(1);
     }
@@ -595,15 +611,18 @@ test("a workflow turn keeps the native workflow notice and gets one guided suppl
 
 test("a default turn carries the Judgment/Production policy without orchestration guidance", async () => {
   const plugin = registeredPlugin();
-  await plugin.beginTurn(PROMPT);
-  const composed = await plugin.context([user(PROMPT)]);
+  const appended = await plugin.beginTurn(PROMPT);
+  expect(appended.map(policyModeOf)).toEqual(["default"]);
+  const composed = await plugin.context([user(PROMPT), ...appended]);
   expect(composed.map(message => policyModeOf(message) ?? null).filter(Boolean)).toEqual(["default"]);
   expect(totalGuidance(composed)).toBe(0);
+  // The persisted notice is still in the model's context, so the next prompt persists no second one.
+  expect(await plugin.beginTurn("Next request")).toEqual([]);
 });
 
 test("master disable leaves native guidance unchanged and does not gate execution", async () => {
   const plugin = registeredPlugin(false);
-  await plugin.beginTurn(PROMPT);
+  expect(await plugin.beginTurn(PROMPT)).toEqual([]);
   const messages = [keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 1), user(PROMPT)];
   expect(await plugin.context(messages)).toEqual(messages);
   expect(await plugin.attempt("edit")).toBeUndefined();
@@ -648,17 +667,19 @@ test("a governed turn is composed by the whole plugin with no network call and n
     });
     const modelBefore = plugin.ctx.model;
 
-    await plugin.beginTurn(PROMPT);
-    const first = await plugin.context([user(PROMPT)]);
+    const appended = await plugin.beginTurn(PROMPT);
+    expect(appended.map(policyModeOf)).toEqual(["default"]);
+    const first = await plugin.context([user(PROMPT), ...appended]);
     expect(first.map(message => policyModeOf(message) ?? null).filter(Boolean)).toEqual(["default"]);
-    expect(first.findIndex(message => policyModeOf(message) === "default")).toBe(0);
-    expect(await plugin.context([user(PROMPT)])).toEqual(first);
+    // The persisted notice follows its user message, exactly as the host places it.
+    expect(first.findIndex(message => policyModeOf(message) === "default")).toBe(1);
+    expect(await plugin.context([user(PROMPT), ...appended])).toEqual(first);
 
-    // Agent-attributed steering continues the turn and keeps the single notice before the user message.
+    // Agent-attributed steering continues the turn and keeps the single notice where it is.
     const steering = { ...user("Worker A is available."), steering: true, attribution: "agent" } as AgentMessage;
-    const steered = await plugin.context([user(PROMPT), steering]);
+    const steered = await plugin.context([user(PROMPT), ...appended, steering]);
     expect(steered.map(policyModeOf).filter(Boolean)).toEqual(["default"]);
-    expect(steered[0]).toEqual(first[0]!);
+    expect(steered[1]).toEqual(first[1]!);
 
     // agent_end settles the turn; a worker delivery then wakes the session without before_agent_start.
     await plugin.endTurn();
@@ -667,20 +688,20 @@ test("a governed turn is composed by the whole plugin with no network call and n
       ["irc:incoming", "<irc from=\"Worker\">done</irc>"],
     ]) {
       const delivery = { role: "custom", customType, content: text, display: false, attribution: "agent", timestamp: 7 } as AgentMessage;
-      const woken = await plugin.context([user(PROMPT), assistant("workers started"), delivery]);
+      const woken = await plugin.context([user(PROMPT), ...appended, assistant("workers started"), delivery]);
       expect(woken.map(policyModeOf).filter(Boolean)).toEqual(["default"]);
-      expect(woken[0]).toEqual(first[0]!);
-      expect(woken[1]).toEqual(user(PROMPT));
+      expect(woken[1]).toEqual(first[1]!);
+      expect(woken[0]).toEqual(user(PROMPT));
     }
-    // A synthetic prompt reaching before_agent_start is a continuation, not a new request.
-    await plugin.beginTurn("<system-notice>background job finished</system-notice>");
-    expect((await plugin.context([user(PROMPT)]))[0]).toEqual(first[0]!);
-    // A gated user prompt ends the policy; an explicit request is composed the same way.
-    await plugin.beginTurn("   ");
-    expect((await plugin.context([user(PROMPT)])).map(policyModeOf).filter(Boolean)).toEqual([]);
-    await plugin.beginTurn(PROMPT);
-    const explicit = await plugin.context([keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 1), user(PROMPT)]);
-    expect(explicit.map(policyModeOf).filter(Boolean)).toEqual(["orchestrate"]);
+    // A synthetic prompt or a blank one persists nothing: the notice is already in the context.
+    expect(await plugin.beginTurn("<system-notice>background job finished</system-notice>")).toEqual([]);
+    expect(await plugin.beginTurn("   ")).toEqual([]);
+    // A request whose context lost the persisted notice still carries a default copy, at the end.
+    const bare = await plugin.context([user(PROMPT)]);
+    expect(bare.map(policyModeOf).filter(Boolean)).toEqual(["default"]);
+    expect(policyModeOf(bare.at(-1))).toBe("default");
+    const explicit = await plugin.context([keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 1), user(PROMPT), ...appended]);
+    expect(explicit.map(policyModeOf).filter(Boolean)).toEqual(["orchestrate", "default"]);
 
     expect(fetches).toBe(0);
     expect(credentialAccesses).toBe(0);

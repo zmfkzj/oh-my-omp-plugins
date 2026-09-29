@@ -52,7 +52,7 @@ instruction is not itself a direct user instruction. Describe relevant constrain
 A provider or output error means no advice was produced; never present it as a completed review.
 Do not loop on unchanged errors. Existing watchdog advisors retain their existing responsibilities.`;
 
-/** Appended once to the live turn's orchestration or workflow policy notice. */
+/** Appended once to the router's first orchestrate or workflow stand-in, else to OMP's current-turn orchestrate notice. */
 export const ORCHESTRATE_GUIDANCE = `<system-notice>
 Orche-Advisor integration: advice is optional and applies to a formed orchestration plan.
 1. Scope and plan first. Once the plan is formed, you may request advice on it with orche_advisor;
@@ -154,11 +154,11 @@ export function registerOrcheAdvisor(pi: ExtensionAPI, reviewer: typeof runRevie
   pi.on("context", (event, ctx) => {
     if (!enabled() || !primarySession(ctx) || !pi.getActiveTools().includes(TOOL)) return;
 
-    // The router's policy notice is provider-only and exists solely for the live turn, so its
-    // orchestrate and workflow modes carry the guidance (never the default mode). Without one
-    // (router inactive or no notice this turn), OMP's explicit notice of the current turn carries it.
-    // Historical turns are never rewritten,
-    // and every change is a copy: shared message objects are left untouched.
+    // The router's stand-ins for OMP's keyword notices (orchestrate, workflow) carry the guidance:
+    // the first one in context, never the persisted default notice, so the rewritten bytes stay
+    // identical in every later request. Without the router's notices (router inactive), OMP's
+    // explicit notice of the current turn carries it. Every change is a copy: shared message
+    // objects are left untouched.
     const messages = event.messages;
     const policyActive = messages.some(message => policyModeOf(message) !== undefined);
     const index = policyActive

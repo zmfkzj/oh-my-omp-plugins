@@ -38,17 +38,24 @@ keyless providers.
 > [Migrating from tier routing](#migrating-from-tier-routing) and
 > [Migrating from review gates](#migrating-from-review-gates).
 
+> **Behavior change (persisted policy notice).** The execution-policy notice is now a
+> hidden message in the session transcript, persisted once per context, instead of a
+> copy added to every request. See
+> [Modes and skip conditions](#modes-and-skip-conditions).
+
 ---
 
 ## What it does
 
 ```text
-Every governed main-session turn → exactly ONE provider-context-only policy notice
+The execution policy is ONE hidden message in the conversation, persisted with the
+prompt that needs it, plus a counterpart for each of OMP's keyword notices
 
-  current turn has a native workflow-notice     → workflow    (supplement only)
-  else a native orchestrate-notice              → orchestrate (replaces it in place)
-  else the `task` tool is enabled               → default     (Judgment + Production + how to choose)
-  else                                          → no notice
+  `task` tool enabled, no current notice in the model's context → persist the `default` notice
+                                                                   (Judgment + Production + how to choose)
+  a native orchestrate-notice in the transcript                  → replaced in place by a short notice
+  a native workflow-notice in the transcript                     → kept; a supplement follows it
+  `task` tool not enabled                                        → no `default` notice
 
 The main reads the notice, then chooses for the current stage:
   Judgment   — the main analyzes directly; workers only for bounded, independent investigations
@@ -56,19 +63,24 @@ The main reads the notice, then chooses for the current stage:
 ```
 
 There is no classifier, keyword matcher, model call, router, subagent call, mode
-tool, slash command or stored state for choosing. The main decides from the
-request, the actual code and tool results, and progress so far.
+tool or slash command for choosing, and the plugin keeps no state about it. The
+main decides from the request, the actual code and tool results, and progress so
+far. The notice lives in the session transcript, so each request extends the
+previous one byte for byte and the provider's prompt cache stays warm (see
+[Modes and skip conditions](#modes-and-skip-conditions)).
 
 ## Execution policies
 
 The `default` notice is about 7.9K characters with the full tool set (about 7.4K
-without `write`); the workflow supplement is about 2.9K. It reads in this order:
+without `write`); the workflow supplement is about 3.0K and an explicit
+`orchestrate` notice about 0.4K. The `default` notice reads in this order:
 the header and precedence line, the rule for choosing, Judgment, Production,
 switching, reuse, the task-item contract with the `effort` line, worker-local
 checks, verification. Shared guidance is written once; the notice does not hold
 two complete execution prompts. It is guidance for the model, not a scheduler or
-permission system, and it renders only instructions backed by tools that are
-enabled on the turn.
+permission system, and it renders only instructions backed by the tools enabled
+when it is rendered (a change of that tool set persists a fresh notice at the
+next prompt).
 
 | | Judgment (판단형) | Production (제작형) |
 | --- | --- | --- |
@@ -136,8 +148,9 @@ re-verification scope. (Checks on a contract change are under
   stay non-destructive and isolated within existing permissions.
 
 **Judgment is not OMP plan mode.** The plugin never toggles plan mode and the
-model cannot enter it (only the user's `/plan` does). In plan mode the plugin adds
-no notice; plan mode and read-only limits come first.
+model cannot enter it (only the user's `/plan` does). In plan mode the plugin
+persists no notice and withholds the ones already in the transcript from the
+provider; plan mode and read-only limits come first.
 
 ### Production (제작형)
 
@@ -271,7 +284,7 @@ capability.
 
 | | |
 | --- | --- |
-| **The plugin enforces** | which notice is selected and where it is placed; the skip gates (below); at most one policy notice per request; that the primary model, `@task`/`@default` roles, custom/specialist agents, tool permissions and task inputs are never changed; that no tool is removed from the main agent (`write` stays available); local telemetry |
+| **The plugin enforces** | when the policy notice is persisted (never twice in a row, unless compaction removed it or the tools it names changed) and how OMP's keyword notices are replaced or supplemented; the skip gates (below); that the primary model, `@task`/`@default` roles, custom/specialist agents, tool permissions and task inputs are never changed; that no tool is removed from the main agent (`write` stays available); local telemetry |
 | **The plugin only instructs** | which policy the main picks for a stage, whether it delegates, reuses an existing worker or parallelizes, whether it stays within an analysis-only request, how it limits its own direct edits, and that it verifies before accepting |
 
 There is no guarantee that the model follows the instructions, chooses the
@@ -281,56 +294,76 @@ it does not block any tool call.
 
 ### Modes and skip conditions
 
-| mode | selected when | notice |
+The `default` notice is the policy. OMP's keyword notices get a counterpart beside it:
+
+| notice | when | what the model reads |
 | --- | --- | --- |
-| `workflow` | the current turn carries a native `workflow-notice` | supplement only: the task-item contract, the `effort` line, worker-local checks and the pause-and-report rule, result labels, the analysis-only boundary, and verification. The native workflow alone chooses execution method, agents, fan-out and reuse; the supplement adds no dispatch, parallelism or reuse instruction and no "the main analyzes directly" instruction. |
-| `orchestrate` | no `workflow-notice`, but a native `orchestrate-notice` is present | with `task`: the `default` notice plus one line right after its header. The line says the user explicitly asked for orchestration, so within the current goal the main leans further toward delegation (production work and independent investigations go to workers); it does not turn an analysis-only request into permission to change the product. The notice replaces the native one in place, so the two never appear together. Without `task`: a short notice (about 0.8K characters) that orchestration was requested but `task` is not enabled this turn; judgment work is done directly, production is implemented directly within permissions or the limitation is stated precisely, delegation is never claimed or simulated, and an analysis-only request stays analysis and changes no product code, config or assets; plus the verification lines. |
-| `default` | neither native notice, and `task` is enabled | both policies and the rule for choosing |
-| — | none of the above (no `task`, no native notice) | no notice |
+| `default` | the `task` tool is enabled | both policies and the rule for choosing. The one notice the plugin persists. |
+| `orchestrate` | a native `orchestrate-notice` is in the transcript | the native notice is replaced in place by a short notice (about 0.4K characters): the user explicitly asked for orchestration, so within the current goal the main leans further toward delegation under the policy (production work and independent investigations go to workers); it does not turn an analysis-only request into permission to change the product. The two never appear together. Without `task`, a notice of about 0.8K characters says orchestration was requested but `task` is not enabled for this request: judgment work is done directly, production is implemented directly within permissions or the limitation is stated precisely, delegation is never claimed or simulated, and an analysis-only request stays analysis and changes no product code, config or assets; plus the verification lines. With a native `workflow-notice` in the same keyword prefix the native `orchestrate-notice` is dropped and only the workflow supplement is added. |
+| `workflow` | a native `workflow-notice` is in the transcript | the native notice stays and a supplement follows it: the task-item contract, the `effort` line, worker-local checks and the pause-and-report rule, result labels, the analysis-only boundary, and verification. For that request the native workflow alone chooses execution method, agents, fan-out and reuse, overriding the `default` notice's stage selection and delegation guidance; the supplement adds no dispatch, parallelism or reuse instruction and no "the main analyzes directly" instruction. |
 
-The notice lives only in provider context: it is never persisted and never
-mutates history, earlier turns, the user's text or other extensions' messages.
+**Persistence.** The `default` notice is a hidden custom message
+(`om-orche-policy-notice`, `display: false`, `details.mode: "default"`) that the
+plugin returns from `before_agent_start`. OMP appends it after the messages
+delivered with the prompt and persists it in the session transcript; the TUI never
+shows it. It is state of the conversation, not of one request: the latest notice
+still in the model's context governs. A prompt persists a new one only when the
+context holds none (a compaction summarized it away, or no prompt has persisted
+one yet) or the latest says something else than it would now because the tools it
+names changed (the todo list, `write`, `bash`, the advice tool). An identical
+notice is never persisted again, so it costs its tokens once per context. History
+is only appended to: each request's context extends the previous one byte for
+byte, which is what keeps the provider's prompt cache warm.
 
-**Turn continuity.** The policy of the last governed user turn stays in force for
-autonomous continuations until the next user prompt. In OMP 18.4.1, async task
-results, re-yields of a messaged worker and worker messages that arrive while the
-main is idle start a turn without `before_agent_start` (agent-attributed
-`async-result` / `irc:incoming` messages), and the same notice is re-applied to
-them. A synthetic prompt continues the ongoing turn; it neither starts nor clears
-one: a `<system-…` prompt, and any prompt whose delivered message is not
-turn-starting, such as OMP's auto-continue after compaction, the plan-approved and
-guided-goal kickoffs, the `.`/`c` continue shortcut and hidden agent-attributed
-prompts (`before_agent_start` carries only the text, so the plugin looks at the
-message delivered for that text in the first request: an agent-attributed
-`developer` or `custom` message is synthetic, and text that matches no delivered
-message is a user request). So an explicit `orchestrate`/`workflow` turn survives
-compaction and its auto-continue, and after plan approval or a goal kickoff no
-policy applies until the next user prompt. A user-invoked `/skill:` prompt and a
-collab peer's prompt (user-attributed `custom` messages) start a turn like typed
-input. A gated user prompt (plugin disabled, plan mode, empty)
-clears the turn, as does a session switch (`/new`, resume, fork). Every request
-re-checks the gate, so enabling plan mode or disabling the plugin later withholds
-the notice.
+**Keyword notices.** OMP builds its `orchestrate-notice` and `workflow-notice`
+from the prompt and persists them itself, before the user message.
+`before_agent_start` sees neither them nor who wrote the prompt (a synthetic
+prompt gets no keyword notices), and OMP's keyword matcher cannot be imported by
+an extension, so no mode can be chosen there. The counterparts are derived in the
+`context` hook from each native notice alone, in whichever request the hook reads
+it and for every such notice in the transcript, not only the current turn's. The
+result is identical in every later request, so a keyword turn does not disturb
+the prefix after it either. Native keyword notices OMP queues before a skill
+prompt (`/skill:x orchestrate`) belong to that prompt's turn and are handled the
+same way. OMP's magic-keyword settings only decide whether a native notice
+appears.
 
-**Placement.** A notice the plugin adds goes before the last turn-starting message
-(a user message, a user-invoked skill prompt or a collab prompt; agent-attributed
-deliveries do not count), or at the end of context if compaction removed that
-message. Native keyword notices OMP queues before a skill prompt
-(`/skill:x orchestrate`) belong to its turn and are replaced like those before a
-user message. A replaced native orchestrate notice keeps its
-position. Content and timestamp are identical across the requests of one turn.
+**Continuations.** There is no turn state to keep. Async task results, re-yields
+of a messaged worker and worker messages that reach an idle main start a turn
+without `before_agent_start` (agent-attributed `async-result` / `irc:incoming`
+messages) and read the persisted notice like any other message. Every prompt that
+does reach `before_agent_start` gets the same check, whoever wrote it: OMP's
+auto-continue after compaction, the plan-approved and guided-goal kickoffs, the
+`.`/`c` continue shortcut, hidden agent-attributed prompts and a retry of a
+prompt all find the notice in place or restore it once. Compaction in the middle
+of a run runs no `before_agent_start`: while the notice is missing, each request
+carries a copy as its last message. The copy is not persisted, and being last it
+belongs to no prefix a later request reuses; the next prompt persists the notice
+and the copy is gone.
 
-The policy is skipped (no notice) when the plugin is disabled (`enabled=false`,
-so OMP's native behavior is untouched), in a subagent session (subagents never
-re-enter), for an empty prompt or a synthetic `<system-…`
-prompt with no turn in progress, and in plan mode. In `default` mode without the
-`task` tool there is also no notice. OMP's magic-keyword settings only decide
-whether a native notice appears.
+**Placement.** The persisted notice follows the messages delivered with its
+prompt, where OMP appends what `before_agent_start` returns. The counterpart of a
+native `orchestrate-notice` takes that notice's place, before the user message it
+belongs to; a workflow supplement follows its native notice.
 
-The orche-advisor guidance is attached once to the plugin's `orchestrate` or
-`workflow` notice, or to the current turn's native orchestrate notice when the
-plugin's policy is inactive; it is never attached to the `default` notice, and
-no advisor call is ever automatic.
+The plugin persists nothing when it is disabled (`enabled=false`, so OMP's native
+behavior is untouched), in a subagent session (subagents never re-enter), in plan
+mode, for an empty prompt or a synthetic `<system-…` prompt, and, for the
+`default` notice, without the `task` tool. Notices already in the transcript are
+withheld from the provider request by request: a disabled plugin or plan mode
+withholds all of them and leaves OMP's native notices exactly as OMP built them;
+a session that is not the main one (a subagent, or a background clone that
+inherited the transcript) never sees them; without `task` only the `default`
+notice is withheld. An empty or synthetic prompt withholds nothing: the notice
+already in the transcript still applies. A stored `enabled` change applies from
+the next prompt, plan mode from the next request. The transcript keeps the
+notices, so they are back once the plugin governs again (the toggle itself changes
+the provider's prefix once).
+
+The orche-advisor guidance is attached once to the first plugin `orchestrate` or
+`workflow` notice in the context, or to the current turn's native orchestrate
+notice when the plugin's policy is inactive; it is never attached to the
+`default` notice, and no advisor call is ever automatic.
 
 ### Task body contract
 
@@ -405,8 +438,11 @@ default model, so the advisor then runs on the same model as the main session.
   a finding or turns an unsupported completion claim into evidence.
 - A missing reviewer configuration, provider failure, cancellation or invalid
   output is a real advice-tool error, not an execution prohibition. Provider
-  errors retain one bounded retry; truncated output retries without reasoning.
-  At most two completion attempts are made, and cancellation is not retried.
+  errors retain one bounded retry. Truncated output retries once without
+  reasoning, but only when the first attempt could have reasoned; with thinking
+  off, or a model without reasoning, the identical request is not resent and the
+  review fails as truncated. At most two completion attempts are made, and
+  cancellation is not retried.
 - Review scope, receipts, dispatch staging, single-use worker permits, mandatory
   phase reviews and `/review-status`, `/review-retry`, `/review-waive` are gone.
   This also removes the old DEFAULT multi-worker fan-out gate and eval/workpool
@@ -429,10 +465,12 @@ be treated as observation time. Only the owned auditor's concern and blocker
 notes are admitted; repeated equivalent notes in the same scope merge.
 Neither age nor a successful review resolves or deletes a finding.
 
-- `resolve` needs a relevance explanation and IDs of successful tool results or
-  actual user messages on this branch. Evidence may precede a delayed notice;
+- `resolve` needs a relevance explanation and IDs of successful tool results
+  (with text output) or actual user messages on this branch. Evidence may precede a delayed notice;
   an already-recorded upload result or user correction need not be repeated just
-  to obtain a timestamp after delivery. `list` includes these earlier candidates.
+  to obtain a timestamp after delivery. `list` shows the newest ten of these
+  earlier candidates; when more exist it says how to page (`list` with
+  `offset=10` skips that many newest candidates, and combines with `findingId`).
   The coordinator must still check that the evidence answers the specific claim
   and covers the relevant revision: the tool requires a non-empty reason but
   does not validate its semantic relevance. Assistant claims, failed results,
@@ -442,7 +480,13 @@ Neither age nor a successful review resolves or deletes a finding.
 - `waive` requires explicit user confirmation. An explicit `reopen` records a
   renewed concern and requires evidence after that reopening for the next
   resolution; repeated notes do not reset this boundary. A renewed auditor
-  objection after a reported resolution opens a new finding.
+  objection after a reported resolution opens a new finding. That is allowed (a
+  delayed note written before the resolution is legitimately answered by the same
+  evidence), but the new finding records which resolved finding it re-raises and,
+  once resolved, which cited entries the earlier resolution had already cited;
+  `list` and the reviewer's findings show both, e.g. "re-raises F1 after its
+  reported resolution; resolved again citing evidence the re-raised finding's
+  resolution already cited". Nothing is blocked; the reviewer weighs it.
 - Findings and lifecycle changes update the evidence available to the next
   explicit advice request. They never block tools, invalidate permission or
   automatically call the advisor. A finding waiver only records accepted risk;
@@ -466,12 +510,18 @@ The ledger covers what the model's context still holds. `/clear` writes a
 `reset_boundary` that OMP's context rebuild starts after, and the ledger starts
 after the latest one too: earlier findings, and evidence from before it, are no
 longer listed or citable (the history itself is untouched). A tool result OMP has
-pruned (`prunedAt`) or its tool flagged as uneventful cannot be cited for a new
-resolution. A resolution recorded earlier stays in force when its cited output
-is pruned later, and is listed with `(output later pruned from context)` in
-place of OMP's placeholder. Any message the user typed counts, including one
-that starts with `/` (a path, an unknown command name): commands never become
-messages.
+pruned (`prunedAt`), its tool flagged as uneventful, or that carries no text
+(an image-only capture, empty output) cannot be cited for a new resolution:
+evidence must be auditable as text. A resolution recorded earlier stays in force
+when its cited output is pruned later or holds no text, and is listed with
+`(output later pruned from context)` or `(no text output)` in place of OMP's
+placeholder. Any prompt the user gave counts, including one that starts with `/`
+(a path, an unknown command name): commands never become messages. So does a
+user-invoked `/skill:` prompt or a writable-collab peer's prompt, which OMP
+persists as a user-attributed `custom_message` (the host's `isUserTurnInitiator`,
+applied through the same turn-start test as the keyword notices): it starts a new
+scope, and its visible text is citable as a user message. Agent-attributed
+skill injections and other custom messages are neither.
 
 The bundled auditor is instructed to stay silent on confirmations, praise,
 progress commentary and checks that already passed, and never to emit `nit`
@@ -546,11 +596,16 @@ name, even a disabled one, is never overridden. Until you send that prompt the
 auditor is not in the roster.
 
 Advice text returned to the model has terminal escapes, control characters and
-zero-width/bidirectional characters removed and is capped at 8000 characters. The
+invisible format characters (zero-width, bidirectional, soft hyphen, word joiner,
+the Unicode tag block used to smuggle hidden text; every `\p{Cf}` character)
+removed and is capped at 8000 characters. The
 reply must open with one verdict line (`VERDICT: KEEP`, `ADJUST`, `REPLAN` or
-`ESCALATE`, alone or followed by ` - rationale`; bold markers are tolerated) and
+`ESCALATE`, alone or followed by a rationale after ` - `, `:`, `,`, `;` or `.`,
+or a bare trailing period; bold markers around the heading, the colon or the token
+are tolerated) and
 then the `ISSUES:`, `ORCHESTRATION CHANGES:` and `AVOID:` headings once each, in
-order. Trailing spaces and inline content after a heading (`ISSUES: None`) are
+order (bold headings such as `**ISSUES**:` or `**ISSUES:**` are accepted). Trailing
+spaces and inline content after a heading (`ISSUES: None`) are
 accepted; the template echoed back (`KEEP | ADJUST | ...`), `KEEP-ish`, repeated
 or reordered headings are not, and count as an invalid-structure error. A review
 cancelled or timed out after an attempt already reached the provider still records
@@ -766,9 +821,11 @@ om-orche OMP setup wrote advisor.enabled=true, modelRoles.verification-auditor="
 ```
 
 **Re-running.** Remove the marker, then start a new main session; the setup runs
-again and is still fill-only. Any of these removes it: reinstalling the plugin
-(`omp plugin uninstall om-orche` first), `/om-orche reset`, or
-`omp plugin config delete om-orche hostSetupVersion`.
+again and is still fill-only. Either of these removes it: reinstalling the plugin
+(`omp plugin uninstall om-orche` first), or
+`omp plugin config delete om-orche hostSetupVersion`. `/om-orche reset` keeps it:
+a reset that dropped the marker would run the setup again and fill in keys you
+deliberately deleted.
 
 **Existing installs.** If om-orche is already installed without the marker, the
 setup runs once at the next main-session start after you upgrade (fill-only).
@@ -785,9 +842,9 @@ status` shows the setup as pending.
 
 | Command | Effect |
 | --- | --- |
-| `/om-orche status` | Whether the plugin is enabled; execution policy (`judgment/production (om-orche-policy-notice)`, or `native (plugin disabled)`); primary model unchanged; native `task` worker and `@task` role; the `OMP setup` row: `applied (v2)` (the stored version, shown even when the plugin is disabled), `pending — applies at the next main session start` (also for an older stored version, such as `v1`), or `skipped — plugin disabled`; retired settings and leftover tier roles still present. |
-| `/om-orche stats` | Live-epoch task-worker usage, plus the read-only Jev-routing-era and tier-era history. It re-reads `telemetry.json` first, read-only, so counts other OMP processes have written are in it, and telemetry just turned on over an older file has migrated it. |
-| `/om-orche reset` | Clear plugin-owned telemetry files and the plugin's stored settings in OMP's plugin store. A project's `plugin-overrides.json` is never edited: keys it still sets are named and stay in effect. |
+| `/om-orche status` | Whether the plugin is enabled; execution policy (`judgment/production (om-orche-policy-notice)`, or `native (plugin disabled)`); primary model unchanged; native `task` worker and `@task` role; the `OMP setup` row: `applied (v2)` (the stored version, shown even when the plugin is disabled), `pending — applies at the next main session start` (also for an older stored version, such as `v1`), or `skipped — plugin disabled`; retired settings and leftover tier roles still present; and, when OMP's plugin settings could not be read, the failure and the settings still in effect. |
+| `/om-orche stats` | Live-epoch task-worker usage, plus the read-only Jev-routing-era and tier-era history. It re-reads `telemetry.json` first, read-only, so counts other OMP processes have written are in it, and telemetry just turned on over an older file has migrated it. When the last write of the counts to disk failed (and none has succeeded since), the first line says why. |
+| `/om-orche reset` | Clear plugin-owned telemetry files and the plugin's stored settings in OMP's plugin store, except the one-time [setup](#omp-setup) marker, which stays. A project's `plugin-overrides.json` is never edited: keys it still sets are named and stay in effect. |
 
 `status` reports no credential, model or gate rows and no last decision: the
 plugin makes none. If `@task` does not resolve, status says `@task does not
@@ -801,9 +858,10 @@ in place. Unknown subcommands get a warning.
 ## Privacy and security
 
 The policy path performs no network I/O and sends nothing anywhere: the notice
-is built locally from fixed text and the tools enabled on the turn, and lives
-only in provider context. It is not written to the transcript, and no prompt
-text is copied to telemetry.
+is built locally from fixed text and the names of the enabled tools. It is
+written to the session transcript as a hidden message (fixed text, no prompt
+text) and reaches the provider with the rest of the conversation. No prompt text
+is copied to telemetry.
 
 The plan advisor receives the submitted seven-field snapshot plus bounded
 findings and explicitly cited finding-resolution evidence. It never receives
@@ -819,6 +877,9 @@ use whatever OMP's model registry authorizes for their configured roles.
 Local data only — no prompt text, no task text, no source, no transcript — under
 `<omp agent dir>/jev-router/`, cleared by `/om-orche reset`. With
 `telemetryEnabled=false` nothing is written (existing data is shown read-only).
+A running main session reads the setting again before each user turn, so
+`omp plugin config set om-orche telemetryEnabled false` (or `true`) takes effect
+from its next turn, without a restart.
 The data directory deliberately keeps its historical name (`jev-router`) so
 telemetry history is neither discarded nor silently relocated.
 
@@ -856,18 +917,34 @@ added together.
 - **Several OMP processes and subagents:** processes may share the state
   directory. A process writes only the counts it recorded itself since its last
   write, added to the file as it is at that moment while it holds
-  `telemetry.lock` (a short-lived file, present only during a write, a
-  migration or a reset), so no process overwrites another's counts. A write
-  that cannot get the lock within a second keeps its counts for the next flush;
-  a lock older than five seconds belongs to a process that died and is broken.
-  `/om-orche reset` takes the same lock before deleting. A process that then
-  finds the file it last wrote gone starts a new epoch (new id and start time)
-  with its next write and writes the counts it had not yet written into it, so a
-  reset in one process is not undone by another. Worker tracking is per process,
-  so a worker already running elsewhere settles into the new epoch without a
-  start of its own. Only the main session decides whether telemetry records and
-  loads or migrates the file: a subagent, whose working directory can differ
-  (an isolated worktree has no project override), never switches the setting.
+  `telemetry.lock` (a directory, present only during a write, a migration or a
+  reset), so no process overwrites another's counts. The lock holds up against
+  stopped and dead holders, not only live ones. A holder takes it by renaming a
+  staged directory that already contains its token file onto `telemetry.lock`,
+  which succeeds only while the lock is free, and it publishes by renaming that
+  token file over `telemetry.json`. The token leaves the lock in the same step,
+  so publishing succeeds only for a holder that has held the lock without a
+  break since it took it. A lock untouched for five seconds belongs to a process
+  that died, or was stopped for that long, and any waiting process breaks it by
+  removing that token. A process whose lock was broken publishes nothing and
+  keeps its counts for its next write, so a broken lock costs a retry, never
+  counts. A write that cannot get the lock within a second keeps its counts for
+  a later attempt too. A lock file left by an older plugin version under the same
+  name is waited for while fresh and broken when stale. `/om-orche reset` takes
+  the same lock before deleting. A process that then finds the file it last
+  wrote gone starts a new epoch (new id and start time) with its next write and
+  writes the counts it had not yet written into it, so a reset in one process is
+  not undone by another. Worker tracking is per process, so a worker already
+  running elsewhere settles into the new epoch without a start of its own.
+  Every session of a process shares one writer, but not one choice: a main
+  session's own `telemetryEnabled` (its global setting plus its project's
+  override) decides whether the workers of its session tree are recorded,
+  whichever main session read its settings last, so an ACP host that runs one
+  project with telemetry off and another with it on keeps both choices. A
+  subagent, whose working directory can differ (an isolated worktree has no
+  project override), follows the main session above it and never switches
+  anyone's setting. Only a main session loads or migrates the file, and the
+  writer writes and migrates while any main session wants telemetry.
   `/om-orche stats` re-reads the file first: it shows what the other processes
   have written with this process's own unwritten counts on top; what another
   process has not flushed yet (up to about two seconds) is not in it. The
@@ -876,6 +953,14 @@ added together.
   stats`, reads the file again, so a file another process replaced with a newer,
   an older or an unreadable one is left untouched and recording is suspended, as
   at start-up; only a start-up converts an older file.
+- **A write that fails:** no permission on the state directory, a full disk, a
+  lock held for too long. The counts stay in memory, `/om-orche stats` starts
+  with the reason and how many attempts have failed, the OMP log gets one
+  warning per distinct failure (`om-orche telemetry could not be written to
+  <file>: <reason>; …`), and the write is retried after 2 s, then 4 s, 8 s and so
+  on up to 32 s, without waiting for a new frame, until one succeeds. Then the
+  note goes away, and a later failure warns again. A process that ends with
+  counts unwritten tries once more as it shuts down.
 
 `/om-orche stats` shows the live epoch plus the read-only Jev-routing and tier
 eras. `decisions.jsonl` is no longer written; an existing file stays on disk
@@ -907,8 +992,9 @@ Migration is automatic, idempotent and non-destructive:
   process that gets there second takes the first one's v6 file.
 
 `reset` deletes only plugin-owned files (`telemetry.json`, `decisions.jsonl`,
-migration temporaries, `telemetry.v<N>.json` backups and `telemetry-history/`
-snapshots) while holding the lock, and reports any it could not remove.
+migration temporaries, `telemetry.v<N>.json` backups, `telemetry-history/`
+snapshots, and lock staging directories an acquisition that died left behind)
+while holding the lock, and reports any it could not remove.
 
 ### Rolling back
 
@@ -938,6 +1024,16 @@ These three are the only settings:
 | `telemetryEnabled` | `true` | local aggregate task-worker counters |
 | `debugLogging` | `false` | one metrics-only line per turn and mode in the OMP log: `om-orche.policy mode=<default\|orchestrate\|workflow>` or `om-orche.policy skip=<reason>`; never prompt text |
 
+A change made with `omp plugin config set` (or in a project's
+`plugin-overrides.json`) reaches a running session: a main session reads the
+stored settings again before each user turn, so the new value applies from the
+next turn without a restart. A subagent keeps what it read when it started. If
+OMP's plugin settings cannot be read (a corrupt or unreadable
+`omp-plugins.lock.json`), the settings already in effect stay, one warning goes
+to the OMP log and `/om-orche status` shows the failure; at session start,
+with nothing read yet, the defaults apply. A store that does not exist simply
+means defaults.
+
 There is no setting to choose a policy mode or to turn delegation on or off.
 The one-time setup keeps an internal marker, `hostSetupVersion`, in the same
 settings map; it is not a setting, is not listed by `omp plugin config list`, and
@@ -945,7 +1041,8 @@ is described under [Re-running](#omp-setup). `examples/config.yml` shows the
 model roles you can customize in your OMP config.
 
 `/om-orche reset` clears the plugin's stored settings from OMP's plugin store,
-the setup marker included. A project's `plugin-overrides.json` belongs to the
+but keeps the setup marker: dropping it would run the setup again and fill in
+keys you deliberately deleted. A project's `plugin-overrides.json` belongs to the
 project and OMP has no API to edit it, so the plugin never does: if it still
 sets keys, the reset names them and says they stay in effect in that project.
 
@@ -1064,18 +1161,20 @@ unused. Uninstall leaves role assignments and credentials intact.
 
 ## Troubleshooting
 
-Turn on `debugLogging` and read the OMP log. Each governed turn logs
-`om-orche.policy mode=<default|orchestrate|workflow>`; a skipped turn logs
+Turn on `debugLogging` and read the OMP log. Each prompt of a governed session
+logs `om-orche.policy mode=default` (the notice is in force; it was persisted
+only if the context lacked it), and each native keyword notice logs
+`om-orche.policy mode=<orchestrate|workflow>` once; a skipped prompt logs
 `om-orche.policy skip=<reason>` with a reason from `disabled`, `not-main-session`,
-`empty-prompt`, `synthetic-notice`, `plan-mode` and
-`task-tool-unavailable`.
+`plan-mode`, `empty-prompt`, `synthetic-notice` and `task-tool-unavailable`.
 
 | symptom | cause |
 | --- | --- |
-| no policy notice on a turn | one of the skip reasons above: the plugin is disabled, a subagent session, an empty prompt, a synthetic `<system-…` prompt with no turn in progress, plan mode (the plugin never toggles plan mode; only the user's `/plan` enters it), or `default` mode without the `task` tool |
+| no policy notice in a request | one of the skip reasons above: the plugin is disabled, a subagent session, plan mode (the plugin never toggles plan mode; only the user's `/plan` enters it), or no `task` tool (the `default` notice is withheld). An empty or synthetic `<system-…` prompt persists nothing new, but a notice already in the transcript still applies |
 | the model did not delegate, reuse a worker, parallelize, or picked the other policy | the policies are guidance, not enforcement; the model decides per stage. Check that `task` (and `write` for reuse) are enabled on the turn |
 | both a native notice and the plugin's seem missing | with `enabled=false` OMP's native behavior is untouched and the plugin adds nothing |
-| a native `orchestrate` request shows only one notice | expected: the plugin's `orchestrate` notice replaces the native one in place |
+| a native `orchestrate` request shows only one notice | expected: the plugin's short `orchestrate` notice replaces the native one in place |
+| the policy notice shows up again after a compaction | expected: the compaction summarized the earlier one away, so the next prompt persists it once more (until then, requests of the same run carry a copy as their last message) |
 | a worker cannot be messaged | the host reported it isolated or hard-aborted, or delivery failed; a new worker with the contract, changes and artifact references is the correct path. A missing "now idle" hint alone does not mean it cannot be continued |
 | `OMP setup` is not `applied (v2)` in status | `skipped — plugin disabled`: om-orche is disabled (`enabled=false`). `pending — applies at the next main session start`: no main session has started since install or since upgrading from setup v1; an item is set only for the current session (CLI flag, `--config`, protocol pin; RPC and ACP sessions pin `task.maxRecursionDepth` themselves), which leaves it pending until a session start without it; or a write failed, in which case the OMP log has the `om-orche OMP setup failed and will be retried at the next session start` warning and the next start retries |
 | the Verification Auditor does not run | `advisor.enabled` is off (the setup only fills it once; if you turned it off, it stays off), or `modelRoles.verification-auditor` is unset, or the plugin is disabled |
@@ -1084,6 +1183,8 @@ Turn on `debugLogging` and read the OMP log. Each governed turn logs
 | `@task does not resolve in this session` in status | expected when `modelRoles.task` is unset: task workers use the main session's active model. Assign `modelRoles.task` in `config.yml` only if you want a different worker model |
 | `Retired settings still stored` in status | delete the listed keys with `omp plugin config delete om-orche <key>`; they have no effect |
 | telemetry suspended | the file was written by a newer plugin version, or a migration backup/write failed; `/om-orche reset` clears it |
+| `Telemetry cannot be written to …` at the top of `/om-orche stats` | the last write of the counts failed: the state directory is not writable, the disk is full, or another process has held `telemetry.lock` for too long (a lock left by a process that died is broken after five seconds). The counts are kept in memory and the write is retried on its own, after 2 s, 4 s, … up to 32 s; the note goes away with the first write that succeeds. The reason is also in the OMP log as `om-orche telemetry could not be written to …` |
+| `The stored settings could not be read` in status | OMP's `omp-plugins.lock.json` is corrupt or unreadable. The settings read last stay in effect (the defaults, when none was read yet), and the OMP log has the `om-orche could not read the stored settings` warning. Repair or restore the file; the next turn picks it up |
 
 ## Uninstall
 
@@ -1093,6 +1194,10 @@ omp plugin uninstall om-orche
 
 Removes the package, the plan-advice tool, the bundled auditor and the plugin's
 guidance; OMP's native `task` behavior and orchestrate notice return unchanged.
+Notices already persisted stay in those sessions' transcripts as hidden messages:
+while the plugin is installed but disabled they are withheld from the provider,
+but once it is uninstalled nothing withholds them, so a resumed session keeps
+sending them until a compaction summarizes them away.
 The OMP settings the [OMP setup](#omp-setup) wrote stay in your config:
 `advisor.enabled: true`, `modelRoles.verification-auditor: "@smol"` and
 `modelRoles.orche-advisor: "@slow"`. Remove or change them yourself (for example
@@ -1125,12 +1230,14 @@ Tests that construct the plugin runtime or fire `session_start` must disable or
 stub telemetry, and run with `PI_CODING_AGENT_DIR` pointing at a temporary
 directory, so they never touch the real agent directory.
 
-`bun test` covers notice selection, placement and turn continuity, skip gates,
-advice verdicts and real error handling, absence of plugin execution gates
-(including old persisted approval records), finding evidence/lifecycle, settings
-and retired settings, telemetry migration and worker accounting, and status
-rendering. The policy text is checked as content only; those checks are not
-evidence of how a model behaves.
+`bun test` covers notice persistence and its dedupe, the stability of the request
+prefix across turns, the counterparts of OMP's keyword notices, withholding under
+the skip gates, advice verdicts and real error handling, absence of plugin
+execution gates (including old persisted approval records), finding
+evidence/lifecycle, settings and retired settings, telemetry migration and worker
+accounting, and status rendering. Only which parts of the policy text render for
+which tools and modes is checked, not the wording; none of it is evidence of how
+a model behaves.
 
 ### Verification record
 
@@ -1145,7 +1252,9 @@ model is told, not what it does.
 deterministic local fake model, no paid requests). They cover notice injection
 and placement, explicit `orchestrate` replacement, `enabled=false`, plan mode,
 zero TypeSafe requests, reuse telemetry counts and the v5 → v6 migration; the
-notice mechanism was not changed in the Judgment/Production cutover.
+notice mechanism was not changed in the Judgment/Production cutover. The first
+bullet was recorded when the notice was still added to every request; the
+persisted notice has its own check in the second bullet.
 
 - One identical policy notice in every main request (positioned before the user
   prompt) and none in worker requests; an explicit `orchestrate` request replaced
@@ -1153,6 +1262,16 @@ notice mechanism was not changed in the Judgment/Production cutover.
   `enabled=false` left the native notice byte-identical and added nothing; plan
   mode added no notice; a TypeSafe recorder received zero requests, also with a
   TypeSafe key set.
+- **Persisted notice (2026-09-29)**, same CLI and a local fake provider,
+  `--no-extensions -e src/index.ts`. Across two runs of one session (`-c`, a new
+  process) the first request's messages were an exact prefix of the second's: one
+  notice was persisted after the first prompt, the second run persisted none,
+  and the previous release had moved the notice in front of the new user message
+  (common prefix 0). An explicit `orchestrate` prompt never sent the native
+  notice to the provider, and its short replacement kept its place in the next two
+  requests. A project override `enabled=false` removed the persisted notice from
+  the next request and re-enabling brought it back in place. After a compaction
+  that summarized the notice away, the next prompt persisted it once more.
 - A follow-up sent with `write agent://<id>` reached the same worker with its
   prior context, and telemetry recorded 1 started worker, 1 follow-up turn and 2
   completed turns, with tokens equal to the sum of that worker's two turns (a
@@ -1231,10 +1350,11 @@ Recorded rather than worked around:
 
 - **`@oh-my-pi/pi-tui` subpaths do not resolve at runtime from an extension**
   (only the package root does, and it does not re-export `containsOrchestrate`).
-  Native notices are therefore recognized in the `context` hook; turn state is
-  prepared at `before_agent_start`, and the last governed turn's notice is
-  re-applied to autonomous continuations that do not pass through that hook.
-  Thinking-level types are imported only as erased types.
+  Native keyword notices are therefore recognized in the `context` hook by their
+  message type. `before_agent_start` cannot see them, so the persisted notice
+  does not depend on them (see
+  [Modes and skip conditions](#modes-and-skip-conditions)). Thinking-level types
+  are imported only as erased types.
 - **Cost per completed task is not acceptance rate**: `completed` is the
   worker's own settlement.
 - **Spawns that settle after the process exits** are not in `stats`: usage is

@@ -467,6 +467,35 @@ describe("workers of different sessions in one process", () => {
 	});
 });
 
+describe("a subscription that carries its session's telemetry choice", () => {
+	test("drops its frames while the choice is off, as if they had never been published, and counts them once it is on", async () => {
+		const bus = new EventBus();
+		const telemetry = await tracked();
+		let choice = false;
+		trackWorkerUsage(bus, telemetry, { enabled: () => choice });
+
+		firstRun([bus], "0-a", FIRST);
+		expect(telemetry.snapshot().workers).toEqual({});
+
+		choice = true;
+		firstRun([bus], "0-b", FIRST);
+		expect(telemetry.snapshot().workers.task).toEqual(ONE_COMPLETED_TURN);
+	});
+
+	test("is gated by its own choice, whatever the other subscriptions of the telemetry decide", async () => {
+		const telemetry = await tracked();
+		const allowed = new EventBus();
+		const refused = new EventBus();
+		trackWorkerUsage(allowed, telemetry, { enabled: () => true });
+		trackWorkerUsage(refused, telemetry, { enabled: () => false });
+
+		firstRun([allowed], "0-a", FIRST);
+		firstRun([refused], "0-a", SECOND);
+
+		expect(telemetry.snapshot().workers.task).toEqual(ONE_COMPLETED_TURN);
+	});
+});
+
 describe("what counts as a task worker frame", () => {
 	test("a settlement without observed progress records the outcome and unknown usage, not zeros or a start", async () => {
 		const bus = new EventBus();

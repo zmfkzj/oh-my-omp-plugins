@@ -1,58 +1,66 @@
 /**
- * Attaches this plugin's execution policy to governed main-session turns.
+ * Keeps this plugin's execution policy in front of the main model without breaking the
+ * provider's prompt cache.
  *
- * Exactly one provider-context-only policy notice is chosen per turn, without any
- * network call, credential lookup or todo-triggered reclassification:
- *   1. the current turn's native workflow notice   -> `workflow` (supplement only);
- *   2. else its native orchestrate notice          -> `orchestrate` (replaces it in place);
- *   3. else the `task` tool is enabled             -> `default` (Judgment/Production policy);
- *   4. else                                        -> no notice.
- * The policy of the last governed user turn stays in force for the autonomous turns that
- * follow it (OMP starts them without `before_agent_start` when a worker result or message
- * arrives on an idle session) until the next user turn replaces or clears it.
- * Notices are never persisted and history is never mutated; tools, permissions
- * and the primary model are never changed.
+ * The policy is a hidden custom message OMP persists with the prompt that needs it
+ * (`before_agent_start`). It is state of the conversation, not of one request: the latest
+ * notice still in the model's context governs, so a new one is persisted only when none is left
+ * (compaction summarized it away) or the tools it was rendered for changed. Persisted history is
+ * append-only, so each request's context extends the previous one byte for byte. No network call,
+ * credential lookup or model call is made, and tools, permissions and the primary model are never
+ * changed.
+ *
+ * The `context` hook does not edit that history, apart from changes that leave a reusable prefix
+ * alone:
+ *   - rewrites that depend on one message only, so they repeat identically in every later request:
+ *     a native `orchestrate` notice gives way to this plugin's policy (it is dropped when the same
+ *     keyword prefix carries a `workflow` notice, which keeps choosing the execution method), and a
+ *     native `workflow` notice is followed by the plugin's supplement. Neither can be persisted with
+ *     the prompt: `before_agent_start` sees only the prompt text, never the keyword notices OMP
+ *     builds from it, and cannot tell a user's prompt from a synthetic one;
+ *   - the notice itself, appended after the last message when compaction removed it in the middle of
+ *     a run. It is not persisted (the next prompt persists it) and, being last, belongs to no prefix
+ *     a later request reuses.
+ * The plugin's notices are withheld wherever the plugin does not govern the request: it is disabled,
+ * the session is a subagent, or plan mode is on. The `default` policy is withheld too when `task`,
+ * the tool it directs work through, is not enabled.
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AgentSession, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { AgentSession, CustomMessage, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { OrcheConfig } from "./config.ts";
 import { mainSessionOf } from "./host.ts";
 import type { RouteLogger } from "./logging.ts";
 import {
 	buildPolicyNotice,
-	currentTurnNotices,
-	isTurnStartEntry,
-	isTurnUserMessage,
 	NATIVE_ORCHESTRATE_NOTICE_TYPE,
 	NATIVE_WORKFLOW_NOTICE_TYPE,
+	POLICY_NOTICE_TYPE,
 	policyModeOf,
+	policyNoticePayload,
+	prefixHas,
 	type PolicyMode,
+	type PolicyNoticePayload,
 } from "./orchestration-policy.ts";
-
-/** Identifies one persisted native notice even after later user messages move it out of the turn prefix. */
-function noticeKey(message: AgentMessage): string | undefined {
-	if (message.role !== "custom" || message.customType !== NATIVE_ORCHESTRATE_NOTICE_TYPE) return undefined;
-	return `${message.timestamp}\u0000${JSON.stringify(message.content)}`;
-}
-
-/** The notice precedes the current user message; end of context when that message was compacted away. */
-function noticeInsertIndex(messages: readonly AgentMessage[]): number {
-	let userIndex = messages.length - 1;
-	while (userIndex >= 0 && !isTurnUserMessage(messages[userIndex])) userIndex--;
-	return userIndex < 0 ? messages.length : userIndex;
-}
 
 type Gate =
 	| { ok: true; session: AgentSession }
 	| { ok: false; reason: string };
 
-/** Everything that decides whether the plugin governs this request, from the prompt and session alone. */
-export function gateRequest(ctx: ExtensionContext, prompt: string, config: OrcheConfig): Gate {
+/** What can change between two requests: the master switch, the session's identity and plan mode. */
+function gateSession(ctx: ExtensionContext, config: OrcheConfig): Gate {
 	if (!config.enabled) return { ok: false, reason: "disabled" };
 
 	// Recursion guard: a subagent must never re-enter the front door.
 	const session = mainSessionOf(ctx);
 	if (!session) return { ok: false, reason: "not-main-session" };
+	if (session.getPlanModeState?.()?.enabled === true) return { ok: false, reason: "plan-mode" };
+	return { ok: true, session };
+}
+
+/** Everything that decides whether a prompt persists a notice, from the prompt and session alone. */
+function gatePrompt(ctx: ExtensionContext, prompt: string, config: OrcheConfig): Gate {
+	const gate = gateSession(ctx, config);
+	if (!gate.ok) return gate;
 
 	const text = prompt.trim();
 	if (!text) return { ok: false, reason: "empty-prompt" };
@@ -61,8 +69,7 @@ export function gateRequest(ctx: ExtensionContext, prompt: string, config: Orche
 	// input controller. A prompt still starting with "/" is text OMP hands the model (an unknown
 	// command, a path), so it is an ordinary request.
 	if (text.startsWith("<system-")) return { ok: false, reason: "synthetic-notice" };
-	if (session.getPlanModeState?.()?.enabled === true) return { ok: false, reason: "plan-mode" };
-	return { ok: true, session };
+	return gate;
 }
 
 export interface OrchestrationRouterDeps {
@@ -70,169 +77,102 @@ export interface OrchestrationRouterDeps {
 	config: () => OrcheConfig;
 }
 
-interface TurnState {
-	prompt: string;
-	session: AgentSession;
-	/** Last committed user entry before preparation; retries precede delivery of the new input. */
-	preparedAfterUserId: string | undefined;
-	/** Keys of this turn's native orchestrate notices, replaced wherever they appear. */
-	natives: string[];
-	/** OMP's workflow notice was seen in this turn; it governs execution for the rest of the turn. */
-	workflow: boolean;
-	/** One stable notice per policy mode, created on first use and reused on every request. */
-	notices: Partial<Record<PolicyMode, AgentMessage>>;
-	/** The last mode logged for this turn (`none` when no notice applied). */
-	logged: PolicyMode | "none" | undefined;
-}
-
 export class OrchestrationRouter {
-	#turn: TurnState | undefined;
-	/** The latest governed prompt while it is unconfirmed as a user turn, with the turn it displaced. */
-	#pending: { prompt: string; previous: TurnState | undefined } | undefined;
 	readonly #deps: OrchestrationRouterDeps;
+	/** Keyword notices whose plugin counterpart is already logged: one debug line per notice. */
+	readonly #logged = new Set<string>();
 
 	constructor(deps: OrchestrationRouterDeps) {
 		this.#deps = deps;
 	}
 
 	/**
-	 * Gate before delivery. A governed prompt starts a new turn (only a retry prepared after the
-	 * same committed turn-starting entry reuses one) unless the first request shows it to be a
-	 * synthetic prompt (`#settle`); a gated user prompt clears the turn. A synthetic `<system-…`
-	 * prompt or a call from another session belongs to no user request: it keeps the ongoing turn,
-	 * whose policy also covers autonomous continuations (worker results, worker messages).
+	 * The hidden notice the prompt about to be delivered must carry into the transcript, or
+	 * `undefined` when the model's context already holds the current one. Every prompt gets the
+	 * same idempotent check: OMP does not say who authored it, and a synthetic continuation
+	 * (auto-continue after compaction, a retry) needs the policy as much as a user's prompt.
 	 */
-	beginTurn(ctx: ExtensionContext, prompt: string): void {
-		const gate = gateRequest(ctx, prompt, this.#deps.config());
+	noticeToPersist(ctx: ExtensionContext, prompt: string): PolicyNoticePayload | undefined {
+		const gate = gatePrompt(ctx, prompt, this.#deps.config());
 		if (!gate.ok) {
-			if (gate.reason !== "synthetic-notice" && gate.reason !== "not-main-session") {
-				this.#turn = undefined;
-				this.#pending = undefined;
-			}
 			this.#deps.logger.policy({ skip: gate.reason });
-			return;
-		}
-		const preparedAfterUserId = gate.session.sessionManager.getBranch().findLast(isTurnStartEntry)?.id;
-		if (this.#turn?.prompt === prompt && this.#turn.session === gate.session &&
-			this.#turn.preparedAfterUserId === preparedAfterUserId) return;
-		// `before_agent_start` does not say who authored the prompt, so the new turn is provisional
-		// until the first request shows the delivered message (see `#settle`).
-		this.#pending = {
-			prompt,
-			previous: this.#pending?.prompt === prompt ? this.#pending.previous : this.#turn,
-		};
-		this.#turn = {
-			prompt, session: gate.session, preparedAfterUserId,
-			natives: [], workflow: false, notices: {}, logged: undefined,
-		};
-	}
-
-	/** Forget the turn, e.g. when the session it belongs to is replaced. */
-	resetTurn(): void {
-		this.#turn = undefined;
-		this.#pending = undefined;
-	}
-
-	/**
-	 * A prompt that reached `before_agent_start` is synthetic when the message delivered for it,
-	 * the newest one whose text is the prompt, is not a turn-starting one (OMP's auto-continue after
-	 * compaction, plan-approved, manual-continue and guided-goal prompts are agent-attributed
-	 * `developer` messages; hidden next-turn prompts are agent-attributed custom ones). Such a
-	 * prompt belongs to no user request: the turn it displaced continues. Anything else, including a
-	 * batch of queued user messages whose joined text matches no single message, starts the turn.
-	 */
-	#settle(messages: readonly AgentMessage[]): void {
-		const pending = this.#pending;
-		if (!pending) return;
-		this.#pending = undefined;
-		const delivered = messages.findLast(message => {
-			if (message.role !== "user" && message.role !== "developer" && message.role !== "custom") return false;
-			const text = typeof message.content === "string"
-				? message.content
-				: message.content.map(part => part.type === "text" ? part.text : "").join("");
-			return text === pending.prompt;
-		});
-		if (delivered && !isTurnUserMessage(delivered)) this.#turn = pending.previous;
-	}
-
-	/**
-	 * Return a provider-context copy carrying exactly one policy notice for this
-	 * turn, or `undefined` when nothing changes. This turn's native orchestrate
-	 * notices are replaced in place; historical turns, the workflow notice and
-	 * other messages are left untouched, and no message object is mutated.
-	 */
-	applyToContext(ctx: ExtensionContext, messages: AgentMessage[]): AgentMessage[] | undefined {
-		if (mainSessionOf(ctx)) this.#settle(messages);
-		const turn = this.#turn;
-		if (!turn || turn.session !== mainSessionOf(ctx) || !gateRequest(ctx, turn.prompt, this.#deps.config()).ok) {
 			return undefined;
 		}
-
-		// Record this turn's keyword notices while they still precede its user message.
-		for (const index of currentTurnNotices(messages, NATIVE_ORCHESTRATE_NOTICE_TYPE)) {
-			const key = noticeKey(messages[index]!);
-			if (key && !turn.natives.includes(key)) turn.natives.push(key);
+		const tools = gate.session.getEnabledToolNames();
+		if (!tools.includes("task")) {
+			this.#deps.logger.policy({ skip: "task-tool-unavailable" });
+			return undefined;
 		}
-		if (currentTurnNotices(messages, NATIVE_WORKFLOW_NOTICE_TYPE).length > 0) turn.workflow = true;
+		this.#deps.logger.policy({ mode: "default" });
 
-		const tools = turn.session.getEnabledToolNames();
-		const mode: PolicyMode | undefined = turn.workflow
-			? "workflow"
-			: turn.natives.length > 0
-				? "orchestrate"
-				: tools.includes("task") ? "default" : undefined;
-		if (turn.logged !== (mode ?? "none")) {
-			turn.logged = mode ?? "none";
-			this.#deps.logger.policy(mode ? { mode } : { skip: "task-tool-unavailable" });
+		const notice = policyNoticePayload("default", tools);
+		// What the model reads now: compaction has already dropped whatever it summarized.
+		const current = gate.session.messages.findLast(message => policyModeOf(message) === "default");
+		return current?.role === "custom" && current.content === notice.content ? undefined : notice;
+	}
+
+	/**
+	 * Return the provider-context view of `messages`, or `undefined` when nothing changes. Where
+	 * the plugin governs the request, this is the transcript with each native `orchestrate` notice
+	 * replaced and each native `workflow` notice supplemented (see the module comment); otherwise
+	 * it is the transcript without this plugin's notices. No message object is mutated.
+	 */
+	applyToContext(ctx: ExtensionContext, messages: AgentMessage[]): AgentMessage[] | undefined {
+		const gate = gateSession(ctx, this.#deps.config());
+		if (!gate.ok) {
+			const kept = messages.filter(message => !(message.role === "custom" && message.customType === POLICY_NOTICE_TYPE));
+			return kept.length === messages.length ? undefined : kept;
 		}
 
-		const isNative = (message: AgentMessage) => {
-			const key = noticeKey(message);
-			return key !== undefined && turn.natives.includes(key);
-		};
-		const firstNative = messages.find(isNative);
-		// Rendered once per turn and mode, so content and timestamp stay stable across requests.
-		const notice = mode && (turn.notices[mode] ??= buildPolicyNotice(mode, tools,
-			firstNative?.role === "custom" ? firstNative.timestamp : Date.now()));
-		const present = messages.some(message => this.#ownMode(turn, message) === mode);
-
+		const tools = gate.session.getEnabledToolNames();
+		const delegating = tools.includes("task");
 		const next: AgentMessage[] = [];
-		let placed = false;
+		let policyPresent = false;
 		let changed = false;
-		for (const message of messages) {
-			if (isNative(message)) {
+		for (let index = 0; index < messages.length; index++) {
+			const message = messages[index]!;
+			if (message.role === "custom" && message.customType === NATIVE_ORCHESTRATE_NOTICE_TYPE) {
 				// The native and plugin policies are never shown together.
 				changed = true;
-				if (notice && !present && !placed) {
-					next.push(notice);
-					placed = true;
+				if (!prefixHas(messages, index, NATIVE_WORKFLOW_NOTICE_TYPE)) {
+					next.push(this.#keywordNotice("orchestrate", message, tools));
 				}
 				continue;
 			}
-			const own = this.#ownMode(turn, message);
-			if (own !== undefined) {
-				if (own === mode && !placed) {
-					next.push(message);
-					placed = true;
-				} else changed = true; // A duplicate, or a mode the turn no longer uses.
-				continue;
+			if (policyModeOf(message) === "default") {
+				// Delegation guidance would dangle without the tool it directs work through.
+				if (!delegating) {
+					changed = true;
+					continue;
+				}
+				policyPresent = true;
 			}
 			next.push(message);
+			if (message.role === "custom" && message.customType === NATIVE_WORKFLOW_NOTICE_TYPE &&
+				policyModeOf(messages[index + 1]) !== "workflow") {
+				next.push(this.#keywordNotice("workflow", message, tools));
+				changed = true;
+			}
 		}
-		if (notice && !placed) {
-			next.splice(noticeInsertIndex(next), 0, notice);
+		if (delegating && !policyPresent) {
+			// Compaction removed the persisted notice in the middle of a run, or no prompt has
+			// persisted one yet: this request carries a copy at the end. It is attributed like the
+			// message it follows, so it never changes who initiated the request (GitHub Copilot's
+			// `X-Initiator`, and with it the billing, follows the last message).
+			const last = messages.at(-1);
+			next.push(buildPolicyNotice("default", tools, last?.timestamp ?? 0, last && "attribution" in last ? last.attribution : undefined));
 			changed = true;
 		}
 		return changed ? next : undefined;
 	}
 
-	/** The mode of a notice this turn created, including a copy later hooks extended. */
-	#ownMode(turn: TurnState, message: AgentMessage): PolicyMode | undefined {
-		const mode = policyModeOf(message);
-		const own = mode && turn.notices[mode];
-		if (!own || own.role !== "custom" || message.role !== "custom" || message.timestamp !== own.timestamp) return undefined;
-		return typeof message.content === "string" && typeof own.content === "string" && message.content.startsWith(own.content)
-			? mode
-			: undefined;
+	/** The plugin's counterpart of a native keyword notice, dated and attributed like it. */
+	#keywordNotice(mode: PolicyMode, native: CustomMessage, tools: readonly string[]): AgentMessage {
+		const key = `${native.customType}\u0000${native.timestamp}`;
+		if (!this.#logged.has(key)) {
+			this.#logged.add(key);
+			this.#deps.logger.policy({ mode });
+		}
+		return buildPolicyNotice(mode, tools, native.timestamp, native.attribution);
 	}
 }

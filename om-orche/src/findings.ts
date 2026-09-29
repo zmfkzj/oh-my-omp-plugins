@@ -23,6 +23,7 @@ import {
 } from "./advisor-review.ts";
 import { type AuditorSeverity, admittedSeverity, isOwnedAuditor } from "./auditor-contract.ts";
 import { mainSessionOf } from "./host.ts";
+import { isTurnStartEntry } from "./orchestration-policy.ts";
 import { AUDITOR_NAME } from "./verification-auditor.ts";
 
 /** Text parts of a message's content, trimmed; anything non-textual is dropped. */
@@ -59,6 +60,8 @@ const LISTED_UNRESOLVED = 10;
 const LISTED_TRANSITIONED = 5;
 const LISTED_CANDIDATES = 10;
 const LISTED_IDS = 20;
+/** Upper bound on `list`'s `offset`; a session's entry count is far below it. */
+const MAX_EVIDENCE_OFFSET = 100_000;
 
 /**
  * Persisted transition. Evidence stays entry ids, never copied excerpts: the transcript is the
@@ -88,6 +91,11 @@ interface Tracked {
   receivedIndex: number;
   /** Only an explicit reopening establishes a freshness boundary. Receipt is not observation. */
   evidenceAfter: number;
+  /**
+   * Snapshot of the evidence ids cited by the resolution of the finding this one re-raises, taken
+   * when the re-raising note arrived; absent for a finding that re-raises nothing.
+   */
+  reraisedEvidence?: ReadonlySet<string>;
 }
 
 interface Ledger {
@@ -99,16 +107,25 @@ interface Ledger {
 }
 
 /**
- * Text of a message the user actually typed: not synthetic or agent-attributed, not a hidden
- * system notice. Nothing else in the transcript speaks for the user. A leading "/" is no
- * exclusion: commands never become messages, and what OMP passes on as text is a real request.
+ * Text of a prompt the user actually gave: a typed message, or a custom message the host
+ * attributes to the user and starts a turn with (`isTurnStartEntry`: a `/skill:` prompt or a
+ * writable-collab peer's prompt, persisted as `custom_message`, not `message`). Not synthetic or
+ * agent-attributed, not a hidden system notice. Nothing else in the transcript speaks for the
+ * user. A leading "/" is no exclusion: commands never become messages, and what OMP passes on as
+ * text is a real request. The same text is scope context and citable "user message" evidence.
  */
 function actualUserText(entry: SessionEntry): string | undefined {
-  const message = entry.type === "message" ? entry.message : undefined;
-  if (message?.role !== "user" || message.synthetic || message.attribution === "agent") {
+  let content: unknown;
+  if (entry.type === "message") {
+    const { message } = entry;
+    if (message.role !== "user" || message.synthetic || message.attribution === "agent") return undefined;
+    content = message.content;
+  } else if (entry.type === "custom_message" && isTurnStartEntry(entry)) {
+    content = entry.content;
+  } else {
     return undefined;
   }
-  const text = visibleText(message.content);
+  const text = visibleText(content);
   return text && !text.startsWith("<system-") ? text : undefined;
 }
 
@@ -125,12 +142,14 @@ function activeBranch(branch: readonly SessionEntry[]): readonly SessionEntry[] 
 
 /** Shown for output the host pruned from a result a recorded resolution cited. */
 const PRUNED_EXCERPT = "(output later pruned from context)";
+/** Shown for a recorded resolution's cited result that holds no text. */
+const NO_TEXT_EXCERPT = "(no text output)";
 
 /**
- * The entry as citable evidence, or why it cannot be cited. A tool result the host pruned or its
- * tool flagged uneventful holds nothing to check a claim against, so it is refused; `replay`
- * keeps a record written earlier valid and shows pruned output as `PRUNED_EXCERPT`, not as the
- * host's placeholder.
+ * The entry as citable evidence, or why it cannot be cited. A tool result the host pruned, its
+ * tool flagged uneventful, or that carries no text (an image-only capture, empty output) holds
+ * nothing auditable to check a claim against, so it is refused; `replay` keeps a record written
+ * earlier valid, showing pruned output as `PRUNED_EXCERPT` and empty output as `NO_TEXT_EXCERPT`.
  */
 function classifyEvidence(entry: SessionEntry, replay = false): FindingEvidence | string {
   const message = entry.type === "message" ? entry.message : undefined;
@@ -141,18 +160,18 @@ function classifyEvidence(entry: SessionEntry, replay = false): FindingEvidence 
       return `is ${message.toolName} output, not evidence about the work`;
     }
     const pruned = message.prunedAt !== undefined;
+    const text = collapse(visibleText(message.content), FINDING_LIMITS.excerpt);
     if (!replay) {
       if (pruned) return "is a tool result whose output was pruned from context";
       if (message.useless) return "is a tool result its tool flagged as uneventful";
+      if (!text) return "is a tool result with no text output";
     }
     return {
       entryId: entry.id,
       kind: "tool_result",
       toolName: collapse(message.toolName, FINDING_LIMITS.token),
       at: entry.timestamp,
-      excerpt: pruned
-        ? PRUNED_EXCERPT
-        : collapse(visibleText(message.content), FINDING_LIMITS.excerpt) || "(no text output)",
+      excerpt: pruned ? PRUNED_EXCERPT : text || NO_TEXT_EXCERPT,
     };
   }
   const text = actualUserText(entry);
@@ -269,6 +288,10 @@ function applyRecord(
     reason: collapse(record.reason, FINDING_LIMITS.reason),
     evidence,
   };
+  // Describes the current resolution only: a waiver or reopening supersedes it.
+  const reused = to === "resolved" ? evidence.filter((cited) => tracked.reraisedEvidence?.has(cited.entryId)) : [];
+  if (reused.length > 0) tracked.finding.reusedEvidenceIds = reused.map((cited) => cited.entryId);
+  else delete tracked.finding.reusedEvidenceIds;
   if (to === "reopened") tracked.evidenceAfter = index;
 }
 
@@ -311,12 +334,21 @@ function buildLedger(branch: readonly SessionEntry[]): Ledger {
           ledger.byId.set(id, standing);
           return;
         }
+        // Not merged, yet the latest same-key finding is resolved: this note re-raises it. Allowed
+        // (a delayed note written before that resolution is legitimately answered by its evidence),
+        // but linked so a reviewer sees the same claim disputed again and any evidence reused.
+        const previous = same.at(-1);
+        const reraised = previous?.finding.status === "resolved" ? previous : undefined;
         const tracked: Tracked = {
           id,
           key,
           receivedIndex: index,
           evidenceAfter: -1,
+          ...(reraised && {
+            reraisedEvidence: new Set(reraised.finding.transition?.evidence.map((cited) => cited.entryId)),
+          }),
           finding: {
+            ...(reraised && { reraisesId: reraised.id }),
             id,
             note: collapse(note.note, FINDING_LIMITS.note),
             severity: note.severity,
@@ -375,7 +407,7 @@ function describe(finding: VerificationFinding): string {
   return `${formatFinding(finding)}\n  Repeats merged into it: ${repeats.join(", ")}${shown}`;
 }
 
-function listLedger(branch: readonly SessionEntry[], findingId: string | undefined) {
+function listLedger(branch: readonly SessionEntry[], findingId: string | undefined, offset = 0) {
   const ledger = buildLedger(branch);
   const sections: string[] = [];
   let details: Record<string, unknown>;
@@ -431,23 +463,32 @@ function listLedger(branch: readonly SessionEntry[], findingId: string | undefin
     details = { action: "list", ...counts };
   }
   if (citableAfter !== undefined) {
-    const lines: string[] = [];
-    for (
-      let index = branch.length - 1;
-      index > citableAfter && lines.length < LISTED_CANDIDATES;
-      index--
-    ) {
+    const candidates: string[] = [];
+    for (let index = branch.length - 1; index > citableAfter; index--) {
       const entry = branch[index];
       const cited = entry && classifyEvidence(entry);
       if (!cited || typeof cited === "string") continue;
       const source = cited.kind === "tool_result" ? `tool result (${cited.toolName})` : "user message";
-      lines.push(`- ${cited.entryId} ${source} at ${cited.at}: "${cited.excerpt}"`);
+      candidates.push(`- ${cited.entryId} ${source} at ${cited.at}: "${cited.excerpt}"`);
     }
+    const lines = candidates.slice(offset, offset + LISTED_CANDIDATES);
     const scope = citableAfter < 0 ? "on this branch" : "after the relevant explicit reopening";
+    const next = offset + lines.length;
+    const page = `list with${findingId === undefined ? "" : ` findingId=${findingId} and`} offset=${next}`;
+    if (lines.length > 0) {
+      const range = offset > 0 ? ` (${offset + 1}-${next} of ${candidates.length})` : "";
+      sections.push(
+        `Citable evidence ${scope}, newest first${range} (pass entry ids as \`evidence\`):\n${lines.join("\n")}`,
+      );
+      if (candidates.length > next) sections.push(`${candidates.length - next} more older citable entries: ${page}.`);
+    } else {
+      sections.push(
+        candidates.length === 0
+          ? `No citable evidence ${scope}.`
+          : `No citable evidence at offset ${offset}; ${candidates.length} entries ${scope} in all.`,
+      );
+    }
     sections.push(
-      lines.length > 0
-        ? `Citable evidence ${scope}, newest first (pass entry ids as \`evidence\`):\n${lines.join("\n")}`
-        : `No citable evidence ${scope}.`,
       "Notice receipt is not the auditor's observation time. Earlier results may answer a delayed note; explain their relevance instead of rerunning solely for chronology. For reopened findings, focus by findingId to see their individual evidence boundary.",
     );
   }
@@ -490,7 +531,7 @@ export function registerFindingTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: FINDINGS_TOOL,
     label: "Review findings",
-    description: `Manage ${AUDITOR_NAME} findings, which stay attached to ${REVIEW_TOOL} reviews until their status changes. DEFAULT only. "list" shows the ledger on this branch (IDs, status, provenance) and citable evidence entry ids; add findingId to focus one finding. "resolve" records your report that a finding is addressed: findingId, reason explaining relevance, and evidence = entry ids of successful tool results or actual user messages on this branch. Evidence may precede a delayed notice; its receipt time is not its observation time. Do not rerun solely to obtain a later timestamp. The auditor's note stays; reviewers weigh your report and its evidence, not as proof. "reopen" makes a resolved or waived finding unresolved again and requires evidence after that explicit reopening for another resolution. "waive" asks the user to accept a finding unresolved; only their explicit confirmation waives it. A review never resolves a finding.`,
+    description: `Manage ${AUDITOR_NAME} findings, which stay attached to ${REVIEW_TOOL} reviews until their status changes. DEFAULT only. "list" shows the ledger on this branch (IDs, status, provenance) and the newest citable evidence entry ids; add findingId to focus one finding, and offset to page past the newest evidence entries to older ones. "resolve" records your report that a finding is addressed: findingId, reason explaining relevance, and evidence = entry ids of successful tool results with text output or actual user messages on this branch. Evidence may precede a delayed notice; its receipt time is not its observation time. Do not rerun solely to obtain a later timestamp. The auditor's note stays; reviewers weigh your report and its evidence, not as proof. "reopen" makes a resolved or waived finding unresolved again and requires evidence after that explicit reopening for another resolution. "waive" asks the user to accept a finding unresolved; only their explicit confirmation waives it. A review never resolves a finding.`,
     loadMode: "essential",
     approval: (args) =>
       (args as { action?: unknown } | undefined)?.action === "list" ? "read" : "write",
@@ -500,6 +541,7 @@ export function registerFindingTools(pi: ExtensionAPI): void {
         findingId: entryId.optional(),
         reason: z.string().min(1).max(FINDING_LIMITS.reason).optional(),
         evidence: z.array(entryId).max(FINDING_LIMITS.evidence).optional(),
+        offset: z.number().int().min(0).max(MAX_EVIDENCE_OFFSET).optional(),
       })
       .strict(),
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
@@ -508,8 +550,9 @@ export function registerFindingTools(pi: ExtensionAPI): void {
         throw new Error(`${FINDINGS_TOOL} is available only to the primary orchestrator, not workers.`);
       }
       const { sessionManager } = primary;
-      const { action, findingId } = params;
-      if (action === "list") return listLedger(activeBranch(sessionManager.getBranch()), findingId);
+      const { action, findingId, offset } = params;
+      if (offset !== undefined && action !== "list") throw new Error("offset applies only to list.");
+      if (action === "list") return listLedger(activeBranch(sessionManager.getBranch()), findingId, offset);
 
       const reason = collapse(params.reason ?? "", FINDING_LIMITS.reason);
       if (!findingId || !reason) throw new Error(`${action} requires findingId and a reason.`);

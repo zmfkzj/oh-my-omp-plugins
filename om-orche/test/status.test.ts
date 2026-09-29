@@ -123,6 +123,17 @@ test("a clean install reports neither retired settings nor leftover roles", asyn
 	expect(status).not.toContain("no longer used");
 });
 
+test("settings that could not be read are reported with the failure, and only then", async () => {
+	const { pi } = makeApi();
+	const { ctx } = mainContext({ "@task": fakeModel("provider", "worker") });
+	const unreadable = { ...fakeRuntime(), configError: "SyntaxError: JSON Parse error" } as unknown as OrcheRuntime;
+
+	const status = await renderStatus(pi, unreadable, ctx, setupStore());
+
+	expect(status).toContain("SyntaxError: JSON Parse error");
+	expect(await renderStatus(pi, fakeRuntime(), ctx, setupStore())).not.toContain("could not be read");
+});
+
 test("the removed setup and test subcommands are rejected before anything runs", async () => {
 	const { pi } = makeApi();
 	let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;

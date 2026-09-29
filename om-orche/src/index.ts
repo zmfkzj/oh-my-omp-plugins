@@ -1,10 +1,11 @@
 /**
  * om-orche — plugin-owned coordination over OMP's native `task` worker.
  *
- *   1. One execution policy notice per governed main-session turn: Judgment
- *      (the main analyzes) and Production (workers build), chosen by the main
- *      per stage. It needs no network and no credentials, and the primary
- *      model never changes.
+ *   1. One execution policy notice, persisted as a hidden message with the prompt that
+ *      needs it and kept in force until compaction or a tool change replaces it:
+ *      Judgment (the main analyzes) and Production (workers build), chosen by the main
+ *      per stage. It needs no network and no credentials, and the primary model never
+ *      changes.
  *   2. Generic workers stay OMP's native `task` agent: it uses the user's `@task`
  *      role when set, else the main session's active model. Task calls are never
  *      classified or rewritten.
@@ -34,11 +35,12 @@ export function registerOmOrche(
 	registerFindingTools(pi);
 
 	pi.on("session_start", async (_event, ctx) => {
-		// Every session in the process runs this handler, but they share one telemetry writer: only the
-		// main session's configuration may switch it, and only the main session loads it. A subagent's
-		// start must not flip the main's setting or migrate and write a file the main left alone.
+		// Every session in the process runs this handler, but they share one telemetry writer, not one
+		// telemetry choice: only a main session's own configuration decides whether its workers are
+		// recorded (a subagent follows the main session above it), and only a main session loads the file.
+		// A subagent's start must not flip the main's setting or migrate and write a file the main left alone.
 		const main = mainSessionOf(ctx) !== undefined;
-		await runtime.reloadConfig(ctx.cwd, { drivesTelemetry: main });
+		await runtime.reloadConfig(ctx);
 		// One-time OMP setup. It must finish before the auditor installer registered by
 		// `registerOrcheAdvisor` runs in this same session_start, so OMP's live
 		// `advisor.enabled` toggle can start the auditor in the first session.
@@ -46,21 +48,22 @@ export function registerOmOrche(
 		if (main) await runtime.telemetry.load();
 	});
 	// Live usage covers workers named `task`, whichever native path spawned them.
-	const stopUsageTracking = trackWorkerUsage(pi.events, runtime.telemetry);
+	const stopUsageTracking = trackWorkerUsage(pi.events, runtime.telemetry, { enabled: () => runtime.recordsTelemetry() });
 
-	pi.on("before_agent_start", (event, ctx) => {
-		runtime.orchestration.beginTurn(ctx, event.prompt);
+	// Persist the execution policy (hidden, once per context) with the prompt that needs it.
+	pi.on("before_agent_start", async (event, ctx) => {
+		// A stored `omp plugin config set` change applies from this turn on.
+		await runtime.syncConfig(ctx);
+		const message = runtime.orchestration.noticeToPersist(ctx, event.prompt);
+		return message && { message };
 	});
 
-	// Attach the turn's policy notice, without persisting it.
+	// Adapt what the provider reads of the transcript, without editing it: OMP's `orchestrate`
+	// notice gives way to the policy, and the plugin's notices are withheld whenever it does not
+	// govern the request (see `orchestration.ts`).
 	pi.on("context", (event, ctx) => {
 		const messages = runtime.orchestration.applyToContext(ctx, event.messages);
 		return messages ? { messages } : undefined;
-	});
-	// A replaced session has no turn to continue; the last governed turn otherwise stays in force
-	// for autonomous continuations until the next user prompt (see `orchestration.ts`).
-	pi.on("session_switch", (_event, ctx) => {
-		if (mainSessionOf(ctx)) runtime.orchestration.resetTurn();
 	});
 
 	pi.on("session_shutdown", async () => {

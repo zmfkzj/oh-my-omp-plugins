@@ -3,21 +3,22 @@
  * the main model per request and per current stage. OMP's own prompt is never
  * reused as policy, and nothing here classifies, routes or calls a model.
  *
- * Exactly one policy notice guides a governed turn's execution method:
+ * Three renderings, each with its own role:
  *   - `default`: both policies, the per-stage selection rule and the shared
- *     guidance (transitions, reuse, task bodies, verification).
- *   - `orchestrate`: an explicit native `orchestrate` request. With `task` it is the
- *     `default` body plus a line naming the request; without `task` an honest
- *     direct-execution notice that never claims delegation.
- *   - `workflow`: supplement only. A native `workflowz` notice keeps choosing the
- *     execution method, agents, fan-out and reuse; this adds the task-body
- *     contract, the analysis-only boundary and verification duties without any
+ *     guidance (transitions, reuse, task bodies, verification). It is the notice the
+ *     plugin persists, hidden, and it stays in force until a newer one.
+ *   - `orchestrate`: stands in for an explicit native `orchestrate` notice. With `task` it
+ *     is a line naming the request (the `default` policy in context does the rest); without
+ *     `task` an honest direct-execution notice that never claims delegation.
+ *   - `workflow`: supplement only, placed right after a native `workflowz` notice. That
+ *     notice keeps choosing the execution method, agents, fan-out and reuse; this adds the
+ *     task-body contract, the analysis-only boundary and verification duties without any
  *     dispatch, parallel, reuse or "analyze directly" instruction.
- * The notice only renders instructions backed by tools enabled on the turn; it
+ * A notice only renders instructions backed by the tools enabled when it is rendered; it
  * never changes tools, models or permissions.
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { isUserTurnInitiator } from "@oh-my-pi/pi-coding-agent";
+import { type CustomMessage, isUserTurnInitiator } from "@oh-my-pi/pi-coding-agent";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 
 /** This plugin's notice; distinct from OMP's so neither is mistaken for the other. */
@@ -95,6 +96,22 @@ export function currentTurnNotices(messages: readonly AgentMessage[], customType
 	return found;
 }
 
+/**
+ * Whether a message of `customType` shares the keyword prefix of the one at `index`: the run of
+ * consecutive custom messages around it that start no turn, which is where OMP queues its keyword
+ * notices ahead of the message that starts the request.
+ */
+export function prefixHas(messages: readonly AgentMessage[], index: number, customType: string): boolean {
+	for (const step of [-1, 1]) {
+		for (let at = index + step; at >= 0 && at < messages.length; at += step) {
+			const message = messages[at];
+			if (message?.role !== "custom" || isTurnUserMessage(message)) break;
+			if (message.customType === customType) return true;
+		}
+	}
+	return false;
+}
+
 const ADVISOR_TOOL = "orche_advisor";
 
 type VerificationKind = "main" | "workflow" | "direct";
@@ -153,13 +170,10 @@ function verification(tools: ReadonlySet<string>, kind: VerificationKind): strin
 	].join("\n");
 }
 
-function renderDefault(tools: ReadonlySet<string>, explicit: boolean): string {
+function renderDefault(tools: ReadonlySet<string>): string {
 	return [
 		"<system-notice>",
 		HEADER,
-		...(explicit
-			? ["The user explicitly asked for orchestration: within the current goal, lean further toward delegation (production work and independent investigations go to workers); this does not turn an analysis-only request into permission to change the product."]
-			: []),
 		SELECTION,
 		judgment(tools),
 		PRODUCTION,
@@ -172,10 +186,16 @@ function renderDefault(tools: ReadonlySet<string>, explicit: boolean): string {
 }
 
 function renderOrchestrate(tools: ReadonlySet<string>): string {
-	if (tools.has("task")) return renderDefault(tools, true);
+	if (tools.has("task")) {
+		return [
+			"<system-notice>",
+			"om-orche execution policy: the user explicitly asked for orchestration in this request. Within the current goal, lean further toward delegation under the Judgment/Production policy (production work and independent investigations go to workers); this does not turn an analysis-only request into permission to change the product.",
+			"</system-notice>",
+		].join("\n");
+	}
 	return [
 		"<system-notice>",
-		"om-orche execution policy: orchestration was requested, but `task` is not enabled for this turn. Do judgment work directly; for production, implement directly within permissions or state the limitation precisely. Never claim or simulate delegation. An analysis-only request stays analysis and changes no product code, config or assets.",
+		"om-orche execution policy: orchestration was requested, but `task` is not enabled for this request. Do judgment work directly; for production, implement directly within permissions or state the limitation precisely. Never claim or simulate delegation. An analysis-only request stays analysis and changes no product code, config or assets.",
 		verification(tools, "direct"),
 		"</system-notice>",
 	].join("\n");
@@ -184,7 +204,7 @@ function renderOrchestrate(tools: ReadonlySet<string>): string {
 function renderWorkflow(tools: ReadonlySet<string>): string {
 	return [
 		"<system-notice>",
-		"om-orche supplement to the workflow notice: it alone chooses the execution method, agents and fan-out; this adds none.",
+		"om-orche supplement to the workflow notice: for this request it alone chooses the execution method, agents and fan-out, overriding the stage selection and delegation guidance of the om-orche execution policy; this adds none.",
 		taskBodyContract(tools, "workflow item prompt"),
 		JUDGMENT_RESULTS,
 		ANALYSIS_ONLY,
@@ -193,12 +213,12 @@ function renderWorkflow(tools: ReadonlySet<string>): string {
 	].join("\n");
 }
 
-/** Render one mode for the tools enabled on this turn. */
+/** Render one mode for the tools enabled when the notice is rendered. */
 export function renderPolicy(mode: PolicyMode, tools: readonly string[]): string {
 	const enabled = new Set(tools);
 	switch (mode) {
 		case "default":
-			return renderDefault(enabled, false);
+			return renderDefault(enabled);
 		case "orchestrate":
 			return renderOrchestrate(enabled);
 		case "workflow":
@@ -206,15 +226,29 @@ export function renderPolicy(mode: PolicyMode, tools: readonly string[]): string
 	}
 }
 
-/** A provider-context-only notice; never persisted. */
-export function buildPolicyNotice(mode: PolicyMode, tools: readonly string[], timestamp: number): AgentMessage {
-	return {
-		role: "custom",
-		customType: POLICY_NOTICE_TYPE,
-		content: renderPolicy(mode, tools),
-		display: false,
-		details: { mode } satisfies PolicyNoticeDetails,
-		attribution: "user",
-		timestamp,
-	} as AgentMessage;
+/**
+ * What `before_agent_start` hands OMP to persist: a hidden custom message. It carries no
+ * `attribution` on purpose: OMP gives a hook's message the prompt's own, so a synthetic prompt's
+ * notice stays agent-attributed (GitHub Copilot's `X-Initiator`, and the billing, follow the last message).
+ */
+export interface PolicyNoticePayload {
+	customType: typeof POLICY_NOTICE_TYPE;
+	content: string;
+	display: false;
+	details: PolicyNoticeDetails;
+}
+
+export function policyNoticePayload(mode: PolicyMode, tools: readonly string[]): PolicyNoticePayload {
+	return { customType: POLICY_NOTICE_TYPE, content: renderPolicy(mode, tools), display: false, details: { mode } };
+}
+
+/** A notice for the provider context only, standing in for a message the transcript does not carry. */
+export function buildPolicyNotice(
+	mode: PolicyMode,
+	tools: readonly string[],
+	timestamp: number,
+	attribution: CustomMessage["attribution"],
+): AgentMessage {
+	const message: CustomMessage = { role: "custom", ...policyNoticePayload(mode, tools), attribution, timestamp };
+	return message;
 }

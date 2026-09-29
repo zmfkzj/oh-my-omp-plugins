@@ -222,4 +222,92 @@ describe("verification finding ledger", () => {
       "open",
     ]);
   });
+
+  test("a user-invoked skill or collab prompt starts a new scope; an agent-attributed one does not", () => {
+    const session = transcript();
+    const typed = session.user("Build the importer.");
+    const early = session.audit(blocker("Importer was never run."));
+    // Host shape: a `/skill:` prompt persists as a `custom_message` entry, not a `message` entry.
+    const skill = session.manager.appendCustomMessageEntry(
+      "skill-prompt",
+      '[IMPORTANT: User invoked the "fix" skill; follow its instructions.]\nUser: fix the parser',
+      true,
+      undefined,
+      "user",
+    );
+    const late = session.audit(blocker("Importer was never run."));
+    session.manager.appendCustomMessageEntry("skill-prompt", "Loaded a helper skill.", true, undefined, "agent");
+    const injected = session.audit(blocker("Parser fixture was never added."));
+    const peer = session.manager.appendCustomMessageEntry("collab-prompt", "Peer asks: also cover tabs.", true, undefined, "user");
+    const collab = session.audit(blocker("Parser fixture was never added."));
+
+    const findings = collectFindings(session.branch());
+    // Same note, different scope: two findings rather than a merged repeat.
+    expect(findings.map((finding) => [finding.id, finding.scopeUserEntryId])).toEqual([
+      [`${early}:0`, typed],
+      [`${late}:0`, skill],
+      [`${injected}:0`, skill],
+      [`${collab}:0`, peer],
+    ]);
+    expect(findings[1]!.scopeUserText).toContain("fix the parser");
+  });
+
+  test("replays a recorded resolution that cites a result with no text", () => {
+    const session = transcript();
+    session.user("Capture the dashboard.");
+    const source = session.audit(blocker("No screenshot was taken."));
+    const capture = session.manager.appendMessage({
+      role: "toolResult",
+      toolCallId: "shot",
+      toolName: "screen_capture",
+      content: [{ type: "image", data: "AAAA", mimeType: "image/png" }],
+      isError: false,
+      timestamp: Date.now(),
+    });
+    session.transition(`${source}:0`, "resolve", [capture]);
+    expect(collectFindings(session.branch())[0]).toMatchObject({
+      status: "resolved",
+      transition: { evidence: [{ entryId: capture, kind: "tool_result", excerpt: "(no text output)" }] },
+    });
+  });
+
+  test("links a re-raised finding to the resolved one and flags evidence its resolution reuses", () => {
+    const session = transcript();
+    session.user("Finish the migration.");
+    const original = session.audit(blocker("Migration was never run."));
+    const run = session.tool("migrated 3 tables");
+    session.transition(`${original}:0`, "resolve", [run]);
+    const again = session.audit(blocker("Migration was never run."));
+    session.transition(`${again}:0`, "resolve", [run]);
+    const third = session.audit(blocker("Migration was never run."));
+    const fresh = session.tool("migrated 3 tables after the schema change");
+    session.transition(`${third}:0`, "resolve", [run, fresh]);
+    const fourth = session.audit(blocker("Migration was never run."));
+    session.transition(`${fourth}:0`, "resolve", [fresh]);
+
+    const [first, second, thirdFinding, fourthFinding] = collectFindings(session.branch());
+    expect(first).not.toHaveProperty("reraisesId");
+    expect(first).not.toHaveProperty("reusedEvidenceIds");
+    expect(second).toMatchObject({ status: "resolved", reraisesId: `${original}:0`, reusedEvidenceIds: [run] });
+    expect(thirdFinding).toMatchObject({ reraisesId: `${again}:0`, reusedEvidenceIds: [run] });
+    // Only entries the re-raised finding's own resolution cited are flagged: `fresh` was new for the third.
+    expect(thirdFinding!.reusedEvidenceIds).not.toContain(fresh);
+    expect(fourthFinding).toMatchObject({ reraisesId: `${third}:0`, reusedEvidenceIds: [fresh] });
+  });
+
+  test("a re-raised finding not yet resolved carries the link but no reuse flag; a waiver does not create one", () => {
+    const session = transcript();
+    session.user("Finish the migration.");
+    const original = session.audit(blocker("Migration was never run."));
+    session.transition(`${original}:0`, "resolve", [session.tool("migrated 3 tables")]);
+    session.audit(blocker("Migration was never run."));
+    expect(collectFindings(session.branch())[1]).toMatchObject({ status: "open", reraisesId: `${original}:0` });
+    expect(collectFindings(session.branch())[1]).not.toHaveProperty("reusedEvidenceIds");
+
+    const waivedSource = session.audit(concern("Rollback path is untested."));
+    session.transition(`${waivedSource}:0`, "waive", []);
+    session.audit(blocker("Rollback path is untested."));
+    const [, , , escalated] = collectFindings(session.branch());
+    expect(escalated).not.toHaveProperty("reraisesId");
+  });
 });

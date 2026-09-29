@@ -25,13 +25,14 @@
  * A marker in om-orche's plugin settings makes the setup one-time. It is written
  * only after every item is resolved and the written values are flushed to disk,
  * so a failed start retries. The marker is an undeclared internal key: it is not
- * part of `OrcheConfig`, and `omp plugin uninstall`, `/om-orche reset` or
- * `omp plugin config delete om-orche hostSetupVersion` remove it.
+ * part of `OrcheConfig`. `omp plugin uninstall` and `omp plugin config delete
+ * om-orche hostSetupVersion` remove it; `/om-orche reset` keeps it, because a
+ * re-run would re-fill keys the user deliberately deleted.
  */
 import { cfgAdvisorEnabled } from "@oh-my-pi/pi-coding-agent/advisor/settings";
 import { PluginManager } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/manager";
 import { cfgTaskMaxRecursionDepth } from "@oh-my-pi/pi-coding-agent/task/settings";
-import { PLUGIN_NAME } from "./config.ts";
+import { HOST_SETUP_KEY, PLUGIN_NAME } from "./config.ts";
 import { mainSessionOf } from "./host.ts";
 import { AUDITOR_ROLE } from "./verification-auditor.ts";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
@@ -40,8 +41,6 @@ import type { RouteLogger } from "./logging.ts";
 
 /** Setup version this build applies; a stored marker at or above it ends the setup for good. */
 export const HOST_SETUP_VERSION = 2;
-/** Key of the marker in om-orche's plugin settings map. */
-export const HOST_SETUP_KEY = "hostSetupVersion";
 
 /** Where the one-time marker lives. */
 export interface HostSetupStore {

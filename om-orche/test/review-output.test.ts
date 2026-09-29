@@ -36,6 +36,7 @@ const selection: ReviewSelection = {
     id: "review-test-model",
     provider: "review-test-provider",
     api: "openai-responses",
+    reasoning: true,
   } as ReviewSelection["model"],
   thinkingLevel: "high" as Effort,
 };
@@ -84,10 +85,10 @@ function completionSequence(...responses: AssistantMessage[]) {
   return { calls, completion };
 }
 
-function review(completion: Completion) {
+function review(completion: Completion, chosen: ReviewSelection = selection) {
   return runReview(
     prepared,
-    selection,
+    chosen,
     { getApiKey: async () => "test-api-key" },
     undefined,
     completion,
@@ -217,7 +218,7 @@ describe("review completion boundary", () => {
     expect(second[2]?.apiKey).toBe(first[2]?.apiKey);
   });
 
-  test("reports truncation after exactly two length completions", async () => {
+  test("reports truncation after exactly two length completions when reasoning was on", async () => {
     const truncated = response({
       stopReason: "length",
       content: [{ type: "text", text: rawOutput }],
@@ -233,6 +234,22 @@ describe("review completion boundary", () => {
       { attempt: 2, mode: "no-reasoning", stopReason: "length" },
     ]);
     expect(calls).toHaveLength(2);
+  });
+
+  test.each([
+    ["thinking is off", { ...selection, thinkingLevel: "off" as const }],
+    ["the model has no reasoning", { ...selection, model: { ...selection.model, reasoning: false } }],
+  ])("does not resend an identical request after a length completion when %s", async (_name, chosen) => {
+    const truncated = response({
+      stopReason: "length",
+      content: [{ type: "text", text: rawOutput }],
+    });
+    const { completion, calls } = completionSequence(truncated, truncated);
+    const result = await review(completion, chosen);
+
+    expectFailure(result, "output_truncated");
+    expect(result.details.attempts).toMatchObject([{ attempt: 1, mode: "configured", stopReason: "length" }]);
+    expect(calls).toHaveLength(1);
   });
 
   test("rejects malformed headings on a completed response without retrying", async () => {
@@ -459,13 +476,34 @@ describe("review structure and returned text", () => {
   test.each([
     ["a bold verdict line", structuredReview.replace("VERDICT: KEEP", "**VERDICT: KEEP**")],
     ["a bold token", structuredReview.replace("VERDICT: KEEP", "VERDICT: **ADJUST**")],
+    ["bold before the colon", structuredReview.replace("VERDICT: KEEP", "**VERDICT**: KEEP")],
+    ["bold before the colon around the token", structuredReview.replace("VERDICT: KEEP", "**VERDICT**: **KEEP**")],
+    ["bold on both sides of the colon", structuredReview.replace("VERDICT: KEEP", "**VERDICT:** **REPLAN**")],
+    ["a trailing period", structuredReview.replace("VERDICT: KEEP", "VERDICT: KEEP.")],
+    ["a bold token with a trailing period", structuredReview.replace("VERDICT: KEEP", "**VERDICT: KEEP.**")],
+    ["a comma rationale", structuredReview.replace("VERDICT: KEEP", "VERDICT: KEEP, because the slices are independent")],
+    ["a semicolon rationale", structuredReview.replace("VERDICT: KEEP", "VERDICT: ESCALATE; the user must decide")],
+    ["a sentence after a period", structuredReview.replace("VERDICT: KEEP", "VERDICT: KEEP. The plan is sound.")],
+    ["a colon rationale", structuredReview.replace("VERDICT: KEEP", "VERDICT: ADJUST: narrow the fan-out")],
     ["a rationale after a dash", structuredReview.replace("VERDICT: KEEP", "VERDICT: ADJUST - narrow the fan-out")],
     ["inline section content", structuredReview.replace("ISSUES:\n- None", "ISSUES: None")],
     ["trailing spaces after headings", structuredReview.replace("AVOID:", "AVOID:  ").replace("ISSUES:", "ISSUES: ")],
+    ["bold section headings, colon inside or outside the markers", structuredReview
+      .replace("ISSUES:", "**ISSUES**:")
+      .replace("ORCHESTRATION CHANGES:", "**ORCHESTRATION CHANGES:**")
+      .replace("AVOID:", "**AVOID**:")],
     ["CRLF line endings", structuredReview.replaceAll("\n", "\r\n")],
   ])("accepts %s", async (_name, text) => {
     const result = await withReply(text);
     expect(result.isError).toBe(false);
+  });
+
+  test.each([
+    ["a period glued to a suffix", "VERDICT: KEEP.ish"],
+    ["a comma without a following space", "VERDICT: KEEP,because"],
+    ["the template echoed with bold", "**VERDICT**: KEEP | ADJUST | REPLAN | ESCALATE"],
+  ])("still rejects %s", async (_name, verdict) => {
+    expectFailure(await withReply(structuredReview.replace("VERDICT: KEEP", verdict)), "invalid_structure");
   });
 
   test("returned advice has terminal and invisible characters removed and a bounded length", async () => {
@@ -480,6 +518,17 @@ describe("review structure and returned text", () => {
     expect(result.text).toContain("abc dxxx");
     expect(result.text).toContain("[advice truncated at 8000 characters]");
     expect(result.text.length).toBeLessThan(8500);
+  });
+
+  test("advice loses every invisible format character, including the tag block used for hidden text", async () => {
+    const hidden = structuredReview.replace(
+      "- None\n\nORCH",
+      "- a\u061cb\u2060c\u180ed\u00ade\u{e0041}\u{e0068}f\u{e007f}g\n\nORCH",
+    );
+    const result = await withReply(hidden);
+    expect(result.isError).toBe(false);
+    expect(result.text).toContain("- abcdefg");
+    expect(/\p{Cf}/u.test(result.text)).toBe(false);
   });
 });
 

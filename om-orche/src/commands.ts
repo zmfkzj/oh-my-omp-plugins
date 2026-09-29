@@ -73,6 +73,13 @@ export async function renderStatus(
 		);
 	}
 
+	if (runtime.configError !== undefined) {
+		lines.push(
+			"",
+			`The stored settings could not be read (${runtime.configError}); the settings read last stay in effect (the defaults, if none has been read).`,
+			"Repair OMP's plugin settings (omp-plugins.lock.json); the next turn picks them up.",
+		);
+	}
 	if (runtime.retiredConfigKeys.length > 0) {
 		lines.push(
 			"",
@@ -91,11 +98,13 @@ export async function renderStatus(
 }
 
 /** How the persisted telemetry file is being treated in this process, or nothing when normal. */
-function telemetryStateNote(state: TelemetryState): string | undefined {
+function telemetryStateNote(state: TelemetryState, file: string): string | undefined {
 	switch (state.kind) {
 		case "unloaded":
-		case "active":
 			return undefined;
+		case "active":
+			if (!state.writeError) return undefined;
+			return `Telemetry cannot be written to ${file}: ${state.writeError.message} (failing since ${isoOf(state.writeError.since)}, ${state.writeError.attempts} attempt(s)). The counts are kept in memory and the write is retried.`;
 		case "deferred":
 			return `Telemetry is disabled: the v${state.version} file is shown read-only and migrates once telemetryEnabled=true.`;
 		case "suspended":
@@ -231,7 +240,7 @@ export function renderStats(runtime: OrcheRuntime): string {
 	const snapshot = telemetry.snapshot();
 	const state = telemetry.state();
 	const lines: string[] = [];
-	const note = telemetryStateNote(state);
+	const note = telemetryStateNote(state, telemetry.file);
 	if (note) lines.push(note, "");
 
 	if (state.kind === "deferred" || state.kind === "suspended") {
@@ -263,7 +272,7 @@ async function runReset(runtime: OrcheRuntime, ctx: ExtensionCommandContext): Pr
 	}
 	// OMP has no API for a project's `plugin-overrides.json`, so what it sets survives the reset and is reported.
 	const overridden = await clearStoredConfig(ctx.cwd);
-	await runtime.reloadConfig(ctx.cwd);
+	await runtime.reloadConfig(ctx);
 	return [
 		telemetryLine,
 		overridden.length === 0
@@ -286,7 +295,7 @@ export function registerCommands(pi: ExtensionAPI, runtime: OrcheRuntime): void 
 				ctx.ui.notify(`Unknown subcommand "${requested}". Use: ${SUBCOMMANDS.join(", ")}.`, "warning");
 				return;
 			}
-			await runtime.reloadConfig(ctx.cwd);
+			await runtime.reloadConfig(ctx);
 			try {
 				switch (sub) {
 					case "status":

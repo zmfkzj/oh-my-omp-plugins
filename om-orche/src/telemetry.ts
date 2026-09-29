@@ -13,8 +13,8 @@
  *   `telemetry.json`, preserved before migration replaced it.
  * - `decisions.jsonl` — the routing eras' per-decision log. It is no longer
  *   written or read; it stays on disk until a reset removes it.
- * - `telemetry.lock` — exists only while a process reads and replaces
- *   `telemetry.json`, or a reset deletes the files.
+ * - `telemetry.lock` — a directory that exists only while a process reads and
+ *   replaces `telemetry.json`, or a reset deletes the files (`state-lock.ts`).
  *
  * An epoch is one span of measurements under one behavior. Migration moves a
  * v5 file's live epoch into `jevRouting`, carries its tier-routing
@@ -26,24 +26,37 @@
  *
  * Several OMP processes may share one state directory. Each keeps only the
  * counts it recorded itself since it last wrote, and a write adds them to the
- * file as it is at that moment: the read, the merge and the atomic replacement
- * happen under `telemetry.lock`, so no process overwrites another's counts. A
- * reset deletes the files under the same lock. A process that finds the file it
- * last wrote gone, because another process reset, starts a new epoch (new id,
- * new start time) and writes its unwritten counts into it: only what is on disk
- * is ever cleared, so a later write cannot undo a reset. What a process shows
- * of the file is its last view of it, so a reader that wants what the others
- * wrote calls `refresh()`: a plain read, since the file is only ever replaced
- * whole, that takes no lock and writes nothing.
+ * file as it is at that moment: the read, the merge and the publication happen
+ * under `telemetry.lock`, so no process overwrites another's counts. The
+ * publication is a rename that only succeeds while the writer still holds the
+ * lock, so even a writer stopped for so long that its lock was broken publishes
+ * nothing and keeps its counts for its next attempt (`state-lock.ts` has the
+ * protocol). A reset deletes the files under the same lock. A process that
+ * finds the file it last wrote gone, because another process reset, starts a
+ * new epoch (new id, new start time) and writes its unwritten counts into it:
+ * only what is on disk is ever cleared, so a later write cannot undo a reset.
+ * What a process shows of the file is its last view of it, so a reader that
+ * wants what the others wrote calls `refresh()`: a plain read, since the file
+ * is only ever replaced whole, that takes no lock and writes nothing.
+ *
+ * Every session of an OMP process shares one writer per state directory, but
+ * not one telemetry choice: each main session's configuration decides whether
+ * the workers of its own session tree are recorded (`setEnabled`,
+ * `recordsFor`), and the writer writes and migrates while any of them wants
+ * that. A write that fails (no permission, a full disk, a lock held for too
+ * long) keeps its counts pending, shows as `writeError` in the state, is
+ * warned about once through the logger, and is retried after a growing delay
+ * until it succeeds.
  *
  * Live worker usage comes from OMP's subagent progress/lifecycle frames (see
  * `worker-usage.ts`). `ctx.sessionManager.getUsageStatistics()` is a single
  * session-wide total with no per-agent breakdown, so it cannot substitute.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { type FileHandle, link, mkdir, open, readdir, readFile, rename, rmdir, stat, unlink } from "node:fs/promises";
+import { link, mkdir, open, readdir, readFile, rm, rmdir, unlink } from "node:fs/promises";
 import path from "node:path";
-import { setTimeout as sleep } from "node:timers/promises";
+import { DEFAULT_LOCK_TIMING, isLockStaging, LockLostError, type LockTiming, type StateLock, withStateLock } from "./state-lock.ts";
+import type { RouteLogger } from "./logging.ts";
 
 const HISTOGRAM_BUCKETS = 10;
 export const TELEMETRY_VERSION = 6;
@@ -53,23 +66,21 @@ const JEV_ROUTING_VERSION = 5;
 const HISTORY_DIR = "telemetry-history";
 /** The routing eras' per-decision log: never written any more, still removed by a reset. */
 const DECISIONS_FILE = "decisions.jsonl";
-/** Temp files of `telemetry.json`: `telemetry.json.<pid>-<n>.tmp`. */
+/** Temp files (`telemetry.json.<pid>-<n>.tmp`) that plugin versions before the lock directory left behind; nothing writes them now. */
 const ACTIVE_TEMP = /^telemetry\.json\.\d+-\d+\.tmp$/;
 /** Where plugin versions before v5 set aside a newer version's file. */
 const SET_ASIDE = /^telemetry\.v\d+\.json$/;
 /** Migration backups, rollback archives, and their temp files. */
 const HISTORY_FILE = /^(?:v\d+-[0-9a-f]{64}\.json|decisions-[0-9a-f]{64}\.jsonl)(?:\.\d+-\d+\.tmp)?$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
+/** How long counts wait before they are written; a failed write is retried after the same, doubled per consecutive failure. */
 const FLUSH_DEBOUNCE_MS = 2000;
 /** Workers remembered for turn accounting and de-duplication across buses; bounded against leaks. */
 const MAX_TRACKED_WORKERS = 4096;
-/** Taken while one process reads and replaces `telemetry.json`, or a reset deletes the files: see {@link acquireLock}. */
+/** Taken while one process reads and replaces `telemetry.json`, or a reset deletes the files: see `state-lock.ts`. */
 const LOCK_FILE = "telemetry.lock";
-/** A holder needs milliseconds; a lock this old was left behind by a process that died. */
-const LOCK_STALE_MS = 5_000;
-/** How long one write waits for another process's lock. OMP gives a `session_shutdown` handler 2 s in all. */
-const LOCK_WAIT_MS = 1_000;
-const LOCK_POLL_MS = 20;
+/** The retry delay of a failing write stops doubling at this many times the flush delay. */
+const MAX_RETRY_FACTOR = 16;
 
 /** Front-door counters of the routing eras; only ever read back from older files. */
 export interface RouteCounters {
@@ -197,13 +208,24 @@ export interface TelemetrySnapshot {
 	historical?: HistoricalTelemetry;
 }
 
+/** Why the last write failed. A write that succeeds clears it. */
+export interface TelemetryWriteError {
+	/** What the failure was, bounded and free of any prompt or task text. */
+	message: string;
+	/** When the first failure of this unbroken run of failures happened. */
+	since: number;
+	/** Consecutive failed attempts, the last one included. */
+	attempts: number;
+}
+
 /**
  * Whether counts are recorded and persisted. Only `active` writes; `unloaded`
  * records into memory and merges into what the first load finds.
  */
 export type TelemetryState =
 	| { kind: "unloaded" }
-	| { kind: "active" }
+	/** Recording and writing. With `writeError`, nothing reaches the disk right now: counts stay in memory and are retried. */
+	| { kind: "active"; writeError?: TelemetryWriteError }
 	/** Telemetry is disabled and `telemetry.json` predates v6: shown read-only, migrated once enabled. */
 	| { kind: "deferred"; version: number; sha256: string }
 	/** Written by a newer plugin: left untouched and nothing is recorded. */
@@ -212,6 +234,18 @@ export type TelemetryState =
 	| { kind: "suspended"; reason: "unreadable"; detail: string }
 	/** The older file stays active, unmigrated: its version and hash identify the sections read from it. */
 	| { kind: "suspended"; reason: "migration-failed"; detail: string; version: number; sha256: string };
+
+/** What telemetry needs of the logger: the rare warning, and a bounded description of an error. */
+export type TelemetryLogger = Pick<RouteLogger, "warn" | "describeError">;
+
+export interface TelemetryOptions {
+	/** Where a failed write is reported, once per distinct failure. */
+	logger?: TelemetryLogger;
+	/** How long counts wait before they are written; a failed write is retried after this, doubled per consecutive failure. */
+	flushDebounceMs?: number;
+	/** How long a write waits for another process's lock, and when a lock counts as left behind by a dead process. */
+	lock?: Partial<LockTiming>;
+}
 
 /** OMP's terminal worker statuses. */
 export type WorkerStatus = "completed" | "failed" | "aborted";
@@ -543,19 +577,6 @@ async function writeNew(file: string, data: string | Uint8Array): Promise<void> 
 	}
 }
 
-/** Replace `file` by renaming a complete sibling temp file over it. */
-async function replaceAtomically(file: string, data: string): Promise<void> {
-	await mkdir(path.dirname(file), { recursive: true });
-	const temp = tempPath(file);
-	try {
-		await writeNew(temp, data);
-		await rename(temp, file);
-	} catch (error) {
-		await unlink(temp).catch(() => {});
-		throw error;
-	}
-}
-
 /**
  * Publish `bytes` as `dir/name` without ever replacing an existing file. A
  * complete temp file is hard-linked into place, so the name never holds a
@@ -628,64 +649,6 @@ async function readDisk(file: string): Promise<DiskFile> {
 	return { kind: "older", bytes, raw, source: { version, sha256: createHash("sha256").update(bytes).digest("hex") } };
 }
 
-/** Remove `lockFile` if its holder must have died; true when it is gone, so taking it can be retried at once. */
-async function breakStaleLock(lockFile: string): Promise<boolean> {
-	try {
-		if (Date.now() - (await stat(lockFile)).mtimeMs <= LOCK_STALE_MS) return false;
-		await unlink(lockFile);
-		return true;
-	} catch (error) {
-		return errorCode(error) === "ENOENT";
-	}
-}
-
-/**
- * Take the exclusive lock on the state directory and resolve to its token. The
- * lock is a file created atomically. A process that finds it taken polls for up
- * to {@link LOCK_WAIT_MS}, then rejects and leaves its counts for the next
- * flush. Critical sections take milliseconds, so a lock older than
- * {@link LOCK_STALE_MS} is a dead process's and is broken.
- */
-async function acquireLock(lockFile: string): Promise<string> {
-	const token = randomUUID();
-	const deadline = Date.now() + LOCK_WAIT_MS;
-	for (;;) {
-		let handle: FileHandle;
-		try {
-			handle = await open(lockFile, "wx");
-		} catch (error) {
-			if (errorCode(error) !== "EEXIST") throw error;
-			if (Date.now() >= deadline) throw new Error(`${lockFile} is held by another process`);
-			if (!(await breakStaleLock(lockFile))) await sleep(LOCK_POLL_MS);
-			continue;
-		}
-		try {
-			await handle.writeFile(token);
-		} catch (error) {
-			await unlink(lockFile).catch(() => {});
-			throw error;
-		} finally {
-			await handle.close();
-		}
-		return token;
-	}
-}
-
-/** Run `work` holding the state directory's lock. */
-async function underLock<T>(lockFile: string, work: () => Promise<T>): Promise<T> {
-	const token = await acquireLock(lockFile);
-	try {
-		return await work();
-	} finally {
-		try {
-			// A holder that outlived the stale limit may have lost the lock to another process: never remove that one.
-			if ((await readFile(lockFile, "utf8")) === token) await unlink(lockFile);
-		} catch {
-			// Already gone.
-		}
-	}
-}
-
 /**
  * Worker counters with a debounced, merging JSON sink.
  *
@@ -693,8 +656,9 @@ async function underLock<T>(lockFile: string, work: () => Promise<T>): Promise<T
  * process — the main session and each subagent — builds its own extension
  * runtime (the factory runs per session), and they all target the same files;
  * separate instances would race, so {@link Telemetry.shared} hands them the
- * same writer. Disabled telemetry never changes a file on disk except through
- * an explicit {@link Telemetry.reset}.
+ * same writer. Their telemetry choices stay their own, see
+ * {@link Telemetry.setEnabled}. Disabled telemetry never changes a file on
+ * disk except through an explicit {@link Telemetry.reset}.
  *
  * Other OMP processes write the same file, so an instance never writes totals
  * of its own. It holds the file as it last saw it (`#base`) and the counts it
@@ -705,11 +669,14 @@ async function underLock<T>(lockFile: string, work: () => Promise<T>): Promise<T
 export class Telemetry {
 	static readonly #instances = new Map<string, Telemetry>();
 
-	/** The process's writer for `stateDir`, created on first use. */
-	static shared(stateDir: string): Telemetry {
+	/** The process's writer for `stateDir`, created on first use; a later caller's logger fills in only when the writer has none. */
+	static shared(stateDir: string, options: TelemetryOptions = {}): Telemetry {
 		const existing = Telemetry.#instances.get(stateDir);
-		if (existing) return existing;
-		const created = new Telemetry(stateDir);
+		if (existing) {
+			existing.#logger ??= options.logger;
+			return existing;
+		}
+		const created = new Telemetry(stateDir, options);
 		Telemetry.#instances.set(stateDir, created);
 		return created;
 	}
@@ -728,9 +695,16 @@ export class Telemetry {
 	/** The increments a write in progress carries; they return to `#pending` if it fails. */
 	#inflight: Record<string, LiveWorkerCounters> = {};
 	#state: TelemetryState = { kind: "unloaded" };
-	#enabled = true;
+	/** Each session's own choice, by the id of its top-level session: see {@link Telemetry.setEnabled}. */
+	readonly #choices = new Map<string, boolean>();
 	#dirty = false;
 	#timer: Timer | undefined;
+	/** Consecutive failed writes: the retry delay grows with it. */
+	#failures = 0;
+	#writeError: TelemetryWriteError | undefined;
+	/** The failures warned about since a write last succeeded: each distinct one is warned about once. */
+	readonly #warned = new Set<string>();
+	#logger: TelemetryLogger | undefined;
 	#loaded: Promise<void> | undefined;
 	/** Incremented by every reset; a load or write that started earlier must not apply its result. */
 	#resets = 0;
@@ -740,11 +714,16 @@ export class Telemetry {
 	readonly #file: string;
 	readonly #lockFile: string;
 	readonly #historyDir: string;
+	readonly #debounceMs: number;
+	readonly #lockTiming: LockTiming;
 
-	constructor(stateDir: string) {
+	constructor(stateDir: string, options: TelemetryOptions = {}) {
 		this.#file = path.join(stateDir, "telemetry.json");
 		this.#lockFile = path.join(stateDir, LOCK_FILE);
 		this.#historyDir = path.join(stateDir, HISTORY_DIR);
+		this.#logger = options.logger;
+		this.#debounceMs = options.flushDebounceMs ?? FLUSH_DEBOUNCE_MS;
+		this.#lockTiming = { ...DEFAULT_LOCK_TIMING, ...options.lock };
 	}
 
 	get file(): string {
@@ -756,13 +735,26 @@ export class Telemetry {
 		return this.#historyDir;
 	}
 
-	state(): Readonly<TelemetryState> {
-		return this.#state;
+	/** Whether any session wants telemetry; before one has chosen, it is on. */
+	get #enabled(): boolean {
+		if (this.#choices.size === 0) return true;
+		for (const enabled of this.#choices.values()) if (enabled) return true;
+		return false;
 	}
 
-	setEnabled(enabled: boolean): void {
-		this.#enabled = enabled;
-		if (enabled && this.#state.kind === "deferred") {
+	state(): Readonly<TelemetryState> {
+		return this.#state.kind === "active" && this.#writeError ? { kind: "active", writeError: this.#writeError } : this.#state;
+	}
+
+	/**
+	 * Record the telemetry choice of `session`, the id of the top-level session whose configuration made it (the
+	 * default suits a caller with a single choice). Every session of the process shares this writer, so one
+	 * session's choice never replaces another's: the writer records, writes and migrates while any session wants
+	 * telemetry, and {@link Telemetry.recordsFor} tells whether one session's own frames are recorded.
+	 */
+	setEnabled(enabled: boolean, session = ""): void {
+		this.#choices.set(session, enabled);
+		if (this.#enabled && this.#state.kind === "deferred") {
 			// The older file was only read. Its view is dropped so it can never be written
 			// without a preserved original; the next load migrates the file first.
 			this.#state = { kind: "unloaded" };
@@ -770,6 +762,11 @@ export class Telemetry {
 			delete this.#base.historical;
 			delete this.#base.jevRouting;
 		}
+	}
+
+	/** Whether the frames of `session`'s tree are recorded: its own choice, or what the process's sessions together want when it has made none. */
+	recordsFor(session: string | undefined): boolean {
+		return (session === undefined ? undefined : this.#choices.get(session)) ?? this.#enabled;
 	}
 
 	/** What the file held when this process last looked, plus every count this process has recorded since. */
@@ -909,7 +906,7 @@ export class Telemetry {
 	 */
 	async #migrate(): Promise<void> {
 		const resets = this.#resets;
-		await underLock(this.#lockFile, async () => {
+		await withStateLock(this.#lockFile, async lock => {
 			const now = await readDisk(this.#file);
 			if (resets !== this.#resets) return;
 			if (now.kind !== "older") {
@@ -925,9 +922,9 @@ export class Telemetry {
 			await preserve(this.#historyDir, historySnapshotName(now.source.version, now.source.sha256), now.bytes);
 			// Writers are expected to be stopped; still, never replace a file that changed since it was read.
 			if (!(await readFile(this.#file)).equals(now.bytes)) throw new Error("telemetry.json changed during migration");
-			await this.#persist();
+			await this.#persist(lock);
 			if (resets === this.#resets) this.#state = { kind: "active" };
-		});
+		}, this.#lockTiming);
 	}
 
 	/** Before the first load, counts are kept in memory and merged into what the load finds. */
@@ -939,14 +936,19 @@ export class Telemetry {
 		return this.#enabled && this.#state.kind === "active";
 	}
 
-	#touch(): void {
-		this.#dirty = true;
+	/** Flush after `delay`, unless a flush is already due. The timer never keeps the process alive. */
+	#arm(delay: number): void {
 		if (this.#timer) return;
 		this.#timer = setTimeout(() => {
 			this.#timer = undefined;
 			void this.flush();
-		}, FLUSH_DEBOUNCE_MS);
+		}, delay);
 		this.#timer.unref?.();
+	}
+
+	#touch(): void {
+		this.#dirty = true;
+		this.#arm(this.#debounceMs);
 	}
 
 	/**
@@ -1119,37 +1121,62 @@ export class Telemetry {
 		const resets = this.#resets;
 		try {
 			await mkdir(path.dirname(this.#file), { recursive: true });
-			await underLock(this.#lockFile, () => this.#merge());
-		} catch {
-			// A telemetry write must never break a turn; the next flush retries.
-			if (resets === this.#resets) this.#dirty = true;
+			await withStateLock(this.#lockFile, lock => this.#merge(lock), this.#lockTiming);
+		} catch (error) {
+			// A telemetry write must never break a turn: the counts stay pending and are retried.
+			if (resets === this.#resets) this.#failed(error);
+			return;
+		}
+		if (resets === this.#resets) this.#succeeded();
+	}
+
+	/**
+	 * Keep the counts for another attempt, say why (in the state, and once in the log), and schedule that attempt:
+	 * without a new frame nothing else would trigger it, and a process may be about to end with counts unwritten.
+	 */
+	#failed(error: unknown): void {
+		this.#dirty = true;
+		this.#failures++;
+		const message = this.#logger?.describeError(error) ?? messageOf(error).slice(0, 200);
+		this.#writeError = { message, since: this.#writeError?.since ?? Date.now(), attempts: this.#failures };
+		this.#arm(Math.min(this.#debounceMs * 2 ** (this.#failures - 1), this.#debounceMs * MAX_RETRY_FACTOR));
+		if (!this.#warned.has(message)) {
+			this.#warned.add(message);
+			this.#logger?.warn(`telemetry could not be written to ${this.#file}: ${message}; the counts stay in memory and the write is retried`);
 		}
 	}
 
+	/** A write got through: the failure is over, and a later one warns again. */
+	#succeeded(): void {
+		this.#failures = 0;
+		this.#writeError = undefined;
+		this.#warned.clear();
+	}
+
 	/** The critical section of {@link Telemetry.flush}: the file is read as it is now and the pending counts join it. */
-	async #merge(): Promise<void> {
+	async #merge(lock: StateLock): Promise<void> {
 		const resets = this.#resets;
 		const disk = await readDisk(this.#file);
 		// A reset, or telemetry being turned off, ran while this waited for the lock or the read.
 		if (resets !== this.#resets || !this.#writable()) return;
 		this.#adopt(disk);
 		// A file this version must not touch has suspended recording; only counts to add call for a write.
-		if (this.#writable() && Object.keys(this.#pending).length > 0) await this.#persist();
+		if (this.#writable() && Object.keys(this.#pending).length > 0) await this.#persist(lock);
 	}
 
 	/**
-	 * Replace the file with this process's view of it plus every pending count. The
-	 * counts travel as `#inflight` while the write runs, so `snapshot()` keeps them
-	 * and a failed write gives them back.
+	 * Replace the file with this process's view of it plus every pending count, publishing it through the lock
+	 * so that it lands only if the lock is still held. The counts travel as `#inflight` while the write runs, so
+	 * `snapshot()` keeps them and a failed write, a lost lock included, gives them back.
 	 */
-	async #persist(): Promise<void> {
+	async #persist(lock: StateLock): Promise<void> {
 		const resets = this.#resets;
 		this.#inflight = this.#pending;
 		this.#pending = {};
 		const base = this.#base;
 		const merged: TelemetrySnapshot = { ...base, updatedAt: Date.now(), workers: sumWorkers(base.workers, this.#inflight, 0) };
 		try {
-			await replaceAtomically(this.#file, JSON.stringify(merged));
+			await lock.commit(this.#file, JSON.stringify(merged));
 		} catch (error) {
 			// A reset that ran meanwhile has already dropped the counts.
 			if (resets === this.#resets) {
@@ -1184,6 +1211,9 @@ export class Telemetry {
 		this.#pending = {};
 		this.#inflight = {};
 		this.#dirty = false;
+		this.#failures = 0;
+		this.#writeError = undefined;
+		this.#warned.clear();
 		this.#tracked.clear();
 		this.#state = { kind: "active" };
 		// The cleared state is authoritative; a later `load()` must not re-read.
@@ -1199,7 +1229,7 @@ export class Telemetry {
 	/** Delete the plugin's files while holding the lock, so no other process's write lands in the middle. */
 	async #removeOwnedFiles(): Promise<string[]> {
 		try {
-			return await underLock(this.#lockFile, () => this.#deleteOwnedFiles());
+			return await withStateLock(this.#lockFile, lock => this.#deleteOwnedFiles(lock), this.#lockTiming);
 		} catch (error) {
 			// No state directory, so nothing was ever written.
 			if (errorCode(error) === "ENOENT") return [];
@@ -1208,12 +1238,15 @@ export class Telemetry {
 	}
 
 	/** Only exact plugin-owned names; other files, including user exports, are left alone. */
-	async #deleteOwnedFiles(): Promise<string[]> {
+	async #deleteOwnedFiles(lock: StateLock): Promise<string[]> {
 		const removed: string[] = [];
 		const failed: string[] = [];
-		const remove = async (file: string) => {
+		const remove = async (file: string, tree = false) => {
+			// A holder judged dead loses its lock: stop rather than delete under whoever holds it now.
+			if (!(await lock.holds())) throw new LockLostError(this.#lockFile);
 			try {
-				await unlink(file);
+				if (tree) await rm(file, { recursive: true, force: true });
+				else await unlink(file);
 				removed.push(file);
 			} catch (error) {
 				if (errorCode(error) !== "ENOENT") failed.push(`${file} (${messageOf(error)})`);
@@ -1224,6 +1257,8 @@ export class Telemetry {
 		await remove(path.join(stateDir, DECISIONS_FILE));
 		for (const name of await listNames(stateDir, failed)) {
 			if (ACTIVE_TEMP.test(name) || SET_ASIDE.test(name)) await remove(path.join(stateDir, name));
+			// Left by an acquisition that died between staging its lock and taking it.
+			else if (isLockStaging(path.basename(this.#lockFile), name)) await remove(path.join(stateDir, name), true);
 		}
 		for (const name of await listNames(this.#historyDir, failed)) {
 			if (HISTORY_FILE.test(name)) await remove(path.join(this.#historyDir, name));

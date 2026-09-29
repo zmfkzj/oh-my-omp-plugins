@@ -249,4 +249,85 @@ describe("review_findings", () => {
     await expect(session.call({ action: "resolve", findingId: other, reason: "see output", evidence: [output] }))
       .rejects.toThrow(/pruned/);
   });
+
+  test("pages older citable evidence with offset instead of hiding it past the newest ten", async () => {
+    const session = primarySession();
+    const results = Array.from({ length: 12 }, (_, index) => session.result(`run ${index + 1} ok`));
+    const id = `${session.audit(blocker("Claimed the migration ran; no output."))}:0`;
+
+    const first = await session.text({ action: "list" });
+    expect(first).toContain(results[11]!);
+    expect(first).toContain(results[2]!);
+    expect(first).not.toContain(results[1]!);
+    expect(first).toContain("2 more older citable entries: list with offset=10");
+    await expect(
+      session.call({ action: "resolve", findingId: id, reason: "Earlier run answers it.", evidence: [results[0]!], offset: 1 }),
+    ).rejects.toThrow("offset applies only to list");
+
+    const second = await session.text({ action: "list", offset: 10 });
+    expect(second).toContain(results[1]!);
+    expect(second).toContain(results[0]!);
+    expect(second).not.toContain(results[2]!);
+    expect(second).not.toContain("more older");
+    expect(await session.text({ action: "list", findingId: id, offset: 1 })).toContain(
+      `findingId=${id} and offset=11`,
+    );
+    expect(await session.text({ action: "list", offset: 500 })).toContain("No citable evidence at offset 500");
+
+    await session.call({ action: "resolve", findingId: id, reason: "Earlier run answers it.", evidence: [results[0]!] });
+    expect(session.status()).toEqual(["resolved"]);
+  });
+
+  test("refuses a result with no text output as new evidence", async () => {
+    const session = primarySession();
+    const image = session.manager.appendMessage({
+      role: "toolResult", toolCallId: "shot", toolName: "screen_capture", isError: false, timestamp: Date.now(),
+      content: [{ type: "image", data: "AAAA", mimeType: "image/png" }],
+    });
+    const empty = session.result("   ");
+    const id = `${session.audit(blocker("No screenshot was taken."))}:0`;
+
+    const listing = await session.text({ action: "list" });
+    expect(listing).not.toContain(image);
+    expect(listing).not.toContain(empty);
+    for (const evidence of [image, empty]) {
+      await expect(session.call({ action: "resolve", findingId: id, reason: "Captured.", evidence: [evidence] }))
+        .rejects.toThrow("is a tool result with no text output");
+    }
+    expect(session.records()).toBe(0);
+  });
+
+  test("a user-invoked skill prompt is citable user evidence and a new scope", async () => {
+    const session = primarySession();
+    const skill = session.manager.appendCustomMessageEntry(
+      "skill-prompt", "[IMPORTANT: User invoked the \"deploy\" skill.]\nUser: deploy to staging only", true, undefined, "user",
+    );
+    const agent = session.manager.appendCustomMessageEntry("skill-prompt", "Loaded helper.", true, undefined, "agent");
+    const id = `${session.audit(blocker("Production was deployed too."))}:0`;
+
+    expect(collectFindings(session.manager.getBranch())[0]).toMatchObject({ scopeUserEntryId: skill });
+    expect(await session.text({ action: "list" })).toContain(`${skill} user message`);
+    await expect(session.call({ action: "resolve", findingId: id, reason: "Agent note.", evidence: [agent] }))
+      .rejects.toThrow("neither a successful tool result nor a message the user typed");
+    await session.call({ action: "resolve", findingId: id, reason: "The user asked for staging only.", evidence: [skill] });
+    expect(session.status()).toEqual(["resolved"]);
+  });
+
+  test("a re-raised finding shows what it re-raises and the evidence reused, in list output", async () => {
+    const session = primarySession();
+    const run = session.result("13 pass, 0 fail");
+    const original = `${session.audit(blocker("Claimed tests pass; no runner output."))}:0`;
+    await session.call({ action: "resolve", findingId: original, reason: "The run passed.", evidence: [run] });
+    const again = `${session.audit(blocker("Claimed tests pass; no runner output."))}:0`;
+    expect(await session.text({ action: "list", findingId: again })).toContain(original);
+
+    // Allowed, but flagged: the same evidence answers the re-raised note again.
+    await session.call({ action: "resolve", findingId: again, reason: "Same run.", evidence: [run] });
+    expect(collectFindings(session.manager.getBranch())[1]).toMatchObject({
+      status: "resolved", reraisesId: original, reusedEvidenceIds: [run],
+    });
+    const listing = await session.text({ action: "list", findingId: again });
+    expect(listing).toContain(original);
+    expect(listing.match(new RegExp(run, "g"))?.length).toBeGreaterThanOrEqual(2);
+  });
 });

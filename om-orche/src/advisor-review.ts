@@ -97,6 +97,10 @@ export interface VerificationFinding {
   repeatIds?: string[];
   /** ISO timestamp of the latest emission, first or repeated. */
   lastRaisedAt?: string;
+  /** Ledger id of the finding this one re-raises: a same-key auditor note that arrived after that finding's reported resolution. */
+  reraisesId?: string;
+  /** Evidence entry ids this finding's reported resolution cites that the re-raised finding's resolution had already cited. */
+  reusedEvidenceIds?: string[];
   /** Latest actual user message before receipt: scope context, not the note's authority. */
   scopeUserEntryId?: string;
   /** Bounded text of that user message. */
@@ -234,6 +238,8 @@ unless the user's own later words lift it: never treat it as superseded by elaps
 the snapshot, or anyone's claim. Open and reopened findings are unresolved. A resolved status is DEFAULT's
 own report with cited transcript excerpts, not proof: judge whether that evidence answers the note. A
 waiver is the user's explicit acceptance, not a fix. Findings summarized by ID keep their stated status.
+A resolution for a re-raised note (marked "re-raises") that only repeats evidence the earlier resolution
+already cited deserves skepticism: the auditor saw the problem again after that evidence existed.
 Finding timestamps describe notice receipt, not the auditor's observation boundary, which the host
 does not supply. Cited evidence may therefore precede receipt; assess whether it answers the actual
 claim and covers the relevant revision, not its order relative to delivery. Never recommend a rerun
@@ -288,8 +294,14 @@ function snapshotField(
   return trimmed;
 }
 
-/** Zero-width and bidirectional formatting characters: invisible, yet able to disguise text in a dialog. */
-const INVISIBLE_FORMAT = /[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
+/**
+ * Invisible format characters (Unicode Cf): zero-width and bidirectional controls, the Arabic letter mark,
+ * word joiner, soft hyphen, Mongolian vowel separator and the tag block (U+E0000-E007F, "ASCII smuggling").
+ * They can disguise text in a dialog or carry hidden instructions. Zero-width joiners are already removed,
+ * so emoji sequences in these sanitized fields were never joined; flag emoji built from tag characters
+ * lose their tags and fall back to the plain base emoji.
+ */
+const INVISIBLE_FORMAT = /\p{Cf}/gu;
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/g;
 
 /** Strip ANSI/control bytes and invisible formatting characters, and collapse whitespace so one field stays a single bounded line. */
@@ -330,6 +342,10 @@ function boundFinding(finding: VerificationFinding): VerificationFinding {
       ?.slice(-FINDING_LIMITS.repeatIds)
       .map((id) => collapse(id, FINDING_LIMITS.token)),
     lastRaisedAt: optionalLine(finding.lastRaisedAt, FINDING_LIMITS.token),
+    reraisesId: optionalLine(finding.reraisesId, FINDING_LIMITS.token),
+    reusedEvidenceIds: finding.reusedEvidenceIds
+      ?.slice(0, FINDING_LIMITS.evidence)
+      .map((id) => collapse(id, FINDING_LIMITS.token)),
     scopeUserEntryId: optionalLine(finding.scopeUserEntryId, FINDING_LIMITS.token),
     scopeUserText: optionalLine(finding.scopeUserText, FINDING_LIMITS.scopeText),
     status: finding.status,
@@ -536,10 +552,13 @@ function sanitizeAdvice(text: string): string {
 }
 
 const VERDICT = "KEEP|ADJUST|REPLAN|ESCALATE";
-// One verdict token, optionally bold, optionally followed by a rationale set off by a dash, colon or parenthesis.
+// One verdict token, bold before and/or after the colon and around the token, optionally followed by a
+// rationale set off by a dash, colon, parenthesis or a `.`/`,`/`;` separator (a bare trailing period is fine).
 // `KEEP | ADJUST | ...` (the prompt template echoed back) and `KEEP-ish` are not verdicts.
-const VERDICT_LINE = new RegExp(`^\\**VERDICT:\\**\\s*\\**(?:${VERDICT})\\**(?:\\s+[-\\u2013\\u2014:(]\\s*\\S.*)?$`);
-const SECTION_LINE = /^\**(VERDICT|ISSUES|ORCHESTRATION CHANGES|AVOID):/;
+const VERDICT_LINE = new RegExp(
+  `^\\**VERDICT\\**:\\**\\s*\\**(?:${VERDICT})\\**(?:[.,;]\\**(?:\\s+\\S.*)?|\\s+[-\\u2013\\u2014(]\\s*\\S.*|\\s*:\\s*\\S.*)?$`,
+);
+const SECTION_LINE = /^\**(VERDICT|ISSUES|ORCHESTRATION CHANGES|AVOID)\**:/;
 const SECTIONS = ["VERDICT", "ISSUES", "ORCHESTRATION CHANGES", "AVOID"];
 
 /**
@@ -569,6 +588,7 @@ export function formatFinding(finding: VerificationFinding): string {
     finding.occurredAt && `received ${finding.occurredAt} (observation time unavailable)`,
     finding.repeatCount &&
       `repeated ${finding.repeatCount}x${finding.lastRaisedAt ? `, latest ${finding.lastRaisedAt}` : ""}`,
+    finding.reraisesId && `re-raises ${finding.reraisesId} after its reported resolution`,
   ].filter(Boolean);
   const lines = [
     `- ${finding.id ? `${finding.id} ` : ""}[${provenance.join("; ")}]`,
@@ -596,6 +616,11 @@ export function formatFinding(finding: VerificationFinding): string {
       cited.push(`${transition.evidence.length - EVIDENCE_SHOWN} more cited`);
     }
     if (cited.length > 0) lines.push(`  Cited evidence: ${cited.join("; ")}`);
+    if (finding.reusedEvidenceIds?.length) {
+      lines.push(
+        `  Resolved again citing evidence the re-raised finding's resolution already cited: ${finding.reusedEvidenceIds.join(", ")}`,
+      );
+    }
   }
   return lines.join("\n");
 }
@@ -770,7 +795,9 @@ export async function runReview(
   let result: AttemptResult;
   try {
     result = await completeAttempt(1);
-    if (result.stopReason === "length" && !result.content.some((part) => part.type === "toolCall")) {
+    // A reasoning-off request would be identical to the one just sent; only retry when reasoning was on.
+    const couldReason = model.reasoning && thinkingLevel !== "off";
+    if (result.stopReason === "length" && !result.content.some((part) => part.type === "toolCall") && couldReason) {
       result = await completeAttempt(2, "no-reasoning");
     } else if (result.stopReason === "error") {
       result = await completeAttempt(2, "provider-retry");

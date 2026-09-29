@@ -1,5 +1,5 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -8,11 +8,13 @@ import { z } from "zod";
 import { renderStats } from "../src/commands.ts";
 import { normalizeConfig } from "../src/config.ts";
 import { registerOmOrche } from "../src/index.ts";
+import { RouteLogger } from "../src/logging.ts";
 import { HOST_SETUP_VERSION } from "../src/omp-setup.ts";
 import { OrcheRuntime } from "../src/runtime.ts";
-import { historySnapshotName, Telemetry } from "../src/telemetry.ts";
+import { historySnapshotName, Telemetry, type TelemetryOptions, type TelemetryWriteError } from "../src/telemetry.ts";
 import { SUBAGENT_LIFECYCLE_CHANNEL, SUBAGENT_PROGRESS_CHANNEL, trackWorkerUsage } from "../src/worker-usage.ts";
 import { clearRegistry, makeSession, registerAsMain } from "./harness.ts";
+import { registeredSession } from "./sessions.ts";
 import { firstRun, NO_TOOL_CALL, progress, publish, settled, turn } from "./worker-frames.ts";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
@@ -36,8 +38,8 @@ async function stateDir(active?: string): Promise<string> {
 	return dir;
 }
 
-async function loaded(dir: string, enabled = true): Promise<Telemetry> {
-	const telemetry = new Telemetry(dir);
+async function loaded(dir: string, enabled = true, options?: TelemetryOptions): Promise<Telemetry> {
+	const telemetry = new Telemetry(dir, options);
 	instances.push(telemetry);
 	telemetry.setEnabled(enabled);
 	await telemetry.load();
@@ -45,8 +47,8 @@ async function loaded(dir: string, enabled = true): Promise<Telemetry> {
 }
 
 /** A loaded telemetry following the worker frames of a fresh bus. */
-async function following(dir: string, enabled = true): Promise<{ telemetry: Telemetry; bus: EventBus }> {
-	const telemetry = await loaded(dir, enabled);
+async function following(dir: string, enabled = true, options?: TelemetryOptions): Promise<{ telemetry: Telemetry; bus: EventBus }> {
+	const telemetry = await loaded(dir, enabled, options);
 	const bus = new EventBus();
 	trackWorkerUsage(bus, telemetry);
 	return { telemetry, bus };
@@ -55,6 +57,12 @@ async function following(dir: string, enabled = true): Promise<{ telemetry: Tele
 /** Every path under `dir`, relative and sorted. */
 async function tree(dir: string): Promise<string[]> {
 	return (await readdir(dir, { recursive: true })).map(String).sort();
+}
+
+/** Why the last write of `telemetry` failed, while it keeps failing. */
+function writeErrorOf(telemetry: Telemetry): TelemetryWriteError | undefined {
+	const state = telemetry.state();
+	return state.kind === "active" ? state.writeError : undefined;
 }
 
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -633,6 +641,101 @@ describe("reset", () => {
 		expect(await new Telemetry(path.join(parent, "never-created")).reset()).toEqual([]);
 		expect(await tree(parent)).toEqual([]);
 	});
+
+	test("removes the staging directory of a lock acquisition that died, and nothing that only looks like one", async () => {
+		const dir = await stateDir();
+		const staging = path.join(dir, `telemetry.lock.${randomUUID()}.tmp`);
+		await mkdir(staging);
+		await writeFile(path.join(staging, randomUUID()), "");
+		await writeFile(path.join(dir, "telemetry.lock.backup"), "x");
+
+		const removed = await new Telemetry(dir).reset();
+
+		expect(removed).toEqual([staging]);
+		expect(await tree(dir)).toEqual(["telemetry.lock.backup"]);
+	});
+});
+
+describe("a write that cannot reach the disk", () => {
+	/** A loaded telemetry over `dir`, following a fresh bus, whose warnings land in `warnings` and which retries a failed write within milliseconds. */
+	async function watched(dir: string, warnings: string[]) {
+		const logger = new RouteLogger({
+			debug() {},
+			info() {},
+			error() {},
+			warn: (message: string) => void warnings.push(message),
+		} as unknown as ExtensionAPI["logger"]);
+		return following(dir, true, { logger, flushDebounceMs: 20 });
+	}
+
+	/** Put a plain file where the state directory is, so that no write can succeed, whoever runs the test (permissions do not stop root). */
+	async function blockStateDir(dir: string): Promise<void> {
+		await rm(dir, { recursive: true });
+		await writeFile(dir, "not a directory");
+	}
+
+	async function unblockStateDir(dir: string): Promise<void> {
+		await rm(dir, { force: true });
+		// A retry may recreate the directory between these two calls.
+		await mkdir(dir, { recursive: true });
+	}
+
+	/** Wait for something only a retry timer brings about; elapsed time is the point, so this polls. */
+	async function eventually(condition: () => boolean): Promise<void> {
+		for (let attempt = 0; attempt < 400; attempt++) {
+			if (condition()) return;
+			await Bun.sleep(5);
+		}
+		throw new Error("the retry did not happen");
+	}
+
+	test("is shown in the state and in the stats, warned about once, retried without a new frame, and forgotten once it lands", async () => {
+		const dir = await stateDir();
+		const warnings: string[] = [];
+		const { telemetry, bus } = await watched(dir, warnings);
+		await blockStateDir(dir);
+		firstRun([bus], "0-W", FIRST);
+
+		await telemetry.flush();
+
+		// Nothing reached the disk, and the process says so instead of looking healthy.
+		const failure = writeErrorOf(telemetry);
+		expect(failure?.attempts).toBeGreaterThanOrEqual(1);
+		expect(failure?.message).toContain(dir);
+		expect(renderStats({ telemetry, config: normalizeConfig(undefined) } as unknown as OrcheRuntime)).toContain(failure?.message ?? "");
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain(telemetry.file);
+		// Nobody flushes again, yet the write is retried; the same failure is not warned about twice.
+		await eventually(() => (writeErrorOf(telemetry)?.attempts ?? 0) >= 3);
+		expect(warnings).toHaveLength(1);
+		expect(telemetry.snapshot().workers.task).toMatchObject({ startedObserved: 1, completed: 1 });
+
+		await unblockStateDir(dir);
+		await eventually(() => writeErrorOf(telemetry) === undefined);
+		expect(JSON.parse(await readFile(telemetry.file, "utf8")).workers.task).toMatchObject({ startedObserved: 1, completed: 1 });
+		expect(telemetry.state()).toEqual({ kind: "active" });
+		expect(warnings).toHaveLength(1);
+	});
+
+	test("a failure after a recovery is warned about again", async () => {
+		const dir = await stateDir();
+		const warnings: string[] = [];
+		const { telemetry, bus } = await watched(dir, warnings);
+		await blockStateDir(dir);
+		firstRun([bus], "0-a", FIRST);
+		await telemetry.flush();
+		expect(warnings).toHaveLength(1);
+
+		await unblockStateDir(dir);
+		await telemetry.flush();
+		expect(writeErrorOf(telemetry)).toBeUndefined();
+
+		await blockStateDir(dir);
+		firstRun([bus], "0-b", FIRST);
+		await telemetry.flush();
+		expect(writeErrorOf(telemetry)).toBeDefined();
+		expect(warnings).toHaveLength(2);
+	});
 });
 
 describe("several processes sharing one state directory", () => {
@@ -804,6 +907,51 @@ describe("several processes sharing one state directory", () => {
 			expect(await tree(dir)).toEqual(["telemetry.json"]);
 		});
 
+		test("writers that race to break a dead process's lock all land their counts", async () => {
+			// Ten writers, over rounds enough that a break which does not check who holds the lock by then would lose counts in some.
+			// They poll quickly: the default interval would make each round wait on it, not on the race.
+			const writers = 10;
+			const lock = { pollMs: 2 };
+			for (let round = 0; round < 12; round++) {
+				const dir = await stateDir();
+				const processes = await Promise.all(Array.from({ length: writers }, () => following(dir, true, { lock })));
+				await writeFile(lockOf(dir), "dead-process");
+				const longAgo = new Date(Date.now() - 60_000);
+				await utimes(lockOf(dir), longAgo, longAgo);
+				processes.forEach(({ bus }, index) => firstRun([bus], `0-w${index}`, FIRST));
+
+				await Promise.all(processes.map(({ telemetry }) => telemetry.flush()));
+
+				expect((await persisted(dir)).workers.task).toMatchObject({
+					startedObserved: writers,
+					completed: writers,
+					tokens: 500 * writers,
+				});
+				expect(await tree(dir)).toEqual(["telemetry.json"]);
+			}
+		});
+
+		test("writers whose locks are broken under them keep their counts and land them on a later attempt", async () => {
+			// A stale limit this short makes every writer that is slow look dead, as a process stopped inside its critical
+			// section would: its publication must fail and leave its counts for the next attempt, never overwrite or drop anything.
+			const dir = await stateDir();
+			const lock = { staleMs: 6, waitMs: 10_000, pollMs: 1 };
+			const processes = await Promise.all(Array.from({ length: 4 }, () => following(dir, true, { lock })));
+			processes.forEach(({ bus }, index) => {
+				for (let worker = 0; worker < 3; worker++) firstRun([bus], `0-p${index}w${worker}`, FIRST);
+			});
+
+			let unfinished = true;
+			for (let attempt = 0; unfinished && attempt < 500; attempt++) {
+				await Promise.all(processes.map(({ telemetry }) => telemetry.flush()));
+				unfinished = processes.some(({ telemetry }) => writeErrorOf(telemetry) !== undefined);
+			}
+
+			expect(unfinished).toBe(false);
+			expect((await persisted(dir)).workers.task).toMatchObject({ startedObserved: 12, completed: 12, tokens: 500 * 12 });
+			expect(await tree(dir)).toEqual(["telemetry.json"]);
+		});
+
 		test("telemetry turned off while a migration waits for the lock is not migrated", async () => {
 			const dir = await stateDir(V5_TEXT);
 			await writeFile(lockOf(dir), "other-process");
@@ -842,8 +990,10 @@ describe("several processes sharing one state directory", () => {
 
 			expect(await tree(dir)).toEqual([]);
 			expect(telemetry.snapshot().workers.task).toMatchObject({ startedObserved: 1, completed: 1 });
+			expect(writeErrorOf(telemetry)?.message).toContain(dir);
 			await telemetry.flush();
 			expect((await persisted(dir)).workers.task).toMatchObject({ startedObserved: 1, completed: 1 });
+			expect(writeErrorOf(telemetry)).toBeUndefined();
 		});
 	});
 
@@ -1120,30 +1270,74 @@ describe("subagent sessions and the process's shared telemetry", () => {
 		expect(JSON.parse(await readFile(main.runtime.telemetry.file, "utf8")).version).toBe(6);
 	});
 
-	test("reloading configuration switches telemetry, unless the caller is a subagent", async () => {
-		const runtime = new OrcheRuntime({ logger: { debug() {}, warn() {}, info() {}, error() {} } } as unknown as ExtensionAPI, await stateDir());
-		instances.push(runtime.telemetry);
-		const bus = new EventBus();
-		trackWorkerUsage(bus, runtime.telemetry);
-		const recorded = () => runtime.telemetry.snapshot().workers.task?.startedObserved ?? 0;
-		const off = await project(false);
-		const on = await project(true);
+	test("a running main session's recording follows telemetryEnabled as it changes in the stored settings, from its next turn on", async () => {
+		const app = host(await stateDir());
+		const cwd = await project(false);
+		const ctx = sessionIn(cwd, true);
+		await app.start(ctx);
+		const recorded = () => app.runtime.telemetry.snapshot().workers.task?.startedObserved ?? 0;
 
-		await runtime.reloadConfig(off);
-		firstRun([bus], "0-a", FIRST);
+		firstRun([app.bus], "0-a", FIRST);
 		expect(recorded()).toBe(0);
 
-		await runtime.reloadConfig(on, { drivesTelemetry: false });
-		firstRun([bus], "0-b", FIRST);
+		// Switched on in the store: the running session keeps its choice until its next turn reads the store.
+		await setTelemetryOverride(cwd, true);
+		firstRun([app.bus], "0-b", FIRST);
 		expect(recorded()).toBe(0);
-
-		await runtime.reloadConfig(on);
-		firstRun([bus], "0-c", FIRST);
+		await app.runtime.syncConfig(ctx);
+		firstRun([app.bus], "0-c", FIRST);
 		expect(recorded()).toBe(1);
 
-		await runtime.reloadConfig(off, { drivesTelemetry: false });
-		firstRun([bus], "0-d", FIRST);
-		expect(recorded()).toBe(2);
+		await setTelemetryOverride(cwd, false);
+		await app.runtime.syncConfig(ctx);
+		firstRun([app.bus], "0-d", FIRST);
+		expect(recorded()).toBe(1);
+	});
+
+	const orders = [
+		["on", "off"],
+		["off", "on"],
+	] as const;
+	for (const order of orders) {
+		test(`two main sessions of one process each keep their own telemetry choice, whichever reads its configuration last (${order.join(" then ")})`, async () => {
+			const dir = await stateDir();
+			const apps = { on: host(dir), off: host(dir) };
+			const contexts = {
+				on: registeredSession("acp:on", await project(true)),
+				off: registeredSession("acp:off", await project(false)),
+			};
+			for (const choice of order) await apps[choice].start(contexts[choice]);
+
+			firstRun([apps.on.bus], "0-on", FIRST);
+			firstRun([apps.off.bus], "0-off", SECOND);
+			await apps.on.runtime.telemetry.flush();
+
+			// The session that opted out records nothing, the other one's worker is written.
+			const file = JSON.parse(await readFile(apps.on.runtime.telemetry.file, "utf8"));
+			expect(file.workers.task).toMatchObject({ startedObserved: 1, completed: 1, tokens: 500 });
+		});
+	}
+
+	test("a subagent's workers, and its own subagents', follow the main session above them, whatever their working directories say", async () => {
+		for (const [mainOn, workersOn] of [[false, true], [true, false]] as const) {
+			clearRegistry();
+			const dir = await stateDir();
+			const main = host(dir);
+			const worker = host(dir);
+			const nested = host(dir);
+			await main.start(registeredSession("acp:1", await project(mainOn)));
+			await worker.start(registeredSession("1-worker", await project(workersOn), "acp:1"));
+			await nested.start(registeredSession("2-nested", await project(workersOn), "1-worker"));
+
+			firstRun([main.bus], "0-main", FIRST);
+			firstRun([worker.bus], "1-a", FIRST);
+			firstRun([nested.bus], "2-a", SECOND);
+			await main.runtime.telemetry.flush();
+
+			// All three sessions' workers count, or none: the subagents' own directories decided nothing, and their
+			// starts left the main session's choice as it was.
+			expect(main.runtime.telemetry.snapshot().workers.task?.startedObserved ?? 0).toBe(mainOn ? 3 : 0);
+		}
 	});
 
 	test("two sessions of one process that allocate the same worker id run two workers, not one", async () => {
