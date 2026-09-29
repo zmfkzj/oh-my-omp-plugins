@@ -21,6 +21,7 @@ import type { RouteLogger } from "./logging.ts";
 import {
 	buildPolicyNotice,
 	currentTurnNotices,
+	isTurnStartEntry,
 	isTurnUserMessage,
 	NATIVE_ORCHESTRATE_NOTICE_TYPE,
 	NATIVE_WORKFLOW_NOTICE_TYPE,
@@ -83,6 +84,8 @@ interface TurnState {
 
 export class OrchestrationRouter {
 	#turn: TurnState | undefined;
+	/** The latest governed prompt while it is unconfirmed as a user turn, with the turn it displaced. */
+	#pending: { prompt: string; previous: TurnState | undefined } | undefined;
 	readonly #deps: OrchestrationRouterDeps;
 
 	constructor(deps: OrchestrationRouterDeps) {
@@ -90,22 +93,31 @@ export class OrchestrationRouter {
 	}
 
 	/**
-	 * Gate before delivery. A governed user prompt starts a new turn (only a retry prepared after
-	 * the same committed user entry reuses one); a gated user prompt clears it. A synthetic prompt
-	 * or a call from another session belongs to no user request: it keeps the ongoing turn, whose
-	 * policy also covers autonomous continuations (worker results, worker messages).
+	 * Gate before delivery. A governed prompt starts a new turn (only a retry prepared after the
+	 * same committed turn-starting entry reuses one) unless the first request shows it to be a
+	 * synthetic prompt (`#settle`); a gated user prompt clears the turn. A synthetic `<system-…`
+	 * prompt or a call from another session belongs to no user request: it keeps the ongoing turn,
+	 * whose policy also covers autonomous continuations (worker results, worker messages).
 	 */
 	beginTurn(ctx: ExtensionContext, prompt: string): void {
 		const gate = gateRequest(ctx, prompt, this.#deps.config());
 		if (!gate.ok) {
-			if (gate.reason !== "synthetic-notice" && gate.reason !== "not-main-session") this.#turn = undefined;
+			if (gate.reason !== "synthetic-notice" && gate.reason !== "not-main-session") {
+				this.#turn = undefined;
+				this.#pending = undefined;
+			}
 			this.#deps.logger.policy({ skip: gate.reason });
 			return;
 		}
-		const preparedAfterUserId = gate.session.sessionManager.getBranch().findLast(entry =>
-			entry.type === "message" && isTurnUserMessage(entry.message))?.id;
+		const preparedAfterUserId = gate.session.sessionManager.getBranch().findLast(isTurnStartEntry)?.id;
 		if (this.#turn?.prompt === prompt && this.#turn.session === gate.session &&
 			this.#turn.preparedAfterUserId === preparedAfterUserId) return;
+		// `before_agent_start` does not say who authored the prompt, so the new turn is provisional
+		// until the first request shows the delivered message (see `#settle`).
+		this.#pending = {
+			prompt,
+			previous: this.#pending?.prompt === prompt ? this.#pending.previous : this.#turn,
+		};
 		this.#turn = {
 			prompt, session: gate.session, preparedAfterUserId,
 			natives: [], workflow: false, notices: {}, logged: undefined,
@@ -115,6 +127,29 @@ export class OrchestrationRouter {
 	/** Forget the turn, e.g. when the session it belongs to is replaced. */
 	resetTurn(): void {
 		this.#turn = undefined;
+		this.#pending = undefined;
+	}
+
+	/**
+	 * A prompt that reached `before_agent_start` is synthetic when the message delivered for it,
+	 * the newest one whose text is the prompt, is not a turn-starting one (OMP's auto-continue after
+	 * compaction, plan-approved, manual-continue and guided-goal prompts are agent-attributed
+	 * `developer` messages; hidden next-turn prompts are agent-attributed custom ones). Such a
+	 * prompt belongs to no user request: the turn it displaced continues. Anything else, including a
+	 * batch of queued user messages whose joined text matches no single message, starts the turn.
+	 */
+	#settle(messages: readonly AgentMessage[]): void {
+		const pending = this.#pending;
+		if (!pending) return;
+		this.#pending = undefined;
+		const delivered = messages.findLast(message => {
+			if (message.role !== "user" && message.role !== "developer" && message.role !== "custom") return false;
+			const text = typeof message.content === "string"
+				? message.content
+				: message.content.map(part => part.type === "text" ? part.text : "").join("");
+			return text === pending.prompt;
+		});
+		if (delivered && !isTurnUserMessage(delivered)) this.#turn = pending.previous;
 	}
 
 	/**
@@ -124,6 +159,7 @@ export class OrchestrationRouter {
 	 * other messages are left untouched, and no message object is mutated.
 	 */
 	applyToContext(ctx: ExtensionContext, messages: AgentMessage[]): AgentMessage[] | undefined {
+		if (mainSessionOf(ctx)) this.#settle(messages);
 		const turn = this.#turn;
 		if (!turn || turn.session !== mainSessionOf(ctx) || !gateRequest(ctx, turn.prompt, this.#deps.config()).ok) {
 			return undefined;

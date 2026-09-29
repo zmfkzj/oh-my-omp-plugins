@@ -17,6 +17,8 @@
  * never changes tools, models or permissions.
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { isUserTurnInitiator } from "@oh-my-pi/pi-coding-agent";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 
 /** This plugin's notice; distinct from OMP's so neither is mistaken for the other. */
 export const POLICY_NOTICE_TYPE = "om-orche-policy-notice";
@@ -40,20 +42,43 @@ export function policyModeOf(message: AgentMessage | undefined): PolicyMode | un
 	return MODES.find(candidate => candidate === mode);
 }
 
-/** Agent steering continues the current request; only user input starts another turn. */
+/**
+ * Agent steering continues the current request; user input starts another turn. A user-invoked
+ * `/skill:` prompt or a writable-collab peer's prompt reaches the model as a user-attributed
+ * `custom` message and starts a turn like one, so the host's own predicate decides it.
+ */
 export function isTurnUserMessage(message: AgentMessage | undefined): boolean {
+	if (message?.role === "custom") return isUserTurnInitiator(message);
 	return message?.role === "user" && !(message.steering === true && message.attribution === "agent");
 }
 
 /**
+ * The same test for a persisted branch entry: a `/skill:` prompt is stored as a `custom_message`
+ * entry, not a `message` entry.
+ */
+export function isTurnStartEntry(entry: SessionEntry): boolean {
+	if (entry.type === "message") return isTurnUserMessage(entry.message);
+	return entry.type === "custom_message" && isUserTurnInitiator({
+		role: "custom",
+		customType: entry.customType,
+		content: entry.content,
+		display: entry.display,
+		details: entry.details,
+		attribution: entry.attribution,
+		timestamp: 0,
+	});
+}
+
+/**
  * First index of the current user's turn: keyword notices are queued as custom
- * messages immediately before that user message. `-1` when no user message exists.
+ * messages immediately before the turn-starting message, which may itself be a custom
+ * message (a skill prompt) and is then never part of that prefix. `-1` when none exists.
  */
 export function currentTurnStart(messages: readonly AgentMessage[]): number {
 	let index = messages.length - 1;
 	while (index >= 0 && !isTurnUserMessage(messages[index])) index--;
 	if (index < 0) return -1;
-	while (index > 0 && messages[index - 1]?.role === "custom") index--;
+	while (index > 0 && messages[index - 1]?.role === "custom" && !isTurnUserMessage(messages[index - 1])) index--;
 	return index;
 }
 
@@ -64,7 +89,7 @@ export function currentTurnNotices(messages: readonly AgentMessage[], customType
 	if (start < 0) return found;
 	for (let index = start; index < messages.length; index++) {
 		const message = messages[index];
-		if (message?.role !== "custom") break;
+		if (message?.role !== "custom" || isTurnUserMessage(message)) break;
 		if (message.customType === customType) found.push(index);
 	}
 	return found;

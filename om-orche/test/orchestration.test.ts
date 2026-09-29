@@ -36,6 +36,16 @@ function nativeOrchestrate(timestamp = 1): AgentMessage {
 function nativeWorkflow(timestamp = 1): AgentMessage {
 	return { role: "custom", customType: NATIVE_WORKFLOW_NOTICE_TYPE, content: "workflow", display: false, attribution: "user", timestamp } as AgentMessage;
 }
+function skillPrompt(text: string, attribution: "user" | "agent" = "user"): AgentMessage {
+	return { role: "custom", customType: "skill-prompt", content: text, display: true, attribution, timestamp: 20 } as AgentMessage;
+}
+function customEntry(message: AgentMessage): SessionEntry {
+	const { customType, content, display, attribution } = message as Extract<AgentMessage, { role: "custom" }>;
+	return { type: "custom_message", customType, content, display, attribution, id: crypto.randomUUID(), parentId: null, timestamp: "2026-01-01" } as SessionEntry;
+}
+function autoContinue(text: string): AgentMessage {
+	return { role: "developer", content: [{ type: "text", text }], attribution: "agent", synthetic: true, timestamp: 30 } as AgentMessage;
+}
 function build(options: { session?: FakeSessionOptions; main?: boolean; config?: Partial<OrcheConfig>; debug?: boolean } = {}) {
 	const currentModel = options.session?.currentModel ?? fakeModel("p", "explicit-choice");
 	const branch = options.session?.branch ?? [];
@@ -310,6 +320,109 @@ describe("turn identity", () => {
 		expect(applied?.[0]).toBe(workflow);
 		expect(policyModeOf(applied?.[3])).toBe("default");
 		expect(applied?.[4]).toBe(steering);
+	});
+});
+
+describe("skill prompts", () => {
+	const SKILL = "[IMPORTANT: User invoked the \"fix\" skill; follow its instructions.]\nUser: fix the parser";
+
+	test("a user-invoked skill prompt starts the turn; its keyword prefix excludes it and agent-attributed ones do not", () => {
+		const messages = [assistant("older"), nativeOrchestrate(), skillPrompt(SKILL)];
+		expect(currentTurnNotices(messages, NATIVE_ORCHESTRATE_NOTICE_TYPE)).toEqual([1]);
+		expect(currentTurnNotices([nativeOrchestrate(), user("older"), skillPrompt(SKILL), assistant("done"), skillPrompt(SKILL)], NATIVE_ORCHESTRATE_NOTICE_TYPE)).toEqual([]);
+		const collab = { ...skillPrompt("from a peer"), customType: "collab-prompt" } as AgentMessage;
+		expect(currentTurnNotices([assistant("older"), nativeOrchestrate(), collab], NATIVE_ORCHESTRATE_NOTICE_TYPE)).toEqual([1]);
+		// An agent-attributed skill injection is a continuation, so the earlier user turn still owns the notices.
+		expect(currentTurnNotices([nativeOrchestrate(), user("request"), assistant("loading"), skillPrompt(SKILL, "agent")], NATIVE_ORCHESTRATE_NOTICE_TYPE)).toEqual([0]);
+	});
+
+	test("a skill turn after an orchestrate turn is a fresh default turn, notice placed before the skill message", () => {
+		const { router, ctx, branch } = build();
+		const first = user("orchestrate the ingestion refactor");
+		router.beginTurn(ctx, "orchestrate the ingestion refactor");
+		expect(modes(router.applyToContext(ctx, [nativeOrchestrate(), first]))).toEqual(["orchestrate"]);
+		branch.push(entry(first), entry(assistant("done")));
+		router.beginTurn(ctx, SKILL);
+		const skill = skillPrompt(SKILL);
+		const applied = router.applyToContext(ctx, [nativeOrchestrate(), first, assistant("done"), skill]);
+		expect(modes(applied)).toEqual(["default"]);
+		expect(policyModeOf(applied?.[3])).toBe("default");
+		expect(applied?.[4]).toBe(skill);
+		// The earlier turn's native notice is history, not this turn's.
+		expect(customCount(applied, NATIVE_ORCHESTRATE_NOTICE_TYPE)).toBe(1);
+	});
+
+	test("a native keyword notice queued before the skill message is replaced by exactly one plugin notice", () => {
+		const { router, ctx, branch } = build();
+		const previous = user("explain the parser");
+		branch.push(entry(previous), entry(assistant("explained")));
+		router.beginTurn(ctx, SKILL);
+		const skill = skillPrompt(SKILL);
+		const applied = router.applyToContext(ctx, [previous, assistant("explained"), nativeOrchestrate(5), skill]);
+		expect(modes(applied)).toEqual(["orchestrate"]);
+		expect(customCount(applied, NATIVE_ORCHESTRATE_NOTICE_TYPE)).toBe(0);
+		expect(policyModeOf(applied?.[2])).toBe("orchestrate");
+		expect(applied?.[3]).toBe(skill);
+		// A later worker delivery keeps the same notice even though the native one is no longer in the prefix.
+		const woken = router.applyToContext(ctx, [previous, assistant("explained"), nativeOrchestrate(5), skill, assistant("working"), asyncResult()]);
+		expect(modes(woken)).toEqual(["orchestrate"]);
+		expect(customCount(woken, NATIVE_ORCHESTRATE_NOTICE_TYPE)).toBe(0);
+	});
+
+	test("a persisted skill prompt separates repeated identical skill turns", () => {
+		const { router, ctx, branch } = build();
+		router.beginTurn(ctx, SKILL);
+		const skill = skillPrompt(SKILL);
+		expect(modes(router.applyToContext(ctx, [nativeOrchestrate(), skill]))).toEqual(["orchestrate"]);
+		branch.push(customEntry(skill), entry(assistant("done")));
+		router.beginTurn(ctx, SKILL);
+		const applied = router.applyToContext(ctx, [nativeOrchestrate(), skill, assistant("done"), skill]);
+		expect(modes(applied)).toEqual(["default"]);
+	});
+});
+
+describe("synthetic agent prompts", () => {
+	const RESUME = "Resume the user's latest intent. Re-read kept recent messages above the summary to confirm the latest request.";
+	const summary = { role: "compactionSummary", summary: "Earlier work.", tokensBefore: 1000, timestamp: 2 } as unknown as AgentMessage;
+
+	test("auto-continue after compaction keeps an explicit orchestrate or workflow turn", () => {
+		for (const [native, mode] of [[nativeOrchestrate(), "orchestrate"], [nativeWorkflow(), "workflow"]] as const) {
+			const { router, ctx, branch } = build();
+			const request = user("migrate everything");
+			router.beginTurn(ctx, "migrate everything");
+			const first = router.applyToContext(ctx, [native, request]);
+			expect(modes(first)).toEqual([mode]);
+			branch.push(entry(request));
+			router.beginTurn(ctx, RESUME);
+			const applied = router.applyToContext(ctx, [summary, assistant("working"), autoContinue(RESUME)]);
+			expect(modes(applied)).toEqual([mode]);
+			expect(applied?.[0]).toBe(summary);
+			expect(applied?.find(message => policyModeOf(message))).toEqual(first?.find(message => policyModeOf(message)));
+			// The same text typed by the user is a user request.
+			router.beginTurn(ctx, RESUME);
+			expect(modes(router.applyToContext(ctx, [summary, assistant("working"), user(RESUME)]))).toEqual(["default"]);
+		}
+	});
+
+	test("a synthetic prompt never starts a turn when none is in progress", () => {
+		const { router, ctx } = build();
+		router.beginTurn(ctx, RESUME);
+		expect(router.applyToContext(ctx, [summary, autoContinue(RESUME)])).toBeUndefined();
+	});
+
+	test("an agent-attributed hidden prompt or a batch of queued user messages is told apart by its delivery", () => {
+		const { router, ctx } = build();
+		router.beginTurn(ctx, PROMPT);
+		const notice = router.applyToContext(ctx, [user(PROMPT)])![0]!;
+		const hidden = { role: "custom", customType: "next-turn", content: "Check the results.", display: false, attribution: "agent", timestamp: 9 } as AgentMessage;
+		router.beginTurn(ctx, "Check the results.");
+		expect(router.applyToContext(ctx, [user(PROMPT), assistant("done"), hidden])?.[0]).toBe(notice);
+		// Joined queued user messages match no single message: still a user turn.
+		router.beginTurn(ctx, "First.\n\nSecond.");
+		const applied = router.applyToContext(ctx, [user(PROMPT), assistant("done"), user("First."), user("Second.")]);
+		expect(policyModeOf(applied?.[3])).toBe("default");
+		expect(applied?.[0]).toEqual(user(PROMPT));
+		expect(applied?.[0]).not.toBe(notice);
 	});
 });
 

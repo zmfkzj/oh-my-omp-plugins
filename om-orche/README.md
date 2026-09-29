@@ -296,15 +296,28 @@ autonomous continuations until the next user prompt. In OMP 18.4.1, async task
 results, re-yields of a messaged worker and worker messages that arrive while the
 main is idle start a turn without `before_agent_start` (agent-attributed
 `async-result` / `irc:incoming` messages), and the same notice is re-applied to
-them. A synthetic `<system-…` prompt that reaches `before_agent_start` continues
-the ongoing turn; it neither starts nor clears one. A gated user prompt (plugin
-disabled, slash command, plan mode, empty) clears the turn, as does a session
-switch (`/new`, resume, fork). Every request re-checks the gate, so enabling plan
-mode or disabling the plugin later withholds the notice.
+them. A synthetic prompt continues the ongoing turn; it neither starts nor clears
+one: a `<system-…` prompt, and any prompt whose delivered message is not
+turn-starting, such as OMP's auto-continue after compaction, the plan-approved and
+guided-goal kickoffs, the `.`/`c` continue shortcut and hidden agent-attributed
+prompts (`before_agent_start` carries only the text, so the plugin looks at the
+message delivered for that text in the first request: an agent-attributed
+`developer` or `custom` message is synthetic, and text that matches no delivered
+message is a user request). So an explicit `orchestrate`/`workflow` turn survives
+compaction and its auto-continue, and after plan approval or a goal kickoff no
+policy applies until the next user prompt. A user-invoked `/skill:` prompt and a
+collab peer's prompt (user-attributed `custom` messages) start a turn like typed
+input. A gated user prompt (plugin disabled, slash command, plan mode, empty)
+clears the turn, as does a session switch (`/new`, resume, fork). Every request
+re-checks the gate, so enabling plan mode or disabling the plugin later withholds
+the notice.
 
-**Placement.** A notice the plugin adds goes before the last turn-starting user
-message (agent-attributed deliveries do not count), or at the end of context if
-compaction removed that message. A replaced native orchestrate notice keeps its
+**Placement.** A notice the plugin adds goes before the last turn-starting message
+(a user message, a user-invoked skill prompt or a collab prompt; agent-attributed
+deliveries do not count), or at the end of context if compaction removed that
+message. Native keyword notices OMP queues before a skill prompt
+(`/skill:x orchestrate`) belong to its turn and are replaced like those before a
+user message. A replaced native orchestrate notice keeps its
 position. Content and timestamp are identical across the requests of one turn.
 
 The policy is skipped (no notice) when the plugin is disabled (`enabled=false`,
@@ -506,6 +519,12 @@ When no WATCHDOG roster is configured, the Verification Auditor is the only
 advisor; the plugin removes OMP's synthesized default advisor. Explicit
 `WATCHDOG.yml` entries are retained, including a general advisor if desired.
 
+With `enabled=false` the plugin installs no auditor and rewrites no advisor notes,
+so OMP's native advisor roster and cards are untouched (the manual `orche_advisor`
+and `review_findings` tools remain available). The setting is read at session
+start: an auditor installed earlier in the same session stays in OMP's live roster
+until the next session start, though its notes are no longer rewritten.
+
 The standalone `orche-advisor` CLI remains available from this package:
 `bun bin/orche-advisor.ts examples/initial-plan.json --check` validates the
 input and model selection without requesting a review. The CLI uses
@@ -632,6 +651,10 @@ OMP has no install hook, so the setup runs at the first main-session start after
 the plugin is installed or linked (that is, when OMP first starts a main session
 with om-orche loaded). It never runs in a subagent session, and not while
 om-orche is disabled (`enabled=false`).
+
+"Main session" means any top-level session, including each ACP session (which the
+host registers as `acp:<sessionId>` rather than `Main`); spawned subagents and
+`/tan` clones are never main.
 
 It is **fill-only and runs once per installation**. Each item is handled by where
 its value currently comes from:
@@ -777,6 +800,28 @@ added together.
   of `task`; they are counted neither as new workers nor as usage. A worker
   evicted from the 4,096-entry tracking map, or cleared by `reset`, counts as
   newly observed if it runs again.
+- **Several OMP processes and subagents:** processes may share the state
+  directory. A process writes only the counts it recorded itself since its last
+  write, added to the file as it is at that moment while it holds
+  `telemetry.lock` (a short-lived file, present only during a write, a
+  migration or a reset), so no process overwrites another's counts. A write
+  that cannot get the lock within a second keeps its counts for the next flush;
+  a lock older than five seconds belongs to a process that died and is broken.
+  `/om-orche reset` takes the same lock before deleting. A process that then
+  finds the file it last wrote gone starts a new epoch (new id and start time)
+  with its next write and writes the counts it had not yet written into it, so a
+  reset in one process is not undone by another. Worker tracking is per process,
+  so a worker already running elsewhere settles into the new epoch without a
+  start of its own. Only the main session decides whether telemetry records and
+  loads or migrates the file: a subagent, whose working directory can differ
+  (an isolated worktree has no project override), never switches the setting.
+  `/om-orche stats` shows this process's last view of the file plus its own
+  unwritten counts; other processes' counts appear once this process has
+  written.
+- **A file replaced while a process runs:** every write reads the file again, so
+  a file another process replaced with a newer, an older or an unreadable one
+  is left untouched and recording is suspended, as at start-up; only a start-up
+  converts an older file.
 
 `/om-orche stats` shows the live epoch plus the read-only Jev-routing and tier
 eras. `decisions.jsonl` is no longer written; an existing file stays on disk
@@ -802,10 +847,13 @@ Migration is automatic, idempotent and non-destructive:
 - **Newer than this plugin:** the file is left untouched and recording is
   suspended until `/om-orche reset`.
 - A failed backup or write leaves the original active and suspends recording.
+- **Several processes migrating at once:** the backup and the conversion both
+  run under the same lock, on the file as it is once the lock is held; a
+  process that gets there second takes the first one's v6 file.
 
 `reset` deletes only plugin-owned files (`telemetry.json`, `decisions.jsonl`,
 migration temporaries, `telemetry.v<N>.json` backups and `telemetry-history/`
-snapshots) and reports any it could not remove.
+snapshots) while holding the lock, and reports any it could not remove.
 
 ### Rolling back
 
@@ -1054,7 +1102,7 @@ notice mechanism was not changed in the Judgment/Production cutover.
   reload.
 
 **OMP setup (2026-09-29).** `bun run check` clean; `bun run lint` 0 errors (2
-existing `no-control-regex` warnings); `bun test` 208 pass, 0 fail across 14
+existing `no-control-regex` warnings); `bun test` 240 pass, 0 fail across 15
 files. The full suite also passes with a temporary HOME and the real config roots
 sandbox-denied. Host scenarios, on the real OMP 18.4.3 CLI (and the pinned 18.4.1
 CLI for the fresh case), with an isolated HOME and agent directory,

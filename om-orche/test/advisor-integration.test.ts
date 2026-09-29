@@ -140,6 +140,49 @@ describe("the live advisor is only switched on for a value this run wrote", () =
   });
 });
 
+test("a disabled plugin leaves OMP's advisor roster and auditor notes untouched", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "om-orche-disabled-"));
+  tempRoots.push(root);
+  const { session, ctx } = makeSession();
+  let roster: AdvisorConfig[] | undefined;
+  Object.assign(session.sessionManager, { getCwd: () => root });
+  Object.assign(session.settings, { getAgentDir: () => root });
+  Object.assign(session, {
+    isAdvisorEnabled: () => true,
+    applyAdvisorConfigs: (configs: AdvisorConfig[]) => { roster = configs; },
+  });
+  registerAsMain(session);
+  const handlers: Record<string, Handler[]> = {};
+  let enabled = false;
+  registerOrcheAdvisor({
+    zod: z,
+    registerTool() {},
+    getActiveTools: () => [TOOL],
+    on(event: string, handler: Handler) { (handlers[event] ??= []).push(handler); },
+  } as unknown as ExtensionAPI, undefined, () => enabled);
+  const note = {
+    role: "custom", customType: "advisor", display: true, attribution: "agent", timestamp: 1,
+    content: "raw",
+    details: { notes: [{ note: "consider renaming foo", severity: "nit", advisor: AUDITOR_NAME }] },
+  } as AgentMessage;
+  const messages = [user(PROMPT), note];
+  const run = async (event: string, payload: unknown) => {
+    const results: unknown[] = [];
+    for (const handler of handlers[event] ?? []) results.push(await handler(payload, ctx));
+    return results;
+  };
+
+  await run("session_start", {});
+  expect(roster).toBeUndefined();
+  expect((await run("context", { type: "context", messages })).every(result => result === undefined)).toBe(true);
+
+  // Enabled, the same start installs the auditor and the same context is rewritten.
+  enabled = true;
+  await run("session_start", {});
+  expect(roster?.map(config => config.name)).toEqual([AUDITOR_NAME]);
+  expect((await run("context", { type: "context", messages })).some(result => result !== undefined)).toBe(true);
+});
+
 test("once the setup has run, a start registers no roles and enables nothing", async () => {
   const { store, written } = markerStore(1);
   const settings = Settings.isolated();
@@ -167,7 +210,8 @@ test("a disabled plugin leaves OMP unconfigured, the live advisor off and the ma
 
   expect(settings.getModelRole("verification-auditor")).toBeUndefined();
   expect(cfgAdvisorEnabled.get(settings)).toBe(false);
-  expect(app.timeline).toEqual(["isAdvisorEnabled=false"]);
+  expect(app.timeline).toEqual([]);
+  expect(app.roster).toEqual([]);
   expect(written).toEqual([]);
 });
 

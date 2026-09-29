@@ -13,6 +13,8 @@
  *   `telemetry.json`, preserved before migration replaced it.
  * - `decisions.jsonl` — the routing eras' per-decision log. It is no longer
  *   written or read; it stays on disk until a reset removes it.
+ * - `telemetry.lock` — exists only while a process reads and replaces
+ *   `telemetry.json`, or a reset deletes the files.
  *
  * An epoch is one span of measurements under one behavior. Migration moves a
  * v5 file's live epoch into `jevRouting`, carries its tier-routing
@@ -22,13 +24,23 @@
  * things — routing decisions and selections, and (in v5) workers counted once,
  * without their follow-up turns.
  *
+ * Several OMP processes may share one state directory. Each keeps only the
+ * counts it recorded itself since it last wrote, and a write adds them to the
+ * file as it is at that moment: the read, the merge and the atomic replacement
+ * happen under `telemetry.lock`, so no process overwrites another's counts. A
+ * reset deletes the files under the same lock. A process that finds the file it
+ * last wrote gone, because another process reset, starts a new epoch (new id,
+ * new start time) and writes its unwritten counts into it: only what is on disk
+ * is ever cleared, so a later write cannot undo a reset.
+ *
  * Live worker usage comes from OMP's subagent progress/lifecycle frames (see
  * `worker-usage.ts`). `ctx.sessionManager.getUsageStatistics()` is a single
  * session-wide total with no per-agent breakdown, so it cannot substitute.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { link, mkdir, open, readdir, readFile, rename, rmdir, unlink } from "node:fs/promises";
+import { type FileHandle, link, mkdir, open, readdir, readFile, rename, rmdir, stat, unlink } from "node:fs/promises";
 import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 
 const HISTOGRAM_BUCKETS = 10;
 export const TELEMETRY_VERSION = 6;
@@ -48,6 +60,13 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
 const FLUSH_DEBOUNCE_MS = 2000;
 /** Workers remembered for turn accounting and de-duplication across buses; bounded against leaks. */
 const MAX_TRACKED_WORKERS = 4096;
+/** Taken while one process reads and replaces `telemetry.json`, or a reset deletes the files: see {@link acquireLock}. */
+const LOCK_FILE = "telemetry.lock";
+/** A holder needs milliseconds; a lock this old was left behind by a process that died. */
+const LOCK_STALE_MS = 5_000;
+/** How long one write waits for another process's lock. OMP gives a `session_shutdown` handler 2 s in all. */
+const LOCK_WAIT_MS = 1_000;
+const LOCK_POLL_MS = 20;
 
 /** Front-door counters of the routing eras; only ever read back from older files. */
 export interface RouteCounters {
@@ -380,20 +399,6 @@ function reviveHistoricalWorker(fields: Record<string, unknown>): HistoricalWork
 	return counters;
 }
 
-/** Add every counter of `source` into `target`, histograms included. */
-function addCounters<T extends object>(target: T, source: T): T {
-	const fields = target as Record<string, unknown>;
-	for (const [key, value] of Object.entries(source)) {
-		const current = fields[key];
-		if (typeof current === "number" && typeof value === "number") {
-			fields[key] = current + value;
-		} else if (Array.isArray(current) && Array.isArray(value)) {
-			for (let index = 0; index < current.length; index++) current[index] += finite(value[index]) ?? 0;
-		}
-	}
-	return target;
-}
-
 /** A persisted `source` (`{ version, sha256 }`), or `undefined` when it does not identify a preserved original. */
 function sourceOf(value: unknown): HistoricalTelemetry["source"] | undefined {
 	const { version, sha256 } = fieldsOf(value);
@@ -475,13 +480,26 @@ function reviveSnapshot(raw: Record<string, unknown>): TelemetrySnapshot {
 	return snapshot;
 }
 
-/** Fold counts recorded before the file was read into the loaded snapshot. */
-function mergePending(loaded: TelemetrySnapshot, pending: TelemetrySnapshot): TelemetrySnapshot {
-	for (const [agent, counters] of Object.entries(pending.workers)) {
-		const existing = loaded.workers[agent];
-		loaded.workers[agent] = existing ? addCounters(existing, counters) : counters;
+/**
+ * `left` plus `right`, agent by agent, as fresh records. Both may hold
+ * increments, and an increment can be negative (a turn's unknown usage measured
+ * after the count of its unknown was already written); a sum is never brought
+ * below `floor`.
+ */
+function sumWorkers(
+	left: Record<string, LiveWorkerCounters>,
+	right: Record<string, LiveWorkerCounters>,
+	floor = Number.NEGATIVE_INFINITY,
+): Record<string, LiveWorkerCounters> {
+	const sum: Record<string, LiveWorkerCounters> = {};
+	for (const [agent, counters] of Object.entries(left)) sum[agent] = { ...counters };
+	for (const [agent, counters] of Object.entries(right)) {
+		const row = (sum[agent] ??= emptyLiveWorker());
+		for (const key of Object.keys(counters) as (keyof LiveWorkerCounters)[]) {
+			row[key] = Math.max(floor, row[key] + counters[key]);
+		}
 	}
-	return loaded;
+	return sum;
 }
 
 /** Cumulative within a turn, so a late or repeated frame never lowers what was seen. */
@@ -569,15 +587,116 @@ async function listNames(dir: string, failed: string[]): Promise<string[]> {
 	}
 }
 
+/** A file in a format before v6, exactly as read: its bytes identify the original a migration preserves. */
+interface OlderFile {
+	kind: "older";
+	bytes: Buffer;
+	raw: Record<string, unknown>;
+	source: HistoricalTelemetry["source"];
+}
+
+/** What `telemetry.json` holds at the moment it is read. */
+type DiskFile =
+	| { kind: "absent" }
+	| { kind: "current"; snapshot: TelemetrySnapshot }
+	| OlderFile
+	/** Written by a newer plugin, or not a telemetry file: left untouched. */
+	| { kind: "unusable"; state: TelemetryState };
+
+/** Read and classify `file`. Rejects when it exists but cannot be read. */
+async function readDisk(file: string): Promise<DiskFile> {
+	let bytes: Buffer;
+	try {
+		bytes = await readFile(file);
+	} catch (error) {
+		if (errorCode(error) === "ENOENT") return { kind: "absent" };
+		throw error;
+	}
+	const raw = parseObject(bytes);
+	const version = raw?.version ?? 0;
+	if (!raw || !isVersion(version)) {
+		const detail = raw ? `unrecognized version ${JSON.stringify(raw.version)}` : "not a JSON object";
+		return { kind: "unusable", state: { kind: "suspended", reason: "unreadable", detail } };
+	}
+	if (version > TELEMETRY_VERSION) {
+		return { kind: "unusable", state: { kind: "suspended", reason: "future-version", version } };
+	}
+	if (version === TELEMETRY_VERSION) return { kind: "current", snapshot: reviveSnapshot(raw) };
+	return { kind: "older", bytes, raw, source: { version, sha256: createHash("sha256").update(bytes).digest("hex") } };
+}
+
+/** Remove `lockFile` if its holder must have died; true when it is gone, so taking it can be retried at once. */
+async function breakStaleLock(lockFile: string): Promise<boolean> {
+	try {
+		if (Date.now() - (await stat(lockFile)).mtimeMs <= LOCK_STALE_MS) return false;
+		await unlink(lockFile);
+		return true;
+	} catch (error) {
+		return errorCode(error) === "ENOENT";
+	}
+}
+
 /**
- * In-memory worker counters with a debounced JSON sink.
+ * Take the exclusive lock on the state directory and resolve to its token. The
+ * lock is a file created atomically. A process that finds it taken polls for up
+ * to {@link LOCK_WAIT_MS}, then rejects and leaves its counts for the next
+ * flush. Critical sections take milliseconds, so a lock older than
+ * {@link LOCK_STALE_MS} is a dead process's and is broken.
+ */
+async function acquireLock(lockFile: string): Promise<string> {
+	const token = randomUUID();
+	const deadline = Date.now() + LOCK_WAIT_MS;
+	for (;;) {
+		let handle: FileHandle;
+		try {
+			handle = await open(lockFile, "wx");
+		} catch (error) {
+			if (errorCode(error) !== "EEXIST") throw error;
+			if (Date.now() >= deadline) throw new Error(`${lockFile} is held by another process`);
+			if (!(await breakStaleLock(lockFile))) await sleep(LOCK_POLL_MS);
+			continue;
+		}
+		try {
+			await handle.writeFile(token);
+		} catch (error) {
+			await unlink(lockFile).catch(() => {});
+			throw error;
+		} finally {
+			await handle.close();
+		}
+		return token;
+	}
+}
+
+/** Run `work` holding the state directory's lock. */
+async function underLock<T>(lockFile: string, work: () => Promise<T>): Promise<T> {
+	const token = await acquireLock(lockFile);
+	try {
+		return await work();
+	} finally {
+		try {
+			// A holder that outlived the stale limit may have lost the lock to another process: never remove that one.
+			if ((await readFile(lockFile, "utf8")) === token) await unlink(lockFile);
+		} catch {
+			// Already gone.
+		}
+	}
+}
+
+/**
+ * Worker counters with a debounced, merging JSON sink.
  *
  * One instance per state directory per process. Every session in an OMP
  * process — the main session and each subagent — builds its own extension
  * runtime (the factory runs per session), and they all target the same files;
- * separate instances would race and lose counts, so {@link Telemetry.shared}
- * hands them the same writer. Disabled telemetry never changes a file on disk
- * except through an explicit {@link Telemetry.reset}.
+ * separate instances would race, so {@link Telemetry.shared} hands them the
+ * same writer. Disabled telemetry never changes a file on disk except through
+ * an explicit {@link Telemetry.reset}.
+ *
+ * Other OMP processes write the same file, so an instance never writes totals
+ * of its own. It holds the file as it last saw it (`#base`) and the counts it
+ * recorded itself since (`#pending`), and a write adds the second to the file
+ * as it is at that moment, under the state directory's lock.
  */
 export class Telemetry {
 	static readonly #instances = new Map<string, Telemetry>();
@@ -596,22 +715,31 @@ export class Telemetry {
 		Telemetry.#instances.clear();
 	}
 
-	#snapshot = emptySnapshot();
+	/** The file as this process last read or wrote it: everything but the counts still `#pending`. */
+	#base = emptySnapshot();
+	/** The file existed, or this process wrote it, when this process last looked: finding it gone later means a reset elsewhere. */
+	#persisted = false;
+	/** Counts recorded since the last write began: increments over `#base`, not totals; a decrement can be among them. */
+	#pending: Record<string, LiveWorkerCounters> = {};
+	/** The increments a write in progress carries; they return to `#pending` if it fails. */
+	#inflight: Record<string, LiveWorkerCounters> = {};
 	#state: TelemetryState = { kind: "unloaded" };
 	#enabled = true;
 	#dirty = false;
 	#timer: Timer | undefined;
 	#loaded: Promise<void> | undefined;
-	/** Incremented by every reset; a load that started earlier must not apply its result. */
+	/** Incremented by every reset; a load or write that started earlier must not apply its result. */
 	#resets = 0;
 	/** Serializes snapshot writes and reset deletions in call order. */
 	#io: Promise<void> = Promise.resolve();
 	readonly #tracked = new Map<string, TrackedWorker>();
 	readonly #file: string;
+	readonly #lockFile: string;
 	readonly #historyDir: string;
 
 	constructor(stateDir: string) {
 		this.#file = path.join(stateDir, "telemetry.json");
+		this.#lockFile = path.join(stateDir, LOCK_FILE);
 		this.#historyDir = path.join(stateDir, HISTORY_DIR);
 	}
 
@@ -635,13 +763,14 @@ export class Telemetry {
 			// without a preserved original; the next load migrates the file first.
 			this.#state = { kind: "unloaded" };
 			this.#loaded = undefined;
-			delete this.#snapshot.historical;
-			delete this.#snapshot.jevRouting;
+			delete this.#base.historical;
+			delete this.#base.jevRouting;
 		}
 	}
 
+	/** What the file held when this process last looked, plus every count this process has recorded since. */
 	snapshot(): Readonly<TelemetrySnapshot> {
-		return this.#snapshot;
+		return { ...this.#base, workers: sumWorkers(this.#base.workers, sumWorkers(this.#inflight, this.#pending), 0) };
 	}
 
 	/** Read the persisted counters once, migrating an older file; later sessions reuse the result. Never rejects. */
@@ -654,47 +783,49 @@ export class Telemetry {
 
 	async #read(): Promise<void> {
 		const resets = this.#resets;
-		let bytes: Buffer;
+		let disk: DiskFile;
 		try {
-			bytes = await readFile(this.#file);
+			disk = await readDisk(this.#file);
 		} catch (error) {
-			if (resets !== this.#resets) return;
-			this.#state =
-				errorCode(error) === "ENOENT"
-					? { kind: "active" }
-					: { kind: "suspended", reason: "unreadable", detail: messageOf(error) };
+			if (resets === this.#resets) this.#state = { kind: "suspended", reason: "unreadable", detail: messageOf(error) };
 			return;
 		}
 		if (resets !== this.#resets) return;
-		const raw = parseObject(bytes);
-		const version = raw?.version ?? 0;
-		if (!raw || !isVersion(version)) {
-			const detail = raw ? `unrecognized version ${JSON.stringify(raw.version)}` : "not a JSON object";
-			this.#state = { kind: "suspended", reason: "unreadable", detail };
+		if (disk.kind !== "older") {
+			this.#adopt(disk);
 			return;
 		}
-		if (version > TELEMETRY_VERSION) {
-			this.#state = { kind: "suspended", reason: "future-version", version };
-			return;
-		}
-		if (version === TELEMETRY_VERSION) {
-			this.#snapshot = mergePending(reviveSnapshot(raw), this.#snapshot);
-			this.#state = { kind: "active" };
-			return;
-		}
-		const source = { version, sha256: createHash("sha256").update(bytes).digest("hex") };
-		this.#adoptEarlierEras(raw, source);
+		this.#adoptEarlierEras(disk.raw, disk.source);
 		if (!this.#enabled) {
-			this.#state = { kind: "deferred", ...source };
+			this.#state = { kind: "deferred", ...disk.source };
 			return;
 		}
 		try {
-			await this.#migrate(bytes, source);
-			if (resets === this.#resets) this.#state = { kind: "active" };
+			await this.#migrate();
 		} catch (error) {
 			if (resets === this.#resets) {
-				this.#state = { kind: "suspended", reason: "migration-failed", detail: messageOf(error), ...source };
+				this.#state = { kind: "suspended", reason: "migration-failed", detail: messageOf(error), ...disk.source };
 			}
+		}
+	}
+
+	/** Take what the file holds as this process's view of it; counts recorded before this stay pending on top. */
+	#adopt(disk: Exclude<DiskFile, OlderFile>): void {
+		switch (disk.kind) {
+			case "absent":
+				// Nothing to read: whatever was taken from an older file went with it.
+				this.#base = emptySnapshot(this.#base.epoch);
+				this.#persisted = false;
+				this.#state = { kind: "active" };
+				return;
+			case "current":
+				this.#base = disk.snapshot;
+				this.#persisted = true;
+				this.#state = { kind: "active" };
+				return;
+			case "unusable":
+				this.#state = disk.state;
+				return;
 		}
 	}
 
@@ -704,28 +835,47 @@ export class Telemetry {
 	 * era it carried; a pre-v5 file is the tier-routing era itself.
 	 */
 	#adoptEarlierEras(raw: Record<string, unknown>, source: HistoricalTelemetry["source"]): void {
+		delete this.#base.jevRouting;
+		delete this.#base.historical;
 		if (source.version === JEV_ROUTING_VERSION) {
-			this.#snapshot.jevRouting = jevRoutingFrom(raw, source);
+			this.#base.jevRouting = jevRoutingFrom(raw, source);
 			const carried = reviveHistorical(raw.historical);
-			if (carried) this.#snapshot.historical = carried;
+			if (carried) this.#base.historical = carried;
 		} else {
-			this.#snapshot.historical = historicalFrom(raw, source);
+			this.#base.historical = historicalFrom(raw, source);
 		}
 	}
 
 	/**
-	 * Replace an older `telemetry.json` with its v6 conversion. The original is
-	 * preserved first under a content-addressed name that is never overwritten;
-	 * the conversion then replaces the active file by atomic rename. Any failure
-	 * leaves the original active file in place, and a later load resumes with
-	 * the same backup and the same conversion.
+	 * Replace an older `telemetry.json` with its v6 conversion, under the lock, on
+	 * the file as it is once the lock is held. The original is preserved first
+	 * under a content-addressed name that is never overwritten; the conversion
+	 * then replaces the active file by atomic rename. If another process migrated
+	 * the file meanwhile (or a reset cleared it), what it left is taken instead.
+	 * Any failure leaves the original active file in place, and a later load
+	 * resumes with the same backup and the same conversion.
 	 */
-	async #migrate(bytes: Buffer, source: HistoricalTelemetry["source"]): Promise<void> {
-		await preserve(this.#historyDir, historySnapshotName(source.version, source.sha256), bytes);
-		// Writers are expected to be stopped; still, never replace a file that changed since it was read.
-		if (!(await readFile(this.#file)).equals(bytes)) throw new Error("telemetry.json changed during migration");
-		this.#snapshot.updatedAt = Date.now();
-		await replaceAtomically(this.#file, JSON.stringify(this.#snapshot));
+	async #migrate(): Promise<void> {
+		const resets = this.#resets;
+		await underLock(this.#lockFile, async () => {
+			const now = await readDisk(this.#file);
+			if (resets !== this.#resets) return;
+			if (now.kind !== "older") {
+				this.#adopt(now);
+				return;
+			}
+			this.#adoptEarlierEras(now.raw, now.source);
+			if (!this.#enabled) {
+				// Turned off while this waited for the lock: shown read-only, as a load that found it off shows it.
+				this.#state = { kind: "deferred", ...now.source };
+				return;
+			}
+			await preserve(this.#historyDir, historySnapshotName(now.source.version, now.source.sha256), now.bytes);
+			// Writers are expected to be stopped; still, never replace a file that changed since it was read.
+			if (!(await readFile(this.#file)).equals(now.bytes)) throw new Error("telemetry.json changed during migration");
+			await this.#persist(this.#base);
+			if (resets === this.#resets) this.#state = { kind: "active" };
+		});
 	}
 
 	/** Before the first load, counts are kept in memory and merged into what the load finds. */
@@ -755,10 +905,12 @@ export class Telemetry {
 	 * turns, each turn settles and is measured on its own (its progress restarts
 	 * from zero), and only the first turn observed is a new worker.
 	 *
-	 * Turns are told apart by their `started` frames. The same frame reaches the
-	 * process once per bus that carries it, and every bus reports a worker's turns
-	 * in the same order, so a bus's n-th turn is the worker's n-th; a frame of a
-	 * turn already counted is dropped whichever bus delivers it, however late.
+	 * Turns are told apart by their `started` frames. The same frame can reach
+	 * the process once per bus subscription that carries it (an extension only
+	 * subscribes to its session bus, `pi.events`; the host's tree-wide
+	 * observability bus is not among them), and every bus reports a worker's
+	 * turns in the same order, so a bus's n-th turn is the worker's n-th; a frame
+	 * of a turn already counted is dropped whichever bus delivers it, however late.
 	 * Two kinds of frame need a second look:
 	 *
 	 * - A worker's first turn publishes progress that has measured nothing yet
@@ -876,11 +1028,12 @@ export class Telemetry {
 		return track;
 	}
 
+	/** The pending row of `agent`, created on first use: increments over what the file holds. */
 	#counters(agent: string): LiveWorkerCounters {
-		const existing = this.#snapshot.workers[agent];
+		const existing = this.#pending[agent];
 		if (existing) return existing;
 		const created = emptyLiveWorker();
-		this.#snapshot.workers[agent] = created;
+		this.#pending[agent] = created;
 		return created;
 	}
 
@@ -898,30 +1051,90 @@ export class Telemetry {
 			await this.load();
 			if (this.#dirty && this.#writable()) {
 				this.#dirty = false;
-				const snapshot = this.#snapshot;
-				this.#enqueue(() => this.#write(snapshot));
+				this.#enqueue(() => this.#write());
 			}
 		}
 		await this.#io;
 	}
 
-	async #write(snapshot: TelemetrySnapshot): Promise<void> {
-		// A reset replaced the snapshot; the new one is written by its own flush.
-		if (snapshot !== this.#snapshot || !this.#writable()) return;
-		snapshot.updatedAt = Date.now();
+	/**
+	 * Add this process's pending counts to the file as it is now. Other processes
+	 * write it too, so it is read again under the lock and only increments are
+	 * merged in, never totals this process remembers.
+	 */
+	async #write(): Promise<void> {
+		if (!this.#writable()) return;
+		const resets = this.#resets;
 		try {
-			await replaceAtomically(this.#file, JSON.stringify(snapshot));
+			await mkdir(path.dirname(this.#file), { recursive: true });
+			await underLock(this.#lockFile, () => this.#merge());
 		} catch {
 			// A telemetry write must never break a turn; the next flush retries.
-			this.#dirty = true;
+			if (resets === this.#resets) this.#dirty = true;
 		}
+	}
+
+	/** The critical section of {@link Telemetry.flush}: the file is read as it is now and the pending counts join it. */
+	async #merge(): Promise<void> {
+		const resets = this.#resets;
+		const disk = await readDisk(this.#file);
+		// A reset, or telemetry being turned off, ran while this waited for the lock or the read.
+		if (resets !== this.#resets || !this.#writable()) return;
+		if (disk.kind === "unusable") {
+			this.#state = disk.state;
+			return;
+		}
+		if (disk.kind === "older") {
+			// Only a load converts an older file, and it preserves the original first.
+			const detail = `rewritten in the older v${disk.source.version} format by another process`;
+			this.#state = { kind: "suspended", reason: "unreadable", detail };
+			return;
+		}
+		let base = this.#base;
+		if (disk.kind === "current") base = disk.snapshot;
+		// A file this process wrote that is gone was cleared by a reset elsewhere: its epoch is over.
+		else if (this.#persisted) base = emptySnapshot();
+		if (Object.keys(this.#pending).length === 0) {
+			this.#base = base;
+			this.#persisted = disk.kind === "current";
+			return;
+		}
+		await this.#persist(base);
+	}
+
+	/**
+	 * Replace the file with `base` plus every pending count. The counts travel as
+	 * `#inflight` while the write runs, so `snapshot()` keeps them and a failed
+	 * write gives them back.
+	 */
+	async #persist(base: TelemetrySnapshot): Promise<void> {
+		const resets = this.#resets;
+		this.#inflight = this.#pending;
+		this.#pending = {};
+		const merged: TelemetrySnapshot = { ...base, updatedAt: Date.now(), workers: sumWorkers(base.workers, this.#inflight, 0) };
+		try {
+			await replaceAtomically(this.#file, JSON.stringify(merged));
+		} catch (error) {
+			// A reset that ran meanwhile has already dropped the counts.
+			if (resets === this.#resets) {
+				this.#pending = sumWorkers(this.#inflight, this.#pending);
+				this.#inflight = {};
+			}
+			throw error;
+		}
+		// A reset that ran meanwhile deletes this write next; its own state is not this one.
+		if (resets !== this.#resets) return;
+		this.#base = merged;
+		this.#persisted = true;
+		this.#inflight = {};
 	}
 
 	/**
 	 * Clear every count and start a new epoch, then delete the files this plugin
-	 * owns once queued writes and any load in progress have finished, so nothing
-	 * deleted is written back. Resolves to the removed paths; rejects naming each
-	 * path that could not be removed, after attempting all of them.
+	 * owns, under the state directory's lock, once queued writes and any load in
+	 * progress have finished, so nothing deleted is written back. Resolves to the
+	 * removed paths; rejects naming each path that could not be removed, after
+	 * attempting all of them.
 	 */
 	async reset(): Promise<string[]> {
 		if (this.#timer) {
@@ -930,7 +1143,10 @@ export class Telemetry {
 		}
 		const loading = this.#loaded;
 		this.#resets++;
-		this.#snapshot = emptySnapshot();
+		this.#base = emptySnapshot();
+		this.#persisted = false;
+		this.#pending = {};
+		this.#inflight = {};
 		this.#dirty = false;
 		this.#tracked.clear();
 		this.#state = { kind: "active" };
@@ -944,8 +1160,19 @@ export class Telemetry {
 		return removal;
 	}
 
-	/** Only exact plugin-owned names; other files, including user exports, are left alone. */
+	/** Delete the plugin's files while holding the lock, so no other process's write lands in the middle. */
 	async #removeOwnedFiles(): Promise<string[]> {
+		try {
+			return await underLock(this.#lockFile, () => this.#deleteOwnedFiles());
+		} catch (error) {
+			// No state directory, so nothing was ever written.
+			if (errorCode(error) === "ENOENT") return [];
+			throw error;
+		}
+	}
+
+	/** Only exact plugin-owned names; other files, including user exports, are left alone. */
+	async #deleteOwnedFiles(): Promise<string[]> {
 		const removed: string[] = [];
 		const failed: string[] = [];
 		const remove = async (file: string) => {

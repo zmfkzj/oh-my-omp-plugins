@@ -3,15 +3,20 @@
  *
  * Extensions load in subagent sessions too (a restricted child keeps its
  * parent's loaded extensions), so every main-session-only behavior has to test
- * identity rather than assume it. The registry holds the process's `Main`
- * agent; comparing its session manager against the handler's context is the
- * same check OMP's own primary-only extensions use.
+ * identity rather than assume it. A top-level session is registered as a
+ * `main` agent under an id the entry point picks: `Main` for the TUI, print and
+ * RPC modes, `acp:<sessionId>` for each ACP session. The check therefore looks
+ * for a `main` registry entry whose session manager is the handler's own,
+ * which is the identity test OMP's primary-only extensions rely on.
  */
-import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
-/** The live main session when `ctx` belongs to it, otherwise `undefined`. */
+/** The live top-level session when `ctx` belongs to it, otherwise `undefined`. */
 export function mainSessionOf(ctx: ExtensionContext): AgentSession | undefined {
-	const main = AgentRegistry.global().get(MAIN_AGENT_ID)?.session;
-	return main?.sessionManager === ctx.sessionManager ? main : undefined;
+	// `/tan` clones share a depth of 0 with the main session; the host reports them as "sub".
+	if (ctx.agent?.kind === "sub") return undefined;
+	return AgentRegistry.global()
+		.list()
+		.find(ref => ref.kind === "main" && ref.session?.sessionManager === ctx.sessionManager)?.session ?? undefined;
 }

@@ -24,9 +24,12 @@ export class OrcheRuntime {
 	#config: OrcheConfig = normalizeConfig(undefined);
 	#retiredConfigKeys: readonly string[] = [];
 
-	constructor(pi: ExtensionAPI) {
-		// Keep the existing data directory across the public package rename.
-		this.stateDir = path.join(getAgentDir(), "jev-router");
+	/**
+	 * `stateDir` defaults to the plugin's directory under OMP's agent directory,
+	 * which keeps its historical name across the public package rename.
+	 */
+	constructor(pi: ExtensionAPI, stateDir: string = path.join(getAgentDir(), "jev-router")) {
+		this.stateDir = stateDir;
 		this.telemetry = Telemetry.shared(this.stateDir);
 		this.logger = new RouteLogger(pi.logger);
 		this.orchestration = new OrchestrationRouter({ logger: this.logger, config: () => this.#config });
@@ -41,12 +44,19 @@ export class OrcheRuntime {
 		return this.#retiredConfigKeys;
 	}
 
-	async reloadConfig(cwd: string): Promise<OrcheConfig> {
+	/**
+	 * Re-read the configuration stored for `cwd`. Telemetry follows its
+	 * `telemetryEnabled` unless `drivesTelemetry` is false: every session in the
+	 * process shares one telemetry writer, so only the main session's project
+	 * configuration may switch it. A subagent's working directory can differ (an
+	 * isolated worktree has no project override) and must not switch it back.
+	 */
+	async reloadConfig(cwd: string, { drivesTelemetry = true } = {}): Promise<OrcheConfig> {
 		const loaded = await loadConfig(cwd);
 		this.#config = loaded.config;
 		this.#retiredConfigKeys = loaded.retiredKeys;
 		this.logger.setEnabled(this.#config.debugLogging);
-		this.telemetry.setEnabled(this.#config.telemetryEnabled);
+		if (drivesTelemetry) this.telemetry.setEnabled(this.#config.telemetryEnabled);
 		return this.#config;
 	}
 }

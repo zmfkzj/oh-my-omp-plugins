@@ -71,10 +71,13 @@ function workerKey(parentToolCallId: unknown, id: string): string {
 }
 
 /**
- * Subscribe `telemetry` to the `task` worker frames on `events`; returns the
- * unsubscriber. Telemetry tells buses apart by subscription, so several buses —
- * the host publishes each frame on the session bus and on the tree-wide
- * observability bus — may feed one `Telemetry` and each frame counts once.
+ * Subscribe `telemetry` to the `task` worker frames on `events`, the session
+ * bus an extension gets as `pi.events`; returns the unsubscriber. The host also
+ * publishes each frame on a tree-wide observability bus, which extensions never
+ * receive. Every session in the process, main and subagents, builds its own
+ * extension and subscribes its own bus to the process's one `Telemetry`; it
+ * tells subscriptions apart, so a frame that reaches it through more than one
+ * counts once.
  */
 export function trackWorkerUsage(events: EventBusLike, telemetry: Telemetry): () => void {
 	const source: WorkerSource = Symbol("task-worker-frames");

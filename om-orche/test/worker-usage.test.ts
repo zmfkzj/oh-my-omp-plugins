@@ -109,7 +109,7 @@ describe("frames recorded from the real host", () => {
 	];
 	const deliveries: Record<string, (main: EventBus, child: EventBus, frames: (typeof recordings)[number]["frames"]) => void> = {
 		"one bus": (main, _child, frames) => replay([main], frames),
-		"both buses, one payload per frame, as the host publishes": (main, child, frames) => replay([main, child], frames),
+		"two subscriptions, one payload per frame": (main, child, frames) => replay([main, child], frames),
 		"the whole recording repeated on a second bus afterwards": (main, child, frames) => {
 			replay([main], frames);
 			replay([child], frames);
@@ -297,7 +297,7 @@ describe("the turns of one worker", () => {
 
 describe("the same frames reaching telemetry from more than one bus", () => {
 	const deliveries: Record<string, (open: TurnEmitter, main: EventBus, child: EventBus) => void> = {
-		"one payload published on both buses, as the host does": (open, main, child) => {
+		"one payload delivered to both subscriptions": (open, main, child) => {
 			open([main, child], "0-W", FIRST);
 			turn([main, child], "0-W", SECOND);
 		},

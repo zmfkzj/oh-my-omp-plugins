@@ -22,19 +22,28 @@ import { OrcheRuntime } from "./runtime.ts";
 import { trackWorkerUsage } from "./worker-usage.ts";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
-export function registerOmOrche(pi: ExtensionAPI, setupStore: HostSetupStore = pluginSetupStore()): OrcheRuntime {
-	const runtime = new OrcheRuntime(pi);
+/** `setupStore` and `stateDir` default to the host's own; tests substitute theirs. */
+export function registerOmOrche(
+	pi: ExtensionAPI,
+	setupStore: HostSetupStore = pluginSetupStore(),
+	stateDir?: string,
+): OrcheRuntime {
+	const runtime = new OrcheRuntime(pi, stateDir);
 	pi.setLabel(PLUGIN_NAME);
 	registerCommands(pi, runtime);
 	registerFindingTools(pi);
 
 	pi.on("session_start", async (_event, ctx) => {
-		await runtime.reloadConfig(ctx.cwd);
+		// Every session in the process runs this handler, but they share one telemetry writer: only the
+		// main session's configuration may switch it, and only the main session loads it. A subagent's
+		// start must not flip the main's setting or migrate and write a file the main left alone.
+		const main = mainSessionOf(ctx) !== undefined;
+		await runtime.reloadConfig(ctx.cwd, { drivesTelemetry: main });
 		// One-time OMP setup. It must finish before the auditor installer registered by
 		// `registerOrcheAdvisor` runs in this same session_start, so OMP's live
 		// `advisor.enabled` toggle can start the auditor in the first session.
 		await runOmpSetup(ctx, { enabled: runtime.config.enabled, store: setupStore, logger: runtime.logger });
-		await runtime.telemetry.load();
+		if (main) await runtime.telemetry.load();
 	});
 	// Live usage covers workers named `task`, whichever native path spawned them.
 	const stopUsageTracking = trackWorkerUsage(pi.events, runtime.telemetry);

@@ -100,35 +100,40 @@ async function installVerificationAuditor(primary: AgentSession): Promise<void> 
 }
 
 
-export function registerOrcheAdvisor(pi: ExtensionAPI, reviewer: typeof runReview = runReview, guidanceEnabled: () => boolean = () => true): void {
+export function registerOrcheAdvisor(pi: ExtensionAPI, reviewer: typeof runReview = runReview, enabled: () => boolean = () => true): void {
   const z = pi.zod;
   const field = z.string().min(1).max(2000);
   let inFlight = false;
 
   // Only the explicit tool invokes the advisor model. Lifecycle hooks never request advice;
   // the auditor installed here is OMP's own passive advisor runtime, billed as an advisor.
+  // While the plugin is disabled the roster is left exactly as OMP built it. `enabled` is read
+  // at each event, but an auditor installed by an earlier enabled session_start stays in OMP's live
+  // roster (the session exposes no getter to reconstruct it), so disabling mid-session takes full
+  // effect at the next session start; only the contract rewriting stops at once.
   pi.on("session_start", async (_event, ctx) => {
     const primary = primarySession(ctx);
     if (!primary) {
-      pi.setActiveTools(pi.getActiveTools().filter((name) => name !== TOOL));
+      await pi.setActiveTools(pi.getActiveTools().filter((name) => name !== TOOL));
       return;
     }
-    await installVerificationAuditor(primary);
+    if (enabled()) await installVerificationAuditor(primary);
   });
   pi.on("before_agent_start", (event, ctx) => {
-    if (guidanceEnabled() && primarySession(ctx) && pi.getActiveTools().includes(TOOL)) {
+    if (enabled() && primarySession(ctx) && pi.getActiveTools().includes(TOOL)) {
       return { systemPrompt: [...event.systemPrompt, DEFAULT_GUIDANCE] };
     }
   });
   // Enforce the auditor's note contract in what the primary reads; runs whether or not the
-  // advice tool is active, because the auditor keeps running either way.
+  // advice tool is active, because the auditor keeps running either way, but never while the
+  // plugin is disabled (OMP's native advisor notes are then delivered untouched).
   pi.on("context", (event, ctx) => {
-    if (!primarySession(ctx)) return;
+    if (!enabled() || !primarySession(ctx)) return;
     const messages = enforceAuditorContract(event.messages);
     return messages && { messages };
   });
   pi.on("context", (event, ctx) => {
-    if (!guidanceEnabled() || !primarySession(ctx) || !pi.getActiveTools().includes(TOOL)) return;
+    if (!enabled() || !primarySession(ctx) || !pi.getActiveTools().includes(TOOL)) return;
 
     // The router's policy notice is provider-only and exists solely for the live turn, so its
     // orchestrate and workflow modes carry the guidance (never the default mode). Without one
