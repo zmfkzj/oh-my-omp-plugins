@@ -697,13 +697,14 @@ its value currently comes from:
 - set only for this session (CLI flag, `--config`, protocol pin) → nothing is
   written and that item stays pending, so a later session start tries again.
 
-The three items:
+The four items:
 
 | OMP key | value | why |
 | --- | --- | --- |
 | `advisor.enabled` | `true` | starts the bundled Verification Auditor. This is OMP's own advisor switch (default `false`), so it also applies to any advisors you declare in `WATCHDOG.yml` |
 | `modelRoles.verification-auditor` | `"@smol"` | the auditor's model. With `smol` unset, OMP resolves `@smol` to your default model |
 | `modelRoles.orche-advisor` | `"@slow"` | the plan advisor uses your Thinking model. With `slow` unset, OMP resolves `@slow` to your default model, so the advisor runs on the main model |
+| `task.maxRecursionDepth` | `1` | om-orche's main session owns all worker distribution, so workers must not spawn sub-workers. At depth `1` the main session (depth 0) can still delegate through `task`, while a worker (depth 1) runs its task directly. OMP's default is `2`. Do not set `0`: it removes `task` from the main session and disables Production delegation |
 
 **Cost.** With the auditor on, every turn adds a model call on
 `@verification-auditor`. In OMP 18.4.x, writing `advisor.enabled` during startup
@@ -715,7 +716,9 @@ change it, set explicit values yourself: `omp config set advisor.enabled false`
 `~/.omp/agent/config.yml`. Individual `modelRoles` entries cannot be set with
 `omp config set`; edit them in `config.yml`. Values you set before the first
 start are kept; values you change afterwards stick, because the setup never
-re-enables or rewrites anything once it has finished.
+re-enables or rewrites anything once it has finished. To allow deeper delegation
+again, set `omp config set task.maxRecursionDepth 2` (or any other value); a value
+in your global or project config is never overwritten.
 
 **Not set, on purpose:**
 
@@ -727,7 +730,7 @@ re-enables or rewrites anything once it has finished.
   written.
 
 **Once, and how it is recorded.** When every item is resolved (written or kept),
-om-orche stores an internal marker, `hostSetupVersion: 1`, in its plugin settings.
+om-orche stores an internal marker, `hostSetupVersion: 2`, in its plugin settings.
 It is not one of the [three settings](#configuration) and does not appear in
 `omp plugin config list`. With the marker present the setup does nothing, even if
 you later delete one of those OMP keys. If a write fails, the setup logs a
@@ -745,18 +748,21 @@ om-orche configured OMP once, filling only what was unset (existing values were 
   advisor.enabled: true
   modelRoles.verification-auditor: "@smol"
   modelRoles.orche-advisor: "@slow"
+  task.maxRecursionDepth: 1
 The Verification Auditor now reviews each turn with @verification-auditor.
 Edit roles in ~/.omp/agent/config.yml; `advisor.enabled` can also be changed with `omp config set advisor.enabled <true|false>`.
+The main session delegates through `task`; workers run their task directly. Allow deeper delegation with `omp config set task.maxRecursionDepth 2`.
 ```
 
-The last line varies with what was written: `Edit roles in
-~/.omp/agent/config.yml.` when only roles were written, and ``Change it with `omp
-config set advisor.enabled <true|false>`.`` when only `advisor.enabled` was
-written. In every mode an info line goes to the OMP log, again listing only what
-was written:
+The middle lines vary with what was written: the auditor line appears only when the
+auditor now runs; the roles line is ``Edit roles in ~/.omp/agent/config.yml.`` when
+only roles were written, and ``Change it with `omp config set advisor.enabled
+<true|false>`.`` when only `advisor.enabled` was written; the last line appears
+only when `task.maxRecursionDepth` was written. In every mode an info line goes to
+the OMP log, again listing only what was written:
 
 ```text
-om-orche OMP setup wrote advisor.enabled=true, modelRoles.verification-auditor="@smol", modelRoles.orche-advisor="@slow"
+om-orche OMP setup wrote advisor.enabled=true, modelRoles.verification-auditor="@smol", modelRoles.orche-advisor="@slow", task.maxRecursionDepth=1
 ```
 
 **Re-running.** Remove the marker, then start a new main session; the setup runs
@@ -764,14 +770,22 @@ again and is still fill-only. Any of these removes it: reinstalling the plugin
 (`omp plugin uninstall om-orche` first), `/om-orche reset`, or
 `omp plugin config delete om-orche hostSetupVersion`.
 
-**Existing installs.** If om-orche is already installed, the setup runs once at the
-next main-session start after you upgrade (fill-only).
+**Existing installs.** If om-orche is already installed without the marker, the
+setup runs once at the next main-session start after you upgrade (fill-only).
+
+**Upgrading from setup v1.** Each item carries the setup version that introduced
+it, and a run applies only items newer than the stored marker. An install with
+`hostSetupVersion: 1` therefore gets only `task.maxRecursionDepth` at its next
+main-session start (fill-only, so an existing value is kept), and the marker
+becomes `2`. `advisor.enabled` and the two roles are not touched again, so keys
+you deleted after the first setup stay deleted. Until that start, `/om-orche
+status` shows the setup as pending.
 
 ## Commands
 
 | Command | Effect |
 | --- | --- |
-| `/om-orche status` | Whether the plugin is enabled; execution policy (`judgment/production (om-orche-policy-notice)`, or `native (plugin disabled)`); primary model unchanged; native `task` worker and `@task` role; the `OMP setup` row: `applied (v1)` (the stored version, shown even when the plugin is disabled), `pending — applies at the next main session start`, or `skipped — plugin disabled`; retired settings and leftover tier roles still present. |
+| `/om-orche status` | Whether the plugin is enabled; execution policy (`judgment/production (om-orche-policy-notice)`, or `native (plugin disabled)`); primary model unchanged; native `task` worker and `@task` role; the `OMP setup` row: `applied (v2)` (the stored version, shown even when the plugin is disabled), `pending — applies at the next main session start` (also for an older stored version, such as `v1`), or `skipped — plugin disabled`; retired settings and leftover tier roles still present. |
 | `/om-orche stats` | Live-epoch task-worker usage, plus the read-only Jev-routing-era and tier-era history. It re-reads `telemetry.json` first, read-only, so counts other OMP processes have written are in it, and telemetry just turned on over an older file has migrated it. |
 | `/om-orche reset` | Clear plugin-owned telemetry files and the plugin's stored settings in OMP's plugin store. A project's `plugin-overrides.json` is never edited: keys it still sets are named and stay in effect. |
 
@@ -1063,8 +1077,9 @@ Turn on `debugLogging` and read the OMP log. Each governed turn logs
 | both a native notice and the plugin's seem missing | with `enabled=false` OMP's native behavior is untouched and the plugin adds nothing |
 | a native `orchestrate` request shows only one notice | expected: the plugin's `orchestrate` notice replaces the native one in place |
 | a worker cannot be messaged | the host reported it isolated or hard-aborted, or delivery failed; a new worker with the contract, changes and artifact references is the correct path. A missing "now idle" hint alone does not mean it cannot be continued |
-| `OMP setup` is not `applied (v1)` in status | `skipped — plugin disabled`: om-orche is disabled (`enabled=false`). `pending — applies at the next main session start`: no main session has started since install; an item is set only for the current session (CLI flag, `--config`, protocol pin), which leaves it pending until a session start without it; or a write failed, in which case the OMP log has the `om-orche OMP setup failed and will be retried at the next session start` warning and the next start retries |
+| `OMP setup` is not `applied (v2)` in status | `skipped — plugin disabled`: om-orche is disabled (`enabled=false`). `pending — applies at the next main session start`: no main session has started since install or since upgrading from setup v1; an item is set only for the current session (CLI flag, `--config`, protocol pin; RPC and ACP sessions pin `task.maxRecursionDepth` themselves), which leaves it pending until a session start without it; or a write failed, in which case the OMP log has the `om-orche OMP setup failed and will be retried at the next session start` warning and the next start retries |
 | the Verification Auditor does not run | `advisor.enabled` is off (the setup only fills it once; if you turned it off, it stays off), or `modelRoles.verification-auditor` is unset, or the plugin is disabled |
+| workers can spawn sub-workers, or `task` is missing in the main session | `task.maxRecursionDepth` is not `1`. The setup fills it once with `1`; a value you had set (`2` or more lets workers delegate, `0` removes `task` from the main session) is kept. Set `omp config set task.maxRecursionDepth 1` to restore the intended setup |
 | `orche_advisor` returns an error about a missing role | `modelRoles.orche-advisor` is unset. The setup fills it once with `@slow`; if the role was removed since, set it again under `modelRoles` in `~/.omp/agent/config.yml` |
 | `@task does not resolve in this session` in status | expected when `modelRoles.task` is unset: task workers use the main session's active model. Assign `modelRoles.task` in `config.yml` only if you want a different worker model |
 | `Retired settings still stored` in status | delete the listed keys with `omp plugin config delete om-orche <key>`; they have no effect |

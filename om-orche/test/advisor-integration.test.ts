@@ -110,7 +110,7 @@ test("the first main session start configures OMP and turns the live advisor on 
   expect(settings.getModelRole("verification-auditor")).toBe("@smol");
   expect(settings.getModelRole("orche-advisor")).toBe("@slow");
   expect(settings.getModelRole("advisor")).toBe("existing-advisor-model");
-  expect(written).toEqual([1]);
+  expect(written).toEqual([2]);
   // The live flag is switched on first, so the installer in the same start sees advisors enabled and installs.
   expect(app.timeline).toEqual(["isAdvisorEnabled=false", "setAdvisorEnabled(true)", "isAdvisorEnabled=true", "roster"]);
   expect(app.roster).toEqual([AUDITOR_NAME]);
@@ -231,7 +231,7 @@ test("an auditor dropped by /advisor configure is restored before the next promp
 });
 
 test("once the setup has run, a start registers no roles and enables nothing", async () => {
-  const { store, written } = markerStore(1);
+  const { store, written } = markerStore(2);
   const settings = Settings.isolated();
   const app = plugin(store, settings);
 

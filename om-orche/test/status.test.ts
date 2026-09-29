@@ -44,9 +44,14 @@ describe("OMP setup row", () => {
 		return renderStatus(pi, fakeRuntime([], config), ctx, setupStore(version));
 	}
 
-	test("a stored marker reports the setup as applied, even while the plugin is disabled", async () => {
-		expect(await rowFor(1)).toMatch(/OMP setup\s+applied \(v1\)/);
-		expect(await rowFor(1, { enabled: false })).toMatch(/OMP setup\s+applied \(v1\)/);
+	test("a stored marker of the current version reports the setup as applied, even while the plugin is disabled", async () => {
+		expect(await rowFor(2)).toMatch(/OMP setup\s+applied \(v2\)/);
+		expect(await rowFor(2, { enabled: false })).toMatch(/OMP setup\s+applied \(v2\)/);
+	});
+
+	test("a v1 marker is pending until the v2 item is applied", async () => {
+		expect(await rowFor(1)).toMatch(/OMP setup\s+pending — applies at the next main session start/);
+		expect(await rowFor(1, { enabled: false })).toMatch(/OMP setup\s+skipped — plugin disabled/);
 	});
 
 	test("without a marker the setup is pending, or skipped while the plugin is disabled", async () => {

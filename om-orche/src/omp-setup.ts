@@ -7,7 +7,8 @@
  *
  *   - `advisor.enabled: true`                    runs the bundled Verification Auditor;
  *   - `modelRoles.verification-auditor: "@smol"` the auditor's model role;
- *   - `modelRoles.orche-advisor: "@slow"`        the plan advisor's model role.
+ *   - `modelRoles.orche-advisor: "@slow"`        the plan advisor's model role;
+ *   - `task.maxRecursionDepth: 1`                (since v2) the main session delegates, workers cannot.
  *
  * The setup is fill-only and never overrides a user value; concrete model IDs
  * are never written. Each item is resolved by where its effective value comes from:
@@ -17,6 +18,10 @@
  *   - anything session-scoped (CLI flag, `--config` overlay, protocol default)
  *                               → left pending so a later start retries.
  *
+ * Every item carries the setup version that introduced it. A run applies only the
+ * items newer than the stored marker, so an install upgraded from an older version
+ * receives just the new items and never has an earlier item re-filled.
+ *
  * A marker in om-orche's plugin settings makes the setup one-time. It is written
  * only after every item is resolved and the written values are flushed to disk,
  * so a failed start retries. The marker is an undeclared internal key: it is not
@@ -25,6 +30,7 @@
  */
 import { cfgAdvisorEnabled } from "@oh-my-pi/pi-coding-agent/advisor/settings";
 import { PluginManager } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/manager";
+import { cfgTaskMaxRecursionDepth } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { PLUGIN_NAME } from "./config.ts";
 import { mainSessionOf } from "./host.ts";
 import { AUDITOR_ROLE } from "./verification-auditor.ts";
@@ -33,7 +39,7 @@ import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { RouteLogger } from "./logging.ts";
 
 /** Setup version this build applies; a stored marker at or above it ends the setup for good. */
-export const HOST_SETUP_VERSION = 1;
+export const HOST_SETUP_VERSION = 2;
 /** Key of the marker in om-orche's plugin settings map. */
 export const HOST_SETUP_KEY = "hostSetupVersion";
 
@@ -60,6 +66,8 @@ export function pluginSetupStore(): HostSetupStore {
 interface SetupItem {
 	key: string;
 	value: string;
+	/** Setup version that introduced the item; a stored marker at or above it skips the item. */
+	since: number;
 	/** Layer that supplies the effective value (`Settings.getProvenance` vocabulary). */
 	provenance(settings: Settings): string;
 	write(settings: Settings): void;
@@ -69,22 +77,32 @@ function roleItem(role: string, value: string): SetupItem {
 	return {
 		key: `modelRoles.${role}`,
 		value: JSON.stringify(value),
+		since: 1,
 		provenance: settings => settings.getModelRoleProvenance(role),
 		write: settings => settings.setModelRole(role, value),
 	};
 }
 
 const ADVISOR_ENABLED_KEY = "advisor.enabled";
+const RECURSION_DEPTH_KEY = "task.maxRecursionDepth";
 
 const SETUP_ITEMS: readonly SetupItem[] = [
 	{
 		key: ADVISOR_ENABLED_KEY,
 		value: "true",
+		since: 1,
 		provenance: settings => settings.getProvenance(cfgAdvisorEnabled),
 		write: settings => cfgAdvisorEnabled.set(settings, true),
 	},
 	roleItem(AUDITOR_ROLE, "@smol"),
 	roleItem("orche-advisor", "@slow"),
+	{
+		key: RECURSION_DEPTH_KEY,
+		value: "1",
+		since: 2,
+		provenance: settings => settings.getProvenance(cfgTaskMaxRecursionDepth),
+		write: settings => cfgTaskMaxRecursionDepth.set(settings, 1),
+	},
 ];
 
 /** User-owned layers: a value here is kept. */
@@ -111,11 +129,10 @@ function report(written: readonly SetupItem[], settings: Settings): string {
 		"om-orche configured OMP once, filling only what was unset (existing values were kept):",
 		...written.map(item => `  ${item.key}: ${item.value}`),
 	];
-	const advisorWritten = written.some(item => item.key === ADVISOR_ENABLED_KEY);
-	const rolesWritten = written.some(item => item.key !== ADVISOR_ENABLED_KEY);
-	const auditorRuns =
-		cfgAdvisorEnabled.get(settings) &&
-		(advisorWritten || written.some(item => item.key === `modelRoles.${AUDITOR_ROLE}`));
+	const wrote = (key: string) => written.some(item => item.key === key);
+	const advisorWritten = wrote(ADVISOR_ENABLED_KEY);
+	const rolesWritten = written.some(item => item.key.startsWith("modelRoles."));
+	const auditorRuns = cfgAdvisorEnabled.get(settings) && (advisorWritten || wrote(`modelRoles.${AUDITOR_ROLE}`));
 	if (auditorRuns) lines.push(`The Verification Auditor now reviews each turn with @${AUDITOR_ROLE}.`);
 	// `omp config set` reaches registered settings only; model roles are entries of a record setting.
 	const setAdvisor = "`omp config set advisor.enabled <true|false>`";
@@ -125,8 +142,13 @@ function report(written: readonly SetupItem[], settings: Settings): string {
 				? `Edit roles in ~/.omp/agent/config.yml; \`advisor.enabled\` can also be changed with ${setAdvisor}.`
 				: "Edit roles in ~/.omp/agent/config.yml.",
 		);
-	} else {
+	} else if (advisorWritten) {
 		lines.push(`Change it with ${setAdvisor}.`);
+	}
+	if (wrote(RECURSION_DEPTH_KEY)) {
+		lines.push(
+			"The main session delegates through `task`; workers run their task directly. Allow deeper delegation with `omp config set task.maxRecursionDepth 2`.",
+		);
 	}
 	return lines.join("\n");
 }
@@ -150,6 +172,7 @@ export async function applyOmpSetup({ settings, liveAdvisor, store, logger, noti
 
 		let pending = 0;
 		for (const item of SETUP_ITEMS) {
+			if (stored !== undefined && item.since <= stored) continue;
 			const provenance = item.provenance(settings);
 			if (provenance === "default") {
 				item.write(settings);

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { cfgAdvisorEnabled } from "@oh-my-pi/pi-coding-agent/advisor/settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgTaskMaxRecursionDepth } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { RouteLogger } from "../src/logging.ts";
 import {
 	applyOmpSetup,
@@ -70,7 +71,7 @@ const warnings = (logs: string[]) => logs.filter(line => line.startsWith("warn "
 const infos = (logs: string[]) => logs.filter(line => line.startsWith("info "));
 
 describe("fresh install", () => {
-	test("fills the three unset items in the global layer, flushes, then marks, and reports once", async () => {
+	test("fills the four unset items in the global layer, flushes, then marks, and reports once", async () => {
 		const h = harness();
 		await h.run();
 
@@ -81,10 +82,12 @@ describe("fresh install", () => {
 		expect(settings.getModelRoleProvenance(AUDITOR)).toBe("global");
 		expect(settings.getModelRole(ADVISOR)).toBe("@slow");
 		expect(settings.getModelRoleProvenance(ADVISOR)).toBe("global");
+		expect(settings.getProvenance(cfgTaskMaxRecursionDepth)).toBe("global");
+		expect(cfgTaskMaxRecursionDepth.get(settings)).toBe(1);
 		expect(h.events).toEqual(["flush", "marker"]);
-		expect(h.written).toEqual([1]);
+		expect(h.written).toEqual([2]);
 		expect(h.notes).toHaveLength(1);
-		for (const key of ["advisor.enabled", `modelRoles.${AUDITOR}`, `modelRoles.${ADVISOR}`]) {
+		for (const key of ["advisor.enabled", `modelRoles.${AUDITOR}`, `modelRoles.${ADVISOR}`, "task.maxRecursionDepth: 1"]) {
 			expect(h.notes[0]).toContain(key);
 		}
 		expect(infos(h.logs)).toHaveLength(1);
@@ -96,12 +99,14 @@ describe("fresh install", () => {
 		await h.run();
 		h.settings.setModelRole(ADVISOR, undefined);
 		cfgAdvisorEnabled.unset(h.settings);
+		cfgTaskMaxRecursionDepth.unset(h.settings);
 		await h.run();
 
 		expect(h.settings.getModelRole(ADVISOR)).toBeUndefined();
 		expect(cfgAdvisorEnabled.get(h.settings)).toBe(false);
+		expect(cfgTaskMaxRecursionDepth.get(h.settings)).toBe(2);
 		expect(h.notes).toHaveLength(1);
-		expect(h.written).toEqual([1]);
+		expect(h.written).toEqual([2]);
 	});
 });
 
@@ -109,14 +114,16 @@ describe("user values", () => {
 	test("global values are kept untouched, the marker is written and nothing is reported", async () => {
 		const h = harness();
 		cfgAdvisorEnabled.set(h.settings, false);
+		cfgTaskMaxRecursionDepth.set(h.settings, 3);
 		h.settings.setModelRole(ADVISOR, "custom/plan");
 		h.settings.setModelRole(AUDITOR, "custom/audit");
 		await h.run();
 
 		expect(cfgAdvisorEnabled.get(h.settings)).toBe(false);
+		expect(cfgTaskMaxRecursionDepth.get(h.settings)).toBe(3);
 		expect(h.settings.getModelRole(ADVISOR)).toBe("custom/plan");
 		expect(h.settings.getModelRole(AUDITOR)).toBe("custom/audit");
-		expect(h.written).toEqual([1]);
+		expect(h.written).toEqual([2]);
 		expect(h.notes).toEqual([]);
 		expect(infos(h.logs)).toEqual([]);
 	});
@@ -142,7 +149,7 @@ describe("user values", () => {
 			expect(settings.getModelRoleProvenance(ADVISOR)).toBe("project");
 			expect(settings.getModelRole(AUDITOR)).toBe("@smol");
 			expect(settings.getModelRoleProvenance(AUDITOR)).toBe("global");
-			expect(h.written).toEqual([1]);
+			expect(h.written).toEqual([2]);
 			expect(h.notes).toHaveLength(1);
 			expect(h.notes[0]).toContain(`modelRoles.${AUDITOR}`);
 			expect(h.notes[0]).not.toContain(`modelRoles.${ADVISOR}`);
@@ -173,7 +180,7 @@ describe("session-scoped values", () => {
 
 		expect(h.settings.getProvenance(cfgAdvisorEnabled)).toBe("global");
 		expect(cfgAdvisorEnabled.get(h.settings)).toBe(true);
-		expect(h.written).toEqual([1]);
+		expect(h.written).toEqual([2]);
 		expect(h.notes).toHaveLength(2);
 		expect(h.notes[1]).toContain("advisor.enabled");
 		expect(h.notes[1]).not.toContain("modelRoles");
@@ -193,25 +200,89 @@ describe("session-scoped values", () => {
 });
 
 describe("the marker", () => {
-	for (const version of [1, 2]) {
-		test(`a stored marker of ${version} prevents every write, even with all keys missing`, async () => {
-			const h = harness(version);
-			await h.run();
+	test("a stored marker of 2 prevents every write, even with all keys missing", async () => {
+		const h = harness(2);
+		await h.run();
 
-			expect(cfgAdvisorEnabled.get(h.settings)).toBe(false);
-			expect(h.settings.getModelRole(AUDITOR)).toBeUndefined();
-			expect(h.settings.getModelRole(ADVISOR)).toBeUndefined();
-			expect(h.flushes()).toBe(0);
-			expect(h.written).toEqual([]);
-			expect(h.notes).toEqual([]);
-		});
-	}
+		expect(cfgAdvisorEnabled.get(h.settings)).toBe(false);
+		expect(h.settings.getModelRole(AUDITOR)).toBeUndefined();
+		expect(h.settings.getModelRole(ADVISOR)).toBeUndefined();
+		expect(cfgTaskMaxRecursionDepth.get(h.settings)).toBe(2);
+		expect(h.flushes()).toBe(0);
+		expect(h.written).toEqual([]);
+		expect(h.notes).toEqual([]);
+	});
 
 	test("a marker below the current version runs the setup", async () => {
 		const h = harness(0);
 		await h.run();
 		expect(h.settings.getModelRole(ADVISOR)).toBe("@slow");
-		expect(h.written).toEqual([1]);
+		expect(cfgTaskMaxRecursionDepth.get(h.settings)).toBe(1);
+		expect(h.written).toEqual([2]);
+	});
+});
+
+describe("upgrading from v1", () => {
+	test("a v1 marker fills only the recursion depth and never refills the earlier items", async () => {
+		const h = harness(1);
+		await h.run();
+
+		expect(cfgTaskMaxRecursionDepth.get(h.settings)).toBe(1);
+		expect(h.settings.getProvenance(cfgTaskMaxRecursionDepth)).toBe("global");
+		expect(cfgAdvisorEnabled.get(h.settings)).toBe(false);
+		expect(h.settings.getModelRole(AUDITOR)).toBeUndefined();
+		expect(h.settings.getModelRole(ADVISOR)).toBeUndefined();
+		expect(h.events).toEqual(["flush", "marker"]);
+		expect(h.written).toEqual([2]);
+		expect(h.notes).toHaveLength(1);
+		expect(h.notes[0]).toContain("task.maxRecursionDepth: 1");
+		expect(h.notes[0]).not.toContain("advisor.enabled: ");
+		expect(h.notes[0]).not.toContain("modelRoles");
+		expect(h.notes[0]).not.toContain("Verification Auditor");
+		expect(infos(h.logs)[0]).toContain("task.maxRecursionDepth=1");
+		expect(infos(h.logs)[0]).not.toContain("modelRoles");
+	});
+
+	test("a user value for the recursion depth is kept and the marker still advances", async () => {
+		const h = harness(1);
+		cfgTaskMaxRecursionDepth.set(h.settings, 2);
+		await h.run();
+
+		expect(cfgTaskMaxRecursionDepth.get(h.settings)).toBe(2);
+		expect(h.flushes()).toBe(0);
+		expect(h.written).toEqual([2]);
+		expect(h.notes).toEqual([]);
+	});
+
+	test("a session-scoped recursion depth stays pending without a marker, then a later start fills it", async () => {
+		const h = harness(1, { "task.maxRecursionDepth": 5 });
+		expect(h.settings.getProvenance(cfgTaskMaxRecursionDepth)).toBe("runtime");
+		await h.run();
+
+		expect(cfgTaskMaxRecursionDepth.get(h.settings)).toBe(5);
+		expect(h.written).toEqual([]);
+		expect(h.notes).toEqual([]);
+
+		cfgTaskMaxRecursionDepth.clearOverride(h.settings);
+		await h.run();
+		expect(cfgTaskMaxRecursionDepth.get(h.settings)).toBe(1);
+		expect(h.written).toEqual([2]);
+	});
+
+	test("an RPC/ACP protocol pin of the default leaves the recursion depth pending, and a later start fills it", async () => {
+		const h = harness(1);
+		cfgTaskMaxRecursionDepth.pinDefault(h.settings);
+		expect(h.settings.getProvenance(cfgTaskMaxRecursionDepth)).toBe("runtime");
+		await h.run();
+
+		expect(cfgTaskMaxRecursionDepth.get(h.settings)).toBe(2);
+		expect(h.written).toEqual([]);
+		expect(h.notes).toEqual([]);
+
+		const later = harness(1);
+		await later.run();
+		expect(cfgTaskMaxRecursionDepth.get(later.settings)).toBe(1);
+		expect(later.written).toEqual([2]);
 	});
 });
 
@@ -235,7 +306,7 @@ describe("failures never reach the session", () => {
 		await h.run();
 		expect(h.settings.getModelRole(AUDITOR)).toBe("@smol");
 		expect(h.settings.getModelRole(ADVISOR)).toBe("@slow");
-		expect(h.written).toEqual([1]);
+		expect(h.written).toEqual([2]);
 	});
 
 	test("a failing flush warns once and writes no marker", async () => {
@@ -272,7 +343,7 @@ describe("failures never reach the session", () => {
 			throw boom;
 		};
 		await h.run();
-		expect(h.written).toEqual([1]);
+		expect(h.written).toEqual([2]);
 		expect(warnings(h.logs)).toHaveLength(1);
 	});
 });
@@ -299,7 +370,7 @@ describe("gates", () => {
 		await runOmpSetup(ctx, { enabled: true, store, logger: new RouteLogger(pi.logger) });
 
 		expect(settings.getModelRole(ADVISOR)).toBe("@slow");
-		expect(written).toEqual([1]);
+		expect(written).toEqual([2]);
 		expect(notes.map(note => note.level)).toEqual(["info"]);
 	});
 
@@ -311,7 +382,7 @@ describe("gates", () => {
 		const { pi, logs } = makeApi();
 		await runOmpSetup(ctx, { enabled: true, store, logger: new RouteLogger(pi.logger) });
 
-		expect(written).toEqual([1]);
+		expect(written).toEqual([2]);
 		expect(notes).toEqual([]);
 		expect(infos(logs)).toHaveLength(1);
 	});
@@ -408,7 +479,7 @@ describe("live advisor flag", () => {
 		h.options.liveAdvisor = {} as unknown as LiveAdvisorSession;
 		await h.run();
 		expect(warnings(h.logs)).toEqual([]);
-		expect(h.written).toEqual([1]);
+		expect(h.written).toEqual([2]);
 	});
 
 	test("a throwing toggle warns once and leaves no marker", async () => {
@@ -426,17 +497,27 @@ describe("live advisor flag", () => {
 });
 
 describe("the report's change instructions", () => {
-	test("point to `omp config set` for advisor.enabled only, never for model roles", async () => {
+	test("point to `omp config set` for advisor.enabled and the recursion depth only, never for model roles", async () => {
 		const h = harness();
 		await h.run();
 		expect(h.notes[0]).toContain("omp config set advisor.enabled");
-		expect(h.notes[0]).not.toMatch(/omp config set (?!advisor\.enabled)/);
+		expect(h.notes[0]).toContain("omp config set task.maxRecursionDepth 2");
+		expect(h.notes[0]).not.toMatch(/omp config set (?!advisor\.enabled|task\.maxRecursionDepth)/);
 		expect(h.notes[0]).toContain("~/.omp/agent/config.yml");
 	});
 
-	test("omit `omp config set` when advisor.enabled was not written", async () => {
+	test("omit the advisor.enabled instruction when it was not written", async () => {
 		const h = harness();
 		cfgAdvisorEnabled.set(h.settings, false);
+		await h.run();
+		expect(h.notes[0]).toContain("~/.omp/agent/config.yml");
+		expect(h.notes[0]).not.toContain("omp config set advisor.enabled");
+	});
+
+	test("omit every `omp config set` when only roles were written", async () => {
+		const h = harness();
+		cfgAdvisorEnabled.set(h.settings, false);
+		cfgTaskMaxRecursionDepth.set(h.settings, 2);
 		await h.run();
 		expect(h.notes[0]).toContain("~/.omp/agent/config.yml");
 		expect(h.notes[0]).not.toContain("omp config set");
