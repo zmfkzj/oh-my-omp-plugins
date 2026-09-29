@@ -22,8 +22,21 @@ import {
 } from "./advisor-review.ts";
 import { type AuditorSeverity, admittedSeverity, isOwnedAuditor } from "./auditor-contract.ts";
 import { mainSessionOf } from "./host.ts";
-import { visibleText } from "./routing-context.ts";
 import { AUDITOR_NAME } from "./verification-auditor.ts";
+
+/** Text parts of a message's content, trimmed; anything non-textual is dropped. */
+function visibleText(content: unknown): string {
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter(
+      (part): part is { type: "text"; text: string } =>
+        part !== null && typeof part === "object" && part.type === "text" && typeof part.text === "string",
+    )
+    .map(part => part.text)
+    .join("\n")
+    .trim();
+}
 
 export const FINDINGS_TOOL = "review_findings";
 /** `customType` of the lifecycle transitions `review_findings` persists. */

@@ -1,8 +1,20 @@
 # Merge these roles into the active OMP config.yml; do not overwrite other settings.
-# Any supported authenticated model selector may be used, independently of DEFAULT.
+# om-orche's Judgment/Production execution policies need no model role, credential or setting
+# here; they never change the primary model, `@default`, `@task` or task inputs.
+# Any supported authenticated model selector may be used for the roles below.
 # Orche-Advisor gives optional advice on an established plan, never execution approval.
 # Reload with /reload-plugins after changes.
 modelRoles:
   # task: <provider/model> # OMP's native task worker model; keep any existing assignment
   orche-advisor: openai-codex/gpt-6-astra:xhigh
   verification-auditor: "@smol" # separate from ADVISOR; customize independently
+
+# Optional starting presets for the main (`default`) and generic worker (`task`) models.
+# They are starting choices you set yourself, not routing: the plugin never switches
+# models, and switching Judgment <-> Production in a session needs no model change.
+# Judgment-centric start:
+#   default: openai-codex/gpt-6-astra:high
+#   task: openai-codex/gpt-6-sol
+# Production-centric start:
+#   default: anthropic/claude-opus-5-5:medium
+#   task: openai-codex/gpt-6-sol

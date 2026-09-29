@@ -1,5 +1,5 @@
 // Bundled plan advisor and independent Verification Auditor for om-orche.
-// Advice is requested explicitly by DEFAULT on an already formed plan; the auditor runs in OMP's
+// Advice is requested explicitly by the primary on an already formed plan; the auditor runs in OMP's
 // passive WATCHDOG roster when enabled. Neither holds execution authority. The two use distinct
 // configurable model roles.
 
@@ -131,8 +131,9 @@ export function registerOrcheAdvisor(pi: ExtensionAPI, reviewer: typeof runRevie
     if (!guidanceEnabled() || !primarySession(ctx) || !pi.getActiveTools().includes(TOOL)) return;
 
     // The router's policy notice is provider-only and exists solely for the live turn, so its
-    // orchestration and workflow modes carry the guidance. Without one (automatic routing
-    // skipped), OMP's explicit notice of the current turn carries it. Historical turns are never rewritten,
+    // orchestrate and workflow modes carry the guidance (never the default mode). Without one
+    // (router inactive or no notice this turn), OMP's explicit notice of the current turn carries it.
+    // Historical turns are never rewritten,
     // and every change is a copy: shared message objects are left untouched.
     const messages = event.messages;
     const policyActive = messages.some(message => policyModeOf(message) !== undefined);

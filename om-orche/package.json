@@ -1,7 +1,7 @@
 {
   "name": "om-orche",
   "version": "1.0.0",
-  "description": "Keeps the primary model fixed while Jev chooses orchestration; plugin-owned coordination over OMP's native task worker, with optional plan advice and independent verification.",
+  "description": "Judgment/Production execution policy for OMP: the main model chooses per stage between analyzing itself (Judgment) and directing native task workers (Production), with optional plan advice and independent verification.",
   "license": "UNLICENSED",
   "type": "module",
   "files": [
@@ -24,55 +24,17 @@
       "enabled": {
         "type": "boolean",
         "default": true,
-        "description": "Master switch for routing and automatic guidance. Manual advice/finding tools remain available; no review gate is installed."
-      },
-      "jevModel": {
-        "type": "string",
-        "default": "",
-        "description": "TypeSafe model id; empty uses the SDK default (jev-latest)."
-      },
-      "orchestrationRoutingEnabled": {
-        "type": "boolean",
-        "default": true,
-        "description": "Allow the ORCHESTRATE execution route. Advice is optional and never blocks execution; the primary model never changes."
-      },
-      "orchestrationMinConfidence": {
-        "type": "number",
-        "default": 0.6,
-        "min": 0,
-        "max": 1,
-        "description": "Minimum confidence for orchestration; below the gate keep DEFAULT and the current primary model."
-      },
-      "orchestrationMinMargin": {
-        "type": "number",
-        "default": 0.2,
-        "min": 0,
-        "max": 1,
-        "description": "Minimum top1 - top2 margin for orchestration; below the gate keep DEFAULT."
-      },
-      "routingTimeoutMs": {
-        "type": "number",
-        "default": 4000,
-        "min": 250,
-        "max": 20000,
-        "description": "Hard per-decision budget; expiry falls back instead of retrying."
-      },
-      "maxRoutingInputChars": {
-        "type": "number",
-        "default": 12000,
-        "min": 200,
-        "max": 40000,
-        "description": "Combined character budget for the request, visible conversation and committed plan sent to Jev (excluding JSON framing and fixed classifier instructions)."
+        "description": "Master switch for the Judgment/Production execution policy and automatic guidance. When false, OMP's native behavior is untouched. Manual advice/finding tools remain available; no review gate is installed."
       },
       "telemetryEnabled": {
         "type": "boolean",
         "default": true,
-        "description": "Aggregate local orchestration decisions and observed task-worker usage. No prompt text is stored."
+        "description": "Aggregate local task-worker usage counters. No prompt text is stored."
       },
       "debugLogging": {
         "type": "boolean",
         "default": false,
-        "description": "Emit one metrics-only line per orchestration decision to the OMP log."
+        "description": "Emit metrics-only lines to the OMP log."
       }
     }
   },
@@ -84,8 +46,7 @@
     "format": "oxfmt src test bin package.json tsconfig.json"
   },
   "dependencies": {
-    "@oh-my-pi/pi-ai": "18.4.1",
-    "@typesafe-ai/sdk": "^0.6.0"
+    "@oh-my-pi/pi-ai": "18.4.1"
   },
   "devDependencies": {
     "@oh-my-pi/pi-coding-agent": "18.4.1",

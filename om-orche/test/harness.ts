@@ -12,14 +12,6 @@ import { getTaskSchema } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import type { Model } from "@oh-my-pi/pi-ai";
-import type {
-	EngineOptions,
-	GateThresholds,
-	JevDecider,
-	OrchestrationDecision,
-	OrchestrationRoute,
-	RoutingContext,
-} from "../src/jev.ts";
 
 export interface FakeSessionOptions {
 	enabledTools?: readonly string[];
@@ -131,49 +123,6 @@ export function makeApi(
 		getAllTools: () => [{ name: "task", description, parameters: getTaskSchema(taskSchema), sourceInfo: {} }],
 	} as unknown as ExtensionAPI;
 	return { pi, logs, taskSchema };
-}
-
-export interface ScriptedOrchestration {
-	top: OrchestrationRoute;
-	confidence: number;
-	margin: number;
-	confident: boolean;
-}
-
-/** A `JevDecider` returning canned answers and counting requests. */
-export class ScriptedDecider implements JevDecider {
-	orchestrationCalls = 0;
-	lastOptions: EngineOptions | undefined;
-	lastContext: RoutingContext = { recentMessages: [] };
-	#orchestrationQueue: (ScriptedOrchestration | Error)[];
-
-	constructor(orchestration: ScriptedOrchestration | Error | (ScriptedOrchestration | Error)[]) {
-		this.#orchestrationQueue = Array.isArray(orchestration) ? [...orchestration] : [orchestration];
-	}
-
-	async decideOrchestration(
-		_request: string,
-		context: RoutingContext,
-		options: EngineOptions,
-		gates: GateThresholds,
-		_maxChars: number,
-	): Promise<OrchestrationDecision> {
-		this.orchestrationCalls++;
-		this.lastOptions = options;
-		this.lastContext = context;
-		const next =
-			this.#orchestrationQueue.length > 1 ? this.#orchestrationQueue.shift()! : this.#orchestrationQueue[0]!;
-		if (next instanceof Error) throw next;
-		const { top, confidence, margin } = next;
-		return {
-			top,
-			confidence,
-			margin,
-			confident: confidence >= gates.minConfidence && margin >= gates.minMargin,
-			probabilities: { [top]: confidence },
-			latencyMs: 7,
-		};
-	}
 }
 
 export function fakeModel(provider: string, id: string): Model {

@@ -1,42 +1,56 @@
 import { describe, expect, test } from "bun:test";
-import { DEFAULT_CONFIG, normalizeConfig, parseConfigValue, retiredConfigKeys } from "../src/config.ts";
+import {
+	CONFIG_KEYS,
+	DEFAULT_CONFIG,
+	normalizeConfig,
+	parseConfigValue,
+	RETIRED_CONFIG_KEYS,
+	retiredConfigKeys,
+} from "../src/config.ts";
 
 describe("configuration normalization", () => {
 	test("CLI-shaped string values from `omp plugin config` are coerced", () => {
-		const config = normalizeConfig({ enabled: "false", orchestrationMinConfidence: "0.9", debugLogging: "true" });
-		expect(config.enabled).toBe(false);
-		expect(config.orchestrationMinConfidence).toBe(0.9);
-		expect(config.debugLogging).toBe(true);
+		const config = normalizeConfig({ enabled: "false", telemetryEnabled: "false", debugLogging: "true" });
+		expect(config).toEqual({ enabled: false, telemetryEnabled: false, debugLogging: true });
 	});
 
-	test("out-of-range thresholds clamp instead of disabling the gate", () => {
-		const config = normalizeConfig({ orchestrationMinConfidence: 5, orchestrationMinMargin: -1, routingTimeoutMs: 10 });
-		expect(config.orchestrationMinConfidence).toBe(1);
-		expect(config.orchestrationMinMargin).toBe(0);
-		// A sub-250ms routing budget would time out before any real request.
-		expect(config.routingTimeoutMs).toBe(250);
+	test("garbage values fall back to defaults rather than breaking the policy", () => {
+		const config = normalizeConfig({ enabled: 7, debugLogging: "nonsense" });
+		expect(config.enabled).toBe(DEFAULT_CONFIG.enabled);
+		expect(config.debugLogging).toBe(DEFAULT_CONFIG.debugLogging);
 	});
 
-	test("garbage values fall back to defaults rather than breaking routing", () => {
-		const config = normalizeConfig({ orchestrationMinConfidence: "nonsense", enabled: 7 });
-		expect(config.orchestrationMinConfidence).toBe(DEFAULT_CONFIG.orchestrationMinConfidence);
-		expect(config.enabled).toBe(true);
-	});
+	test("stored retired keys never reach the config and are reported for cleanup", () => {
+		const jevRaw = {
+			jevModel: "jev-latest",
+			orchestrationRoutingEnabled: false,
+			orchestrationMinConfidence: 0.99,
+			orchestrationMinMargin: 0.9,
+			routingTimeoutMs: 250,
+			maxRoutingInputChars: 200,
+		};
+		const tierRaw = { taskRoutingEnabled: false, challengeTaskRole: "slow", taskMinConfidence: 0.9 };
+		const raw = { ...jevRaw, ...tierRaw, enabled: false };
 
-	test("stored tier-routing keys never reach the config but are reported for cleanup", () => {
-		const raw = { taskRoutingEnabled: false, challengeTaskRole: "slow", taskMinConfidence: 0.9, enabled: true };
 		const config = normalizeConfig(raw);
-		expect(config).toEqual(normalizeConfig({ enabled: true }));
-		expect(retiredConfigKeys(raw)).toEqual(["taskRoutingEnabled", "taskMinConfidence", "challengeTaskRole"]);
-		expect(retiredConfigKeys({ enabled: true })).toEqual([]);
+		expect(config).toEqual(normalizeConfig({ enabled: false }));
+		expect(Object.keys(config).sort()).toEqual([...CONFIG_KEYS].sort());
+
+		expect(retiredConfigKeys(raw).sort()).toEqual(Object.keys({ ...jevRaw, ...tierRaw }).sort());
+		expect(retiredConfigKeys({ enabled: true, telemetryEnabled: false, debugLogging: true })).toEqual([]);
 		expect(retiredConfigKeys(undefined)).toEqual([]);
 	});
 
-	test("typed parsing rejects a non-boolean for a boolean key", () => {
-		expect(parseConfigValue("enabled", "false")).toBe(false);
-		expect(parseConfigValue("enabled", "yes")).toBeUndefined();
-		expect(parseConfigValue("orchestrationMinConfidence", "0.85")).toBe(0.85);
-		expect(parseConfigValue("orchestrationMinConfidence", "high")).toBeUndefined();
-		expect(parseConfigValue("jevModel", " jev-latest ")).toBe("jev-latest");
+	test("kept and retired keys are disjoint", () => {
+		for (const key of CONFIG_KEYS) expect(RETIRED_CONFIG_KEYS as readonly string[]).not.toContain(key);
+	});
+
+	test("typed parsing accepts only booleans for the kept keys", () => {
+		for (const key of CONFIG_KEYS) {
+			expect(parseConfigValue(key, "true")).toBe(true);
+			expect(parseConfigValue(key, "false")).toBe(false);
+			expect(parseConfigValue(key, "yes")).toBeUndefined();
+			expect(parseConfigValue(key, "0.85")).toBeUndefined();
+		}
 	});
 });

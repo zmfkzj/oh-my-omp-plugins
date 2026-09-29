@@ -2,11 +2,11 @@ import { afterEach, expect, test } from "bun:test";
 import { z } from "zod";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
-import type { ExtensionAPI, ExtensionContext, ToolResultEvent } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import example from "../examples/initial-plan.json";
 import { runReview, ROLE, TOOL, type ReviewSelection } from "../src/advisor-review.ts";
-import { registerJevRouter } from "../src/index.ts";
+import { registerOmOrche } from "../src/index.ts";
 import { AUDITOR_NAME, VERIFICATION_AUDITOR } from "../src/verification-auditor.ts";
 import { ORCHESTRATE_GUIDANCE, registerOrcheAdvisor } from "../src/orche-advisor.ts";
 import {
@@ -14,8 +14,7 @@ import {
   NATIVE_WORKFLOW_NOTICE_TYPE,
   policyModeOf,
 } from "../src/orchestration-policy.ts";
-import { clearRegistry, makeSession, registerAsMain, ScriptedDecider } from "./harness.ts";
-import type { ScriptedOrchestration } from "./harness.ts";
+import { clearRegistry, makeSession, registerAsMain } from "./harness.ts";
 
 afterEach(clearRegistry);
 
@@ -49,7 +48,7 @@ test("one extension registers the advice tool and an independent auditor role, w
       if (event === "session_start") handlers.push(handler);
     },
   } as unknown as ExtensionAPI;
-  const runtime = registerJevRouter(pi);
+  const runtime = registerOmOrche(pi);
   runtime.reloadConfig = async () => runtime.config;
   runtime.telemetry.load = async () => {};
 
@@ -190,8 +189,6 @@ test("advice is primary-only and one request runs at a time", async () => {
 });
 
 const PROMPT = "Refactor the ingestion pipeline.";
-const DEFAULT_ROUTE: ScriptedOrchestration = { top: "DEFAULT", confidence: 0.92, margin: 0.84, confident: true };
-const ORCHESTRATE_ROUTE: ScriptedOrchestration = { top: "ORCHESTRATE", confidence: 0.92, margin: 0.84, confident: true };
 
 function user(text: string): AgentMessage {
   return { role: "user", content: [{ type: "text", text }], timestamp: 0 } as AgentMessage;
@@ -214,8 +211,8 @@ function ofType(messages: AgentMessage[], customType: string): AgentMessage[] {
   return messages.filter(message => message.role === "custom" && message.customType === customType);
 }
 
-/** The whole plugin as OMP loads it, with a scripted Jev decision and no network or disk writes. */
-function registeredPlugin(route: ScriptedOrchestration, enabled = true, branch: SessionEntry[] = []) {
+/** The whole plugin as OMP loads it, with no network, credentials or disk writes. */
+function registeredPlugin(enabled = true, branch: SessionEntry[] = []) {
   const { session, ctx } = makeSession({ branch });
   Object.assign(session.sessionManager, {
     appendCustomEntry(customType: string, data: unknown) {
@@ -238,16 +235,13 @@ function registeredPlugin(route: ScriptedOrchestration, enabled = true, branch: 
       handlers.set(event, [...(handlers.get(event) ?? []), handler]);
     },
   } as unknown as ExtensionAPI;
-  const runtime = registerJevRouter(pi);
+  const runtime = registerOmOrche(pi);
   runtime.config.enabled = enabled;
   runtime.telemetry.setEnabled(false);
-  runtime.apiKey = async () => "ts_test_key";
-  const decider = new ScriptedDecider(route);
-  Object.assign(runtime.engine, { decideOrchestration: decider.decideOrchestration.bind(decider) });
   return {
     branch, session, ctx, runtime,
-    async toolResult(event: ToolResultEvent) {
-      for (const handler of handlers.get("tool_result") ?? []) await handler(event, ctx);
+    async endTurn() {
+      for (const handler of handlers.get("agent_end") ?? []) await handler({ type: "agent_end", willContinue: false }, ctx);
     },
     /** The first blocking `tool_call` result, if any hook would deny this call. */
     async attempt(toolName: string, input: Record<string, unknown> = {}) {
@@ -295,10 +289,10 @@ function staleGateHistory(): SessionEntry[] {
   ];
 }
 
-for (const route of [DEFAULT_ROUTE, ORCHESTRATE_ROUTE]) {
-  test(`${route.top}: stale gate records, findings, failed and REPLAN/ESCALATE advice never block mutation or spawn`, async () => {
+for (const explicit of [false, true]) {
+  test(`${explicit ? "explicit orchestrate" : "default"}: stale gate records, findings, failed and REPLAN/ESCALATE advice never block mutation or spawn`, async () => {
     const branch = staleGateHistory();
-    const plugin = registeredPlugin(route, true, branch);
+    const plugin = registeredPlugin(true, branch);
     const advisor = adviceFixture(branch);
     // Real advice results persisted on the same branch: rejection-style verdicts and a provider failure.
     for (const verdict of ["REPLAN", "ESCALATE"]) {
@@ -311,6 +305,8 @@ for (const route of [DEFAULT_ROUTE, ORCHESTRATE_ROUTE]) {
     registerAsMain(plugin.session);
 
     await plugin.beginTurn(PROMPT);
+    if (explicit) branch.push({ type: "message", id: "native", parentId: branch.at(-1)?.id ?? null,
+      timestamp: "2026-09-28T00:00:00Z", message: keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 9) } as unknown as SessionEntry);
     branch.push({ type: "message", id: "request", parentId: branch.at(-1)?.id ?? null,
       timestamp: "2026-09-28T00:00:00Z", message: user(PROMPT) } as SessionEntry);
     const composed = await plugin.context(branch.flatMap(entry => entry.type === "message" ? [entry.message] : []));
@@ -320,18 +316,12 @@ for (const route of [DEFAULT_ROUTE, ORCHESTRATE_ROUTE]) {
     for (const [tool, input] of [["edit", {}], ["write", {}], ["bash", { command: "true" }], ["task", spawn]] as const) {
       expect(await plugin.attempt(tool, input)).toBeUndefined();
     }
-    // A phase completion is not a review trigger either.
-    const phases = [{ name: "Build", tasks: [{ content: "Implement parser", status: "completed" }] }];
-    await plugin.toolResult({ type: "tool_result", toolName: "todo", toolCallId: "todo-done", input: { op: "done" },
-      content: [{ type: "text", text: "Build completed" }], isError: false, details: { op: "done", phases } });
-    expect(await plugin.attempt("edit")).toBeUndefined();
-    expect(await plugin.attempt("task", spawn)).toBeUndefined();
     expect(advisor.state.customEntries).toEqual([]);
   });
 }
 
-test("explicit and automatic orchestration compose one policy notice with Advisor guidance once", async () => {
-  const plugin = registeredPlugin(ORCHESTRATE_ROUTE);
+test("explicit orchestration composes one policy notice with Advisor guidance once", async () => {
+  const plugin = registeredPlugin();
   await plugin.beginTurn(PROMPT);
   const historical = keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 1, "earlier native");
   const persisted = [historical, user("Earlier request"), assistant("done"),
@@ -357,10 +347,8 @@ test("explicit and automatic orchestration compose one policy notice with Adviso
 });
 
 test("a workflow turn keeps the native workflow notice and gets one guided supplement", async () => {
-  for (const [route, explicit] of [
-    [DEFAULT_ROUTE, false], [ORCHESTRATE_ROUTE, false], [DEFAULT_ROUTE, true], [ORCHESTRATE_ROUTE, true],
-  ] as const) {
-    const plugin = registeredPlugin(route);
+  for (const explicit of [false, true]) {
+    const plugin = registeredPlugin();
     await plugin.beginTurn(PROMPT);
     const workflow = keywordNotice(NATIVE_WORKFLOW_NOTICE_TYPE, 3);
     const persisted = [assistant("previous"),
@@ -376,8 +364,8 @@ test("a workflow turn keeps the native workflow notice and gets one guided suppl
   }
 });
 
-test("a direct turn carries the default policy without orchestration guidance", async () => {
-  const plugin = registeredPlugin(DEFAULT_ROUTE);
+test("a default turn carries the Judgment/Production policy without orchestration guidance", async () => {
+  const plugin = registeredPlugin();
   await plugin.beginTurn(PROMPT);
   const composed = await plugin.context([user(PROMPT)]);
   expect(composed.map(message => policyModeOf(message) ?? null).filter(Boolean)).toEqual(["default"]);
@@ -385,7 +373,7 @@ test("a direct turn carries the default policy without orchestration guidance", 
 });
 
 test("master disable leaves native guidance unchanged and does not gate execution", async () => {
-  const plugin = registeredPlugin(ORCHESTRATE_ROUTE, false);
+  const plugin = registeredPlugin(false);
   await plugin.beginTurn(PROMPT);
   const messages = [keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 1), user(PROMPT)];
   expect(await plugin.context(messages)).toEqual(messages);
@@ -417,4 +405,58 @@ test("without a router policy, only the current turn's native notice is guided, 
   // A workflow notice alone carries no orchestration contract to annotate.
   expect(await context!({ type: "context", messages: [keywordNotice(NATIVE_WORKFLOW_NOTICE_TYPE, 4), user(PROMPT)] }, ctx))
     .toBeUndefined();
+});
+
+test("a governed turn is composed by the whole plugin with no network call and no credential access", async () => {
+  const realFetch = globalThis.fetch;
+  let fetches = 0;
+  globalThis.fetch = (async () => { fetches++; throw new Error("network is forbidden"); }) as unknown as typeof fetch;
+  try {
+    const plugin = registeredPlugin();
+    let credentialAccesses = 0;
+    Object.defineProperty(plugin.ctx.modelRegistry, "authStorage", {
+      get() { credentialAccesses++; throw new Error("credentials are forbidden"); },
+    });
+    const modelBefore = plugin.ctx.model;
+
+    await plugin.beginTurn(PROMPT);
+    const first = await plugin.context([user(PROMPT)]);
+    expect(first.map(message => policyModeOf(message) ?? null).filter(Boolean)).toEqual(["default"]);
+    expect(first.findIndex(message => policyModeOf(message) === "default")).toBe(0);
+    expect(await plugin.context([user(PROMPT)])).toEqual(first);
+
+    // Agent-attributed steering continues the turn and keeps the single notice before the user message.
+    const steering = { ...user("Worker A is available."), steering: true, attribution: "agent" } as AgentMessage;
+    const steered = await plugin.context([user(PROMPT), steering]);
+    expect(steered.map(policyModeOf).filter(Boolean)).toEqual(["default"]);
+    expect(steered[0]).toEqual(first[0]!);
+
+    // agent_end settles the turn; a worker delivery then wakes the session without before_agent_start.
+    await plugin.endTurn();
+    for (const [customType, text] of [
+      ["async-result", "<system-notice>\nBackground job bg_1 has completed"],
+      ["irc:incoming", "<irc from=\"Worker\">done</irc>"],
+    ]) {
+      const delivery = { role: "custom", customType, content: text, display: false, attribution: "agent", timestamp: 7 } as AgentMessage;
+      const woken = await plugin.context([user(PROMPT), assistant("workers started"), delivery]);
+      expect(woken.map(policyModeOf).filter(Boolean)).toEqual(["default"]);
+      expect(woken[0]).toEqual(first[0]!);
+      expect(woken[1]).toEqual(user(PROMPT));
+    }
+    // A synthetic prompt reaching before_agent_start is a continuation, not a new request.
+    await plugin.beginTurn("<system-notice>background job finished</system-notice>");
+    expect((await plugin.context([user(PROMPT)]))[0]).toEqual(first[0]!);
+    // A gated user prompt ends the policy; an explicit request is composed the same way.
+    await plugin.beginTurn("/compact");
+    expect((await plugin.context([user(PROMPT)])).map(policyModeOf).filter(Boolean)).toEqual([]);
+    await plugin.beginTurn(PROMPT);
+    const explicit = await plugin.context([keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 1), user(PROMPT)]);
+    expect(explicit.map(policyModeOf).filter(Boolean)).toEqual(["orchestrate"]);
+
+    expect(fetches).toBe(0);
+    expect(credentialAccesses).toBe(0);
+    expect(plugin.ctx.model).toBe(modelBefore);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
