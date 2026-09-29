@@ -6,6 +6,7 @@
  * `advisor` custom messages, lifecycle transitions from `custom` entries that `review_findings`
  * appends. A finding never expires and no review outcome changes it; only a recorded transition
  * does, and a transition is replayed only while its cited evidence still validates on the branch.
+ * The ledger starts after the latest `/clear` (`reset_boundary`), as the model's context does.
  */
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { slugifyAdvisorName } from "@oh-my-pi/pi-coding-agent/advisor/config";
@@ -61,7 +62,8 @@ const LISTED_IDS = 20;
 
 /**
  * Persisted transition. Evidence stays entry ids, never copied excerpts: the transcript is the
- * one source, and a record whose evidence stops validating on the branch is not replayed.
+ * one source, and a record whose evidence is no longer on the active branch, or was never
+ * citable, is not replayed. Evidence the host pruned afterwards still counts, listed as pruned.
  */
 interface TransitionRecord {
   /** v1 required post-receipt evidence; v2 permits evidence predating delayed delivery. */
@@ -98,7 +100,8 @@ interface Ledger {
 
 /**
  * Text of a message the user actually typed: not synthetic or agent-attributed, not a hidden
- * system notice, not a slash command. Nothing else in the transcript speaks for the user.
+ * system notice. Nothing else in the transcript speaks for the user. A leading "/" is no
+ * exclusion: commands never become messages, and what OMP passes on as text is a real request.
  */
 function actualUserText(entry: SessionEntry): string | undefined {
   const message = entry.type === "message" ? entry.message : undefined;
@@ -106,11 +109,30 @@ function actualUserText(entry: SessionEntry): string | undefined {
     return undefined;
   }
   const text = visibleText(message.content);
-  return text && !text.startsWith("<system-") && !text.startsWith("/") ? text : undefined;
+  return text && !text.startsWith("<system-") ? text : undefined;
 }
 
-/** The entry as citable evidence, or why it cannot be cited. */
-function classifyEvidence(entry: SessionEntry): FindingEvidence | string {
+/**
+ * The entries OMP still builds the model's context from: those after the latest `/clear`
+ * boundary (`reset_boundary`), which also elides everything before an earlier compaction
+ * (session-context.ts). What the model can no longer see is neither a finding to answer for
+ * nor evidence to cite, and the persisted history stays untouched.
+ */
+function activeBranch(branch: readonly SessionEntry[]): readonly SessionEntry[] {
+  const boundary = branch.findLastIndex((entry) => entry.type === "reset_boundary");
+  return boundary < 0 ? branch : branch.slice(boundary + 1);
+}
+
+/** Shown for output the host pruned from a result a recorded resolution cited. */
+const PRUNED_EXCERPT = "(output later pruned from context)";
+
+/**
+ * The entry as citable evidence, or why it cannot be cited. A tool result the host pruned or its
+ * tool flagged uneventful holds nothing to check a claim against, so it is refused; `replay`
+ * keeps a record written earlier valid and shows pruned output as `PRUNED_EXCERPT`, not as the
+ * host's placeholder.
+ */
+function classifyEvidence(entry: SessionEntry, replay = false): FindingEvidence | string {
   const message = entry.type === "message" ? entry.message : undefined;
   if (message?.role === "toolResult") {
     if (message.isError) return "is a failed tool result";
@@ -118,12 +140,19 @@ function classifyEvidence(entry: SessionEntry): FindingEvidence | string {
     if (message.toolName === REVIEW_TOOL || message.toolName === FINDINGS_TOOL) {
       return `is ${message.toolName} output, not evidence about the work`;
     }
+    const pruned = message.prunedAt !== undefined;
+    if (!replay) {
+      if (pruned) return "is a tool result whose output was pruned from context";
+      if (message.useless) return "is a tool result its tool flagged as uneventful";
+    }
     return {
       entryId: entry.id,
       kind: "tool_result",
       toolName: collapse(message.toolName, FINDING_LIMITS.token),
       at: entry.timestamp,
-      excerpt: collapse(visibleText(message.content), FINDING_LIMITS.excerpt) || "(no text output)",
+      excerpt: pruned
+        ? PRUNED_EXCERPT
+        : collapse(visibleText(message.content), FINDING_LIMITS.excerpt) || "(no text output)",
     };
   }
   const text = actualUserText(entry);
@@ -182,6 +211,7 @@ function parseRecord(data: unknown): TransitionRecord | undefined {
  * Validate cited entry ids against the branch walked so far. Each must follow the finding's
  * latest opening and be a successful tool result or a message the user typed; a waiver may cite
  * only the latter, and a resolution must cite at least one. Returns the rejection otherwise.
+ * `replay` re-validates a record written earlier: output the host has pruned since still counts.
  */
 function citeEvidence(
   ledger: Ledger,
@@ -189,6 +219,7 @@ function citeEvidence(
   ids: readonly string[],
   evidenceAfter: number,
   action: TransitionAction,
+  replay = false,
 ): FindingEvidence[] | string {
   if (action === "resolve" && ids.length === 0) {
     return "A resolution must cite at least one evidence entry id; `list` shows citable entries.";
@@ -201,7 +232,7 @@ function citeEvidence(
     if (index <= evidenceAfter) {
       return `Evidence ${id} predates the latest explicit reopening; cite an entry recorded after it.`;
     }
-    const cited = classifyEvidence(entry);
+    const cited = classifyEvidence(entry, replay);
     if (typeof cited === "string") return `Evidence ${id} ${cited}.`;
     if (action === "waive" && cited.kind !== "user_message") {
       return `Evidence ${id} is not a message the user typed; a waiver may cite only those.`;
@@ -227,7 +258,7 @@ function applyRecord(
   const boundary = record.v === 1
     ? Math.max(tracked.receivedIndex, tracked.evidenceAfter)
     : tracked.evidenceAfter;
-  const evidence = citeEvidence(ledger, branch, record.evidence, boundary, record.action);
+  const evidence = citeEvidence(ledger, branch, record.evidence, boundary, record.action, true);
   if (typeof evidence === "string") return;
   tracked.finding.status = to;
   tracked.finding.transition = {
@@ -314,7 +345,7 @@ function buildLedger(branch: readonly SessionEntry[]): Ledger {
  * — oldest first, in whatever lifecycle state, with provenance. Repeats merge into one finding.
  */
 export function collectFindings(branch: readonly SessionEntry[]): VerificationFinding[] {
-  return buildLedger(branch).tracked.map(({ finding }) => finding);
+  return buildLedger(activeBranch(branch)).tracked.map(({ finding }) => finding);
 }
 
 function findTracked(ledger: Ledger, findingId: string): Tracked {
@@ -478,12 +509,12 @@ export function registerFindingTools(pi: ExtensionAPI): void {
       }
       const { sessionManager } = primary;
       const { action, findingId } = params;
-      if (action === "list") return listLedger(sessionManager.getBranch(), findingId);
+      if (action === "list") return listLedger(activeBranch(sessionManager.getBranch()), findingId);
 
       const reason = collapse(params.reason ?? "", FINDING_LIMITS.reason);
       if (!findingId || !reason) throw new Error(`${action} requires findingId and a reason.`);
       const evidenceIds = params.evidence ?? [];
-      let planned = planTransition(sessionManager.getBranch(), action, findingId, evidenceIds);
+      let planned = planTransition(activeBranch(sessionManager.getBranch()), action, findingId, evidenceIds);
       let author: TransitionRecord["author"] = "orchestrator";
       if (action === "waive") {
         if (!ctx.hasUI) {
@@ -514,7 +545,7 @@ export function registerFindingTools(pi: ExtensionAPI): void {
         }
         author = "user";
         // The ledger may have moved while the dialog was open; record only what still holds.
-        planned = planTransition(sessionManager.getBranch(), action, findingId, evidenceIds);
+        planned = planTransition(activeBranch(sessionManager.getBranch()), action, findingId, evidenceIds);
       }
 
       const { tracked, evidence } = planned;

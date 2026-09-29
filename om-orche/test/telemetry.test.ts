@@ -1,18 +1,20 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { z } from "zod";
+import { renderStats } from "../src/commands.ts";
+import { normalizeConfig } from "../src/config.ts";
 import { registerOmOrche } from "../src/index.ts";
 import { HOST_SETUP_VERSION } from "../src/omp-setup.ts";
 import { OrcheRuntime } from "../src/runtime.ts";
 import { historySnapshotName, Telemetry } from "../src/telemetry.ts";
 import { SUBAGENT_LIFECYCLE_CHANNEL, SUBAGENT_PROGRESS_CHANNEL, trackWorkerUsage } from "../src/worker-usage.ts";
 import { clearRegistry, makeSession, registerAsMain } from "./harness.ts";
-import { firstRun, progress, publish, settled, turn } from "./worker-frames.ts";
-import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { firstRun, NO_TOOL_CALL, progress, publish, settled, turn } from "./worker-frames.ts";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 const roots: string[] = [];
 const instances: Telemetry[] = [];
@@ -683,9 +685,12 @@ describe("several processes sharing one state directory", () => {
 
 	test("usage measured after its settlement was written turns the unknown into one sample", async () => {
 		const dir = await stateDir();
-		const { telemetry, bus: first } = await following(dir);
+		const telemetry = await loaded(dir);
+		// Two buses carrying one session's frames, so the same worker reaches this process twice.
+		const first = new EventBus();
 		const second = new EventBus();
-		trackWorkerUsage(second, telemetry);
+		trackWorkerUsage(first, telemetry, { scope: "session" });
+		trackWorkerUsage(second, telemetry, { scope: "session" });
 		settled([first], "0-W", "completed");
 		await telemetry.flush();
 		expect((await persisted(dir)).workers.task).toMatchObject({ completed: 1, usageSamples: 0, usageUnknown: 1 });
@@ -877,56 +882,187 @@ describe("several processes sharing one state directory", () => {
 	});
 });
 
+describe("refreshing what a process sees of the file", () => {
+	const inodeOf = async (file: string) => (await stat(file)).ino;
+
+	test("shows what other processes wrote, keeps this process's unwritten counts on top, and writes nothing", async () => {
+		const dir = await stateDir();
+		const a = await following(dir);
+		const b = await following(dir);
+		firstRun([b.bus], "0-b1", SECOND);
+		await b.telemetry.flush();
+		firstRun([a.bus], "0-a1", FIRST);
+		const before = { inode: await inodeOf(a.telemetry.file), bytes: await readFile(a.telemetry.file, "utf8") };
+
+		await a.telemetry.refresh();
+
+		expect(a.telemetry.snapshot().workers.task).toMatchObject({ startedObserved: 2, completed: 2, tokens: 800 });
+		expect({ inode: await inodeOf(a.telemetry.file), bytes: await readFile(a.telemetry.file, "utf8") }).toEqual(before);
+		expect(await tree(dir)).toEqual(["telemetry.json"]);
+		await a.telemetry.flush();
+		expect(JSON.parse(await readFile(a.telemetry.file, "utf8")).workers.task).toMatchObject({ startedObserved: 2, tokens: 800 });
+	});
+
+	test("after a reset elsewhere, what was cleared leaves the view, unwritten counts stay, and the next write joins the epoch shown", async () => {
+		const dir = await stateDir();
+		const a = await following(dir);
+		firstRun([a.bus], "0-a1", FIRST);
+		await a.telemetry.flush();
+		const cleared = a.telemetry.snapshot().epoch;
+		firstRun([a.bus], "0-a2", SECOND);
+		await (await loaded(dir)).reset();
+
+		await a.telemetry.refresh();
+
+		const shown = a.telemetry.snapshot();
+		expect(shown.epoch.id).not.toBe(cleared.id);
+		expect(shown.workers.task).toMatchObject({ startedObserved: 1, completed: 1, tokens: 300 });
+		await a.telemetry.flush();
+		const file = JSON.parse(await readFile(a.telemetry.file, "utf8"));
+		expect(file.epoch).toEqual(shown.epoch);
+		expect(file.workers.task).toMatchObject({ startedObserved: 1, tokens: 300 });
+	});
+
+	test("a process with telemetry off shows the file as others left it, and still writes nothing", async () => {
+		const dir = await stateDir();
+		const writer = await following(dir);
+		firstRun([writer.bus], "0-w1", FIRST);
+		await writer.telemetry.flush();
+		const reader = await loaded(dir, false);
+		expect(reader.snapshot().workers.task).toMatchObject({ startedObserved: 1 });
+		firstRun([writer.bus], "0-w2", SECOND);
+		await writer.telemetry.flush();
+		const before = await inodeOf(reader.file);
+
+		await reader.refresh();
+
+		expect(reader.snapshot().workers.task).toMatchObject({ startedObserved: 2, tokens: 800 });
+		expect(await inodeOf(reader.file)).toBe(before);
+	});
+
+	test("a file replaced by a newer version's suspends recording and is never written", async () => {
+		const dir = await stateDir();
+		const { telemetry, bus } = await following(dir);
+		firstRun([bus], "0-W", FIRST);
+		await telemetry.flush();
+		const future = JSON.stringify({ version: 99, workers: { task: { completed: 5 } } });
+		await writeFile(telemetry.file, future);
+
+		await telemetry.refresh();
+
+		expect(telemetry.state()).toEqual({ kind: "suspended", reason: "future-version", version: 99 });
+		firstRun([bus], "1-W", FIRST);
+		await telemetry.flush();
+		expect(await readFile(telemetry.file, "utf8")).toBe(future);
+		expect(await tree(dir)).toEqual(["telemetry.json"]);
+	});
+
+	test("telemetry just turned on over an older file has migrated it by the time the view is read", async () => {
+		const dir = await stateDir(V5_TEXT);
+		const telemetry = await loaded(dir, false);
+		expect(telemetry.state()).toMatchObject({ kind: "deferred" });
+		telemetry.setEnabled(true);
+
+		await telemetry.refresh();
+
+		expect(telemetry.state()).toEqual({ kind: "active" });
+		expect(telemetry.snapshot().jevRouting).toEqual(V5_JEV_ROUTING);
+		expect(await readFile(path.join(telemetry.historyDir, V5_BACKUP), "utf8")).toBe(V5_TEXT);
+		expect(JSON.parse(await readFile(telemetry.file, "utf8")).version).toBe(6);
+	});
+
+	test("a deferred view follows another process's migration of the file without writing it", async () => {
+		const dir = await stateDir(V5_TEXT);
+		const disabled = await loaded(dir, false);
+		await loaded(dir);
+		const before = await inodeOf(disabled.file);
+
+		await disabled.refresh();
+
+		expect(disabled.state()).toEqual({ kind: "active" });
+		expect(disabled.snapshot().jevRouting).toEqual(V5_JEV_ROUTING);
+		expect(await inodeOf(disabled.file)).toBe(before);
+	});
+
+	test("a suspended process stays as it is, whatever the file becomes", async () => {
+		const dir = await stateDir("{ truncated");
+		const telemetry = await loaded(dir);
+		expect(telemetry.state()).toMatchObject({ kind: "suspended", reason: "unreadable" });
+		await writeFile(telemetry.file, JSON.stringify({ version: 6, epoch: { id: "e", startedAt: 1 }, workers: { task: { completed: 3 } } }));
+
+		await telemetry.refresh();
+
+		expect(telemetry.state()).toMatchObject({ kind: "suspended", reason: "unreadable" });
+		expect(telemetry.snapshot().workers).toEqual({});
+	});
+});
+
+type SessionStart = (event: object, ctx: ExtensionContext) => Promise<void>;
+type CommandHandler = (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+
+/** A project directory whose plugin override sets `telemetryEnabled`. */
+async function project(telemetryEnabled: boolean): Promise<string> {
+	const cwd = await mkdtemp(path.join(tmpdir(), "om-orche-project-"));
+	roots.push(cwd);
+	await mkdir(path.join(cwd, ".omp"));
+	await setTelemetryOverride(cwd, telemetryEnabled);
+	return cwd;
+}
+
+/** Change what a project's plugin override says about `telemetryEnabled`, as a user editing it between two commands would. */
+async function setTelemetryOverride(cwd: string, telemetryEnabled: boolean): Promise<void> {
+	const overrides = { settings: { "om-orche": { telemetryEnabled } } };
+	await writeFile(path.join(cwd, ".omp", "plugin-overrides.json"), JSON.stringify(overrides));
+}
+
+/** The main session, or a subagent's, working in `cwd`; what the plugin shows the user lands in `notes`. */
+function sessionIn(cwd: string, main: boolean, notes: string[] = []): ExtensionCommandContext {
+	const fake = makeSession();
+	Object.assign(fake.session, { isAdvisorEnabled: () => false });
+	if (main) registerAsMain(fake.session);
+	const ui = { notify: (message: string) => void notes.push(message) };
+	return { ...fake.ctx, cwd, ui } as unknown as ExtensionCommandContext;
+}
+
+/**
+ * The whole plugin on a fake host over `dir`, as one session's extension builds it: `start` runs its
+ * session_start handlers for a session, `command` its `/om-orche`, and `bus` carries that session's worker frames.
+ */
+function host(dir: string) {
+	const starts: SessionStart[] = [];
+	let handler: CommandHandler | undefined;
+	const bus = new EventBus();
+	const pi = {
+		zod: z,
+		logger: { debug() {}, warn() {}, info() {}, error() {} },
+		events: bus,
+		setLabel() {},
+		registerCommand(_name: string, options: { handler: CommandHandler }) {
+			handler = options.handler;
+		},
+		registerTool() {},
+		getActiveTools: () => [],
+		setActiveTools: async () => {},
+		on(event: string, listener: SessionStart) {
+			if (event === "session_start") starts.push(listener);
+		},
+	} as unknown as ExtensionAPI;
+	const store = { version: async () => HOST_SETUP_VERSION, markApplied: async () => {} };
+	const runtime = registerOmOrche(pi, store, dir);
+	instances.push(runtime.telemetry);
+	return {
+		runtime,
+		bus,
+		async start(ctx: ExtensionContext) {
+			for (const listener of starts) await listener({}, ctx);
+		},
+		async command(args: string, ctx: ExtensionCommandContext) {
+			await handler?.(args, ctx);
+		},
+	};
+}
+
 describe("subagent sessions and the process's shared telemetry", () => {
-	type SessionStart = (event: object, ctx: ExtensionContext) => Promise<void>;
-
-	/** A project directory whose plugin override sets `telemetryEnabled`. */
-	async function project(telemetryEnabled: boolean): Promise<string> {
-		const cwd = await mkdtemp(path.join(tmpdir(), "om-orche-project-"));
-		roots.push(cwd);
-		await mkdir(path.join(cwd, ".omp"));
-		const overrides = { settings: { "om-orche": { telemetryEnabled } } };
-		await writeFile(path.join(cwd, ".omp", "plugin-overrides.json"), JSON.stringify(overrides));
-		return cwd;
-	}
-
-	/** The main session, or a subagent's, working in `cwd`. */
-	function sessionIn(cwd: string, main: boolean): ExtensionContext {
-		const fake = makeSession();
-		Object.assign(fake.session, { isAdvisorEnabled: () => false });
-		if (main) registerAsMain(fake.session);
-		return { ...fake.ctx, cwd };
-	}
-
-	/** The whole plugin on a fake host over `dir`, as one session's extension builds it: `start` runs its session_start handlers for a session, and `bus` carries the worker frames of that session. */
-	function host(dir: string) {
-		const starts: SessionStart[] = [];
-		const bus = new EventBus();
-		const pi = {
-			zod: z,
-			logger: { debug() {}, warn() {}, info() {}, error() {} },
-			events: bus,
-			setLabel() {},
-			registerCommand() {},
-			registerTool() {},
-			getActiveTools: () => [],
-			setActiveTools: async () => {},
-			on(event: string, handler: SessionStart) {
-				if (event === "session_start") starts.push(handler);
-			},
-		} as unknown as ExtensionAPI;
-		const store = { version: async () => HOST_SETUP_VERSION, markApplied: async () => {} };
-		const runtime = registerOmOrche(pi, store, dir);
-		instances.push(runtime.telemetry);
-		return {
-			runtime,
-			bus,
-			async start(ctx: ExtensionContext) {
-				for (const handler of starts) await handler({}, ctx);
-			},
-		};
-	}
-
 	test("a subagent's start cannot switch on telemetry the main session turned off", async () => {
 		const dir = await stateDir(V5_TEXT);
 		const main = host(dir);
@@ -1008,5 +1144,86 @@ describe("subagent sessions and the process's shared telemetry", () => {
 		await runtime.reloadConfig(off, { drivesTelemetry: false });
 		firstRun([bus], "0-d", FIRST);
 		expect(recorded()).toBe(2);
+	});
+
+	test("two sessions of one process that allocate the same worker id run two workers, not one", async () => {
+		const dir = await stateDir();
+		// Each session's extension subscribes the bus of its own session; the host's output managers are per session.
+		const first = host(dir);
+		const second = host(dir);
+		firstRun([first.bus], "reviewers-0", FIRST, { owner: NO_TOOL_CALL });
+		firstRun([second.bus], "reviewers-0", SECOND, { owner: NO_TOOL_CALL });
+		await first.runtime.telemetry.flush();
+
+		const file = JSON.parse(await readFile(first.runtime.telemetry.file, "utf8"));
+		expect(file.workers.task).toMatchObject({ startedObserved: 2, followUpTurns: 0, completed: 2, tokens: 800 });
+	});
+});
+
+describe("/om-orche stats", () => {
+	test("telemetry turned on over an older file shows the migrated file at once, not an empty epoch", async () => {
+		const dir = await stateDir(V5_TEXT);
+		const app = host(dir);
+		const cwd = await project(false);
+		const notes: string[] = [];
+		const ctx = sessionIn(cwd, true, notes);
+		await app.start(ctx);
+		expect(app.runtime.telemetry.state()).toMatchObject({ kind: "deferred" });
+
+		await setTelemetryOverride(cwd, true);
+		await app.command("stats", ctx);
+
+		const [shown] = notes;
+		expect(shown).toContain("Jev routing era (v5)");
+		expect(shown).toContain(`Source snapshot: ${path.join(app.runtime.telemetry.historyDir, V5_BACKUP)}`);
+		expect(shown).not.toContain("not migrated");
+		expect(JSON.parse(await readFile(app.runtime.telemetry.file, "utf8")).version).toBe(6);
+	});
+
+	test("shows what another process has counted, without writing anything", async () => {
+		const dir = await stateDir();
+		const notes: string[] = [];
+		const app = host(dir);
+		const ctx = sessionIn(await project(true), true, notes);
+		await app.start(ctx);
+		const other = await following(dir);
+		firstRun([other.bus], "0-W", FIRST);
+		await other.telemetry.flush();
+		const before = (await stat(app.runtime.telemetry.file)).ino;
+
+		await app.command("stats", ctx);
+
+		expect(notes[0]).toMatch(/workers started\s+1 observed/);
+		expect(notes[0]).toMatch(/settled turns\s+1 completed/);
+		expect((await stat(app.runtime.telemetry.file)).ino).toBe(before);
+	});
+
+	test("drops what another process's reset cleared", async () => {
+		const dir = await stateDir();
+		const notes: string[] = [];
+		const app = host(dir);
+		const ctx = sessionIn(await project(true), true, notes);
+		await app.start(ctx);
+		firstRun([app.bus], "0-W", FIRST);
+		await app.runtime.telemetry.flush();
+		await (await loaded(dir)).reset();
+
+		await app.command("stats", ctx);
+
+		expect(notes[0]).toContain("none observed");
+		expect(await tree(dir)).toEqual([]);
+	});
+
+	test("cost per completed says what it divides: all measured spend, failed and cancelled included", async () => {
+		const { telemetry, bus } = await following(await stateDir());
+		firstRun([bus], "0-W", { tokens: 1000, cost: 1, durationMs: 100 }, { status: "failed" });
+		turn([bus], "0-W", { tokens: 100, cost: 0.1, durationMs: 100 }, { status: "completed" });
+
+		const shown = renderStats({ telemetry, config: normalizeConfig(undefined) } as unknown as OrcheRuntime);
+
+		// $1.00 of a failed turn and $0.10 of the completed one, over the one measured completion.
+		const row = shown.split("\n").find(line => line.includes("cost per completed")) ?? "";
+		expect(row).toContain("$1.1000");
+		expect(row).toMatch(/failed and cancelled/);
 	});
 });

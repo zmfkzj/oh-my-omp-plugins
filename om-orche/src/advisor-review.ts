@@ -288,10 +288,15 @@ function snapshotField(
   return trimmed;
 }
 
-/** Strip ANSI/control bytes and collapse whitespace so one field stays a single bounded line. */
+/** Zero-width and bidirectional formatting characters: invisible, yet able to disguise text in a dialog. */
+const INVISIBLE_FORMAT = /[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
+const CONTROL = /[\u0000-\u001f\u007f-\u009f]/g;
+
+/** Strip ANSI/control bytes and invisible formatting characters, and collapse whitespace so one field stays a single bounded line. */
 export function collapse(text: string, limit: number): string {
   return Bun.stripANSI(text)
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    .replace(INVISIBLE_FORMAT, "")
+    .replace(CONTROL, " ")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, limit);
@@ -488,22 +493,69 @@ function mergeUsage<T extends object>(previous: T, next: T): T {
   return merged;
 }
 
+/** A request credential the model registry did not authorize or could not resolve. */
+export class ReviewCredentialError extends Error {}
+
+/** A review cut short by cancellation or the timeout after some attempts were already billed. */
+export class ReviewInterrupted extends Error {
+  constructor(
+    cause: unknown,
+    readonly attempts: readonly ReviewAttemptDetails[],
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+  }
+}
+
+/** Mask values that look like credentials in text that may have come from a provider, command or file. */
+export function redactSecrets(text: string): string {
+  return text
+    .replace(
+      /((?:api[-_ ]?key|authorization|bearer|access[-_ ]?token|refresh[-_ ]?token|secret|password)\s*(?::|=)\s*)[^\s,;]+/gi,
+      "$1[REDACTED]",
+    )
+    .replace(/\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED]");
+}
+
 function sanitizeErrorMessage(value: unknown, apiKey: string | undefined): string | undefined {
   const message = value instanceof Error ? value.message : typeof value === "string" ? value : "";
   const redacted = apiKey ? message.replaceAll(apiKey, "[redacted]") : message;
-  return collapse(redacted, 500) || undefined;
+  return collapse(redactSecrets(redacted), 500) || undefined;
 }
 
+/** Advice text returned to the primary is bounded: the prompt asks for at most 180 words. */
+const ADVICE_LIMIT = 8000;
+
+/** Keep line structure but drop ANSI, control and invisible formatting characters from model output. */
+function sanitizeAdvice(text: string): string {
+  return Bun.stripANSI(text)
+    .replace(INVISIBLE_FORMAT, "")
+    .split(/\r\n?|\n/)
+    .map((line) => line.replace(CONTROL, " ").trimEnd())
+    .join("\n")
+    .trim();
+}
+
+const VERDICT = "KEEP|ADJUST|REPLAN|ESCALATE";
+// One verdict token, optionally bold, optionally followed by a rationale set off by a dash, colon or parenthesis.
+// `KEEP | ADJUST | ...` (the prompt template echoed back) and `KEEP-ish` are not verdicts.
+const VERDICT_LINE = new RegExp(`^\\**VERDICT:\\**\\s*\\**(?:${VERDICT})\\**(?:\\s+[-\\u2013\\u2014:(]\\s*\\S.*)?$`);
+const SECTION_LINE = /^\**(VERDICT|ISSUES|ORCHESTRATION CHANGES|AVOID):/;
+const SECTIONS = ["VERDICT", "ISSUES", "ORCHESTRATION CHANGES", "AVOID"];
+
+/**
+ * The reply must open with one verdict line and then carry the three remaining headings once each,
+ * in order. Bold markers, trailing spaces and inline content after a heading (`ISSUES: None`) are
+ * tolerated; heading case and order are not.
+ */
 function hasReviewStructure(text: string): boolean {
   const headings = text
-    .split(/\r?\n/)
-    .filter((line) => /^(?:VERDICT:|ISSUES:|ORCHESTRATION CHANGES:|AVOID:)/.test(line));
+    .split("\n")
+    .map((line) => SECTION_LINE.exec(line)?.[1])
+    .filter((heading) => heading !== undefined);
   return (
-    /^VERDICT: (KEEP|ADJUST|REPLAN|ESCALATE)\b/.test(text) &&
-    headings.length === 4 &&
-    headings[1] === "ISSUES:" &&
-    headings[2] === "ORCHESTRATION CHANGES:" &&
-    headings[3] === "AVOID:"
+    VERDICT_LINE.test(text.split("\n", 1)[0] ?? "") &&
+    headings.length === SECTIONS.length &&
+    headings.every((heading, index) => heading === SECTIONS[index])
   );
 }
 
@@ -606,6 +658,11 @@ function formatFindings(
   return lines.join("\n");
 }
 
+/**
+ * Request one review. When cancellation or the timeout ends the call after an attempt reached the
+ * provider, the {@link ReviewInterrupted} error carries those attempts so their billed usage is
+ * still accounted for.
+ */
 export async function runReview(
   prepared: PreparedReview,
   selection: ReviewSelection,
@@ -615,15 +672,24 @@ export async function runReview(
 ): Promise<ReviewResult> {
   const { model, thinkingLevel } = selection;
   const requestId = Bun.randomUUIDv7();
-  const apiKey = await registry.getApiKey(model, requestId);
-  // Undefined/empty keys let pi-ai fall back to environment credentials, bypassing
-  // host denial (including disabledProviders). The explicit keyless sentinel is valid.
-  if (!apiKey) {
-    throw new Error(`No request credential authorized by the model registry for "${model.provider}".`);
-  }
   const timeout = AbortSignal.timeout(180_000);
   const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
   requestSignal.throwIfAborted();
+  let apiKey: string | undefined;
+  try {
+    apiKey = await registry.getApiKey(model, requestId, { signal: requestSignal });
+  } catch (error) {
+    requestSignal.throwIfAborted();
+    throw new ReviewCredentialError(
+      `Credential lookup failed for "${model.provider}": ${sanitizeErrorMessage(error, undefined) ?? "unknown error"}`,
+    );
+  }
+  requestSignal.throwIfAborted();
+  // Undefined/empty keys let pi-ai fall back to environment credentials, bypassing
+  // host denial (including disabledProviders). The explicit keyless sentinel is valid.
+  if (!apiKey) {
+    throw new ReviewCredentialError(`No request credential authorized by the model registry for "${model.provider}".`);
+  }
 
   const context: Context = {
     systemPrompt: [ADVISOR_PROMPT],
@@ -685,8 +751,8 @@ export async function runReview(
         errorMessage: sanitizeErrorMessage(error, apiKey),
       };
     }
-    requestSignal.throwIfAborted();
     const errorMessage = sanitizeErrorMessage(result.errorMessage, apiKey);
+    // Recorded before the cancellation check: an attempt cut short still carries billed usage.
     attempts.push({
       attempt,
       mode,
@@ -697,20 +763,28 @@ export async function runReview(
       usage: result.usage,
       ...(errorMessage ? { errorMessage } : {}),
     });
+    requestSignal.throwIfAborted();
     return result;
   }
 
-  let result = await completeAttempt(1);
-  if (result.stopReason === "length" && !result.content.some((part) => part.type === "toolCall")) {
-    result = await completeAttempt(2, "no-reasoning");
-  } else if (result.stopReason === "error") {
-    result = await completeAttempt(2, "provider-retry");
+  let result: AttemptResult;
+  try {
+    result = await completeAttempt(1);
+    if (result.stopReason === "length" && !result.content.some((part) => part.type === "toolCall")) {
+      result = await completeAttempt(2, "no-reasoning");
+    } else if (result.stopReason === "error") {
+      result = await completeAttempt(2, "provider-retry");
+    }
+  } catch (error) {
+    if (requestSignal.aborted && attempts.length > 0) throw new ReviewInterrupted(error, attempts);
+    throw error;
   }
-  const text = result.content
-    .filter((part) => part.type === "text")
-    .map((part) => part.text)
-    .join("\n")
-    .trim();
+  const text = sanitizeAdvice(
+    result.content
+      .filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .join("\n"),
+  );
   let failureKind: ReviewFailureKind | undefined;
   if (result.stopReason === "error" || result.stopReason === "aborted") {
     failureKind = "provider_error";
@@ -753,8 +827,10 @@ export async function runReview(
     };
     return { text: failures[failureKind], isError: true, details };
   }
+  const advice =
+    text.length > ADVICE_LIMIT ? `${text.slice(0, ADVICE_LIMIT)}\n[advice truncated at ${ADVICE_LIMIT} characters]` : text;
   return {
-    text: `${text}\n\nModel: ${details.model}; usage: ${usage.input} input, ${usage.output} output, ${usage.cacheRead} cache-read tokens; estimated cost: $${usage.cost.total.toFixed(6)}.`,
+    text: `${advice}\n\nModel: ${details.model}; usage: ${usage.input} input, ${usage.output} output, ${usage.cacheRead} cache-read tokens; estimated cost: $${usage.cost.total.toFixed(6)}.`,
     isError: false,
     details,
   };

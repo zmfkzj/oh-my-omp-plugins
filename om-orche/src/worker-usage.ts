@@ -29,11 +29,20 @@
  * `started` that follows it on the same bus, so a first turn is never taken for
  * two turns.
  *
- * A worker's identity is `<parentToolCallId>:<id>`. The live reviver hands a
- * follow-up turn the original spawn's `parentToolCallId`, and eval `agent()`
- * and `workpool()` spawns never have one, so every in-process path keeps the
- * same key across a worker's turns. An absent `parentToolCallId` is not a
- * follow-up marker.
+ * A worker's identity is its session scope, its `parentToolCallId` and its
+ * `id`. The live reviver hands a follow-up turn the original spawn's
+ * `parentToolCallId`, and eval `agent()` and `workpool()` spawns never have
+ * one, so every in-process path keeps the same key across a worker's turns. An
+ * absent `parentToolCallId` is not a follow-up marker.
+ *
+ * The scope is what keeps sessions apart. The host allocates worker ids per
+ * session, so two sessions of one process can both run a worker `reviewers-0`
+ * (ACP hosts several, each with a bus of its own), and without a scope the
+ * second one's frames would be taken for a repeat of the first's and lost.
+ * Within one session the host never allocates an id twice, `/new` included, so
+ * a repeated id on one bus is the same worker. The frames carry no session
+ * marker that could say otherwise: `sessionFile` is absent when a session has
+ * no artifacts directory and is not derived the same way on every frame.
  *
  * Workers are counted by agent name, not by caller: the frames carry no
  * invocation kind, so `task` workers from the task tool, eval `agent()`, and
@@ -61,13 +70,38 @@ interface EventBusLike {
 	on(channel: string, handler: (data: unknown) => void): () => void;
 }
 
+/** Scopes handed to buses that were not given one; weak, so a session's bus is never kept alive by its scope. */
+const busScopes = new WeakMap<object, string>();
+let busCount = 0;
+
 function numberOr0(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
-/** One worker's identity, the same on every bus that carries its frames and across its turns. */
-function workerKey(parentToolCallId: unknown, id: string): string {
-	return `${typeof parentToolCallId === "string" ? parentToolCallId : ""}:${id}`;
+/** Which session a bus belongs to when the caller does not say: the bus itself, the same for every subscription on it. */
+function scopeOfBus(events: object): string {
+	let scope = busScopes.get(events);
+	if (scope === undefined) {
+		scope = `bus-${++busCount}`;
+		busScopes.set(events, scope);
+	}
+	return scope;
+}
+
+/** One worker's identity: the same across its turns and on every bus of its session, and never another session's. */
+function workerKey(scope: string, parentToolCallId: unknown, id: string): string {
+	return JSON.stringify([scope, typeof parentToolCallId === "string" ? parentToolCallId : "", id]);
+}
+
+export interface WorkerUsageOptions {
+	/**
+	 * The session whose frames `events` carries. Workers of different scopes never
+	 * share an identity, however their ids and tool call ids read. Defaults to a
+	 * scope of the bus itself, one session's as the host builds a bus per session;
+	 * buses that carry the same session's frames share a scope, so a frame that
+	 * reaches more than one of them counts once.
+	 */
+	scope?: string;
 }
 
 /**
@@ -75,18 +109,20 @@ function workerKey(parentToolCallId: unknown, id: string): string {
  * bus an extension gets as `pi.events`; returns the unsubscriber. The host also
  * publishes each frame on a tree-wide observability bus, which extensions never
  * receive. Every session in the process, main and subagents, builds its own
- * extension and subscribes its own bus to the process's one `Telemetry`; it
- * tells subscriptions apart, so a frame that reaches it through more than one
- * counts once.
+ * extension and subscribes its own bus to the process's one `Telemetry`; each
+ * bus is a scope of its own unless `options.scope` says otherwise, and
+ * `Telemetry` tells subscriptions of one scope apart, so a frame that reaches it
+ * through more than one counts once.
  */
-export function trackWorkerUsage(events: EventBusLike, telemetry: Telemetry): () => void {
+export function trackWorkerUsage(events: EventBusLike, telemetry: Telemetry, options: WorkerUsageOptions = {}): () => void {
 	const source: WorkerSource = Symbol("task-worker-frames");
+	const scope = options.scope ?? scopeOfBus(events);
 
 	const offProgress = events.on(SUBAGENT_PROGRESS_CHANNEL, data => {
 		const payload = data as Partial<SubagentProgressPayload> | null | undefined;
 		const progress = payload?.progress;
 		if (typeof progress?.id !== "string" || progress.agent !== GENERIC_TASK_AGENT) return;
-		telemetry.observeWorker(source, workerKey(payload?.parentToolCallId, progress.id), GENERIC_TASK_AGENT, {
+		telemetry.observeWorker(source, workerKey(scope, payload?.parentToolCallId, progress.id), GENERIC_TASK_AGENT, {
 			kind: "progress",
 			usage: {
 				tokens: numberOr0(progress.tokens),
@@ -99,7 +135,7 @@ export function trackWorkerUsage(events: EventBusLike, telemetry: Telemetry): ()
 	const offLifecycle = events.on(SUBAGENT_LIFECYCLE_CHANNEL, data => {
 		const payload = data as Partial<SubagentLifecyclePayload> | null | undefined;
 		if (typeof payload?.id !== "string" || payload.agent !== GENERIC_TASK_AGENT) return;
-		const key = workerKey(payload.parentToolCallId, payload.id);
+		const key = workerKey(scope, payload.parentToolCallId, payload.id);
 		const status: unknown = payload.status;
 		if (status === "started") {
 			telemetry.observeWorker(source, key, GENERIC_TASK_AGENT, { kind: "started" });

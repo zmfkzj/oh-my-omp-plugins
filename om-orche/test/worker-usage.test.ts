@@ -15,6 +15,7 @@ import {
 	progress,
 	settled,
 	started,
+	TASK_TOOL,
 	turn,
 } from "./worker-frames.ts";
 
@@ -26,14 +27,17 @@ afterAll(async () => {
 	await Promise.all(roots.map(dir => rm(dir, { recursive: true, force: true })));
 });
 
-/** A loaded telemetry over a fresh temp state directory, following the frames of `buses`. */
+/** The scope of buses that carry one session's frames: a frame reaching several of them counts once. */
+const ONE_SESSION = { scope: "session" };
+
+/** A loaded telemetry over a fresh temp state directory, following the frames of `buses`, all of one session. */
 async function tracked(...buses: EventBus[]): Promise<Telemetry> {
 	const dir = await mkdtemp(path.join(tmpdir(), "om-orche-worker-usage-"));
 	roots.push(dir);
 	const telemetry = new Telemetry(dir);
 	instances.push(telemetry);
 	await telemetry.load();
-	for (const bus of buses) trackWorkerUsage(bus, telemetry);
+	for (const bus of buses) trackWorkerUsage(bus, telemetry, ONE_SESSION);
 	return telemetry;
 }
 
@@ -347,13 +351,13 @@ describe("the same frames reaching telemetry from more than one bus", () => {
 		const main = new EventBus();
 		const late = new EventBus();
 		const telemetry = await tracked();
-		const stopMain = trackWorkerUsage(main, telemetry);
+		const stopMain = trackWorkerUsage(main, telemetry, ONE_SESSION);
 		firstRun([main], "0-W", FIRST);
 		started([main], "0-W");
 		progress([main], "0-W", NOTHING_YET);
 		progress([main], "0-W", { tokens: 150, cost: 0.0625, durationMs: 200 });
 
-		trackWorkerUsage(late, telemetry);
+		trackWorkerUsage(late, telemetry, ONE_SESSION);
 		progress([main, late], "0-W", SECOND);
 		// An older frame arriving late never lowers what was seen.
 		progress([late], "0-W", { tokens: 150, cost: 0.0625, durationMs: 200 });
@@ -385,6 +389,81 @@ describe("the same frames reaching telemetry from more than one bus", () => {
 		settled([first], "0-W", "completed");
 
 		expect(telemetry.snapshot().workers.task).toEqual(ONE_COMPLETED_TURN);
+	});
+});
+
+describe("workers of different sessions in one process", () => {
+	// A session's bus carries only its own workers' frames, and the host allocates worker ids per session.
+	const owners: Record<string, FrameOwner> = {
+		"eval agent() or workpool, which carry no tool call id": NO_TOOL_CALL,
+		"the task tool, whose tool call ids two sessions can repeat": TASK_TOOL,
+	};
+	for (const [kind, owner] of Object.entries(owners)) {
+		test(`two sessions that allocate the same worker id run two workers: ${kind}`, async () => {
+			const first = new EventBus();
+			const second = new EventBus();
+			const telemetry = await tracked();
+			trackWorkerUsage(first, telemetry);
+			trackWorkerUsage(second, telemetry);
+			firstRun([first], "0-W", FIRST, { owner });
+			firstRun([second], "0-W", SECOND, { owner });
+
+			expect(telemetry.snapshot().workers.task).toEqual({
+				...NONE,
+				startedObserved: 2,
+				completed: 2,
+				usageSamples: 2,
+				usageSamplesCompleted: 2,
+				tokens: 800,
+				costUsd: 0.375,
+				durationMs: 1200,
+			});
+		});
+
+		test(`each session's worker keeps its own follow-up turns: ${kind}`, async () => {
+			const first = new EventBus();
+			const second = new EventBus();
+			const telemetry = await tracked();
+			trackWorkerUsage(first, telemetry);
+			trackWorkerUsage(second, telemetry);
+			firstRun([first], "0-W", FIRST, { owner });
+			firstRun([second], "0-W", FIRST, { owner });
+			turn([first], "0-W", SECOND, { owner });
+			turn([second], "0-W", SECOND, { owner });
+
+			expect(telemetry.snapshot().workers.task).toEqual({
+				...NONE,
+				startedObserved: 2,
+				followUpTurns: 2,
+				completed: 4,
+				usageSamples: 4,
+				usageSamplesCompleted: 4,
+				tokens: 1600,
+				costUsd: 0.75,
+				durationMs: 2400,
+			});
+		});
+	}
+
+	test("subscriptions on one bus are one session: a frame that reaches both counts once", async () => {
+		const bus = new EventBus();
+		const telemetry = await tracked();
+		trackWorkerUsage(bus, telemetry);
+		trackWorkerUsage(bus, telemetry);
+		firstRun([bus], "0-W", FIRST);
+		turn([bus], "0-W", SECOND);
+
+		expect(telemetry.snapshot().workers.task).toEqual(TWO_COMPLETED_TURNS);
+	});
+
+	test("a tool call id and a worker id that only read alike once joined name different workers", async () => {
+		const bus = new EventBus();
+		const telemetry = await tracked();
+		trackWorkerUsage(bus, telemetry);
+		firstRun([bus], "c", FIRST, { owner: { agent: "task", parentToolCallId: "a:b" } });
+		firstRun([bus], "b:c", SECOND, { owner: { agent: "task", parentToolCallId: "a" } });
+
+		expect(telemetry.snapshot().workers.task).toMatchObject({ startedObserved: 2, followUpTurns: 0, completed: 2, tokens: 800 });
 	});
 });
 

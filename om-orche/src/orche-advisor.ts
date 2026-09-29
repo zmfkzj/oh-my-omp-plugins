@@ -18,8 +18,11 @@ import {
   ROLE,
   TOOL,
   AUDITOR_SLUG,
+  ReviewInterrupted,
   prepareReviewInput,
   runReview,
+  type ReviewAttemptDetails,
+  type ReviewResult,
 } from "./advisor-review.ts";
 import { collectFindings } from "./findings.ts";
 import { enforceAuditorContract } from "./auditor-contract.ts";
@@ -71,9 +74,10 @@ const primarySession = mainSessionOf;
  * Add the bundled auditor to the live advisor roster unless the user declares their own.
  *
  * Discovery is re-run rather than mutated blind: `applyAdvisorConfigs` replaces the roster
- * wholesale and the session exposes no getter to read the current one back, so appending to
- * a freshly discovered copy is the only lossless way to add one entry. This mirrors what
- * `/advisor configure` does on save.
+ * wholesale and the session exposes no getter to read the configs back, so appending to a
+ * freshly discovered copy is the only lossless way to add one entry. `/advisor configure`
+ * applies a freshly discovered roster on save with no hook for extensions, which drops the
+ * auditor; {@link restoreVerificationAuditor} repairs that on the next prompt.
  *
  * A `WATCHDOG.yml` entry whose name slugifies the same wins outright — that is the documented
  * way to repoint the model, retune the instructions, or switch the auditor off entirely.
@@ -99,6 +103,18 @@ async function installVerificationAuditor(primary: AgentSession): Promise<void> 
   );
 }
 
+/**
+ * Re-install the auditor when the live roster no longer carries it. The roster is replaced
+ * wholesale by `/advisor configure` on save, and the status roster (`getAdvisorStats`) is the
+ * only view of it an extension has, so the check runs before each prompt. A roster that names the
+ * auditor (bundled or the user's own `WATCHDOG.yml` entry, enabled or not) is left alone.
+ */
+async function restoreVerificationAuditor(primary: AgentSession): Promise<void> {
+  if (!primary.isAdvisorEnabled()) return;
+  const live = primary.getAdvisorStats().advisors;
+  if (live.some((advisor) => slugifyAdvisorName(advisor.name) === AUDITOR_SLUG)) return;
+  await installVerificationAuditor(primary);
+}
 
 export function registerOrcheAdvisor(pi: ExtensionAPI, reviewer: typeof runReview = runReview, enabled: () => boolean = () => true): void {
   const z = pi.zod;
@@ -119,8 +135,11 @@ export function registerOrcheAdvisor(pi: ExtensionAPI, reviewer: typeof runRevie
     }
     if (enabled()) await installVerificationAuditor(primary);
   });
-  pi.on("before_agent_start", (event, ctx) => {
-    if (enabled() && primarySession(ctx) && pi.getActiveTools().includes(TOOL)) {
+  pi.on("before_agent_start", async (event, ctx) => {
+    const primary = enabled() ? primarySession(ctx) : undefined;
+    if (!primary) return;
+    await restoreVerificationAuditor(primary);
+    if (pi.getActiveTools().includes(TOOL)) {
       return { systemPrompt: [...event.systemPrompt, DEFAULT_GUIDANCE] };
     }
   });
@@ -213,23 +232,34 @@ export function registerOrcheAdvisor(pi: ExtensionAPI, reviewer: typeof runRevie
           sessionId: primary.sessionManager.getSessionId(),
           parentId: primary.sessionManager.getLeafId(),
         };
-        const review = await reviewer(prepared, selection, ctx.modelRegistry, signal);
-        for (const attempt of review.details.attempts) {
-          const entryId = primary.sessionManager.appendModelUsage(
-            {
-              purpose: TOOL,
-              role: ROLE,
-              api: attempt.api,
-              provider: attempt.provider,
-              model: attempt.model,
-              usage: attempt.usage,
-              stopReason: attempt.stopReason,
-              ...(attempt.errorMessage ? { errorMessage: attempt.errorMessage } : {}),
-            },
-            usageOwner,
-          );
-          if (entryId) usageOwner.parentId = entryId;
+        const recordUsage = (attempts: readonly ReviewAttemptDetails[]) => {
+          for (const attempt of attempts) {
+            const entryId = primary.sessionManager.appendModelUsage(
+              {
+                purpose: TOOL,
+                role: ROLE,
+                api: attempt.api,
+                provider: attempt.provider,
+                model: attempt.model,
+                usage: attempt.usage,
+                stopReason: attempt.stopReason,
+                ...(attempt.errorMessage ? { errorMessage: attempt.errorMessage } : {}),
+              },
+              usageOwner,
+            );
+            if (entryId) usageOwner.parentId = entryId;
+          }
+        };
+        let review: ReviewResult;
+        try {
+          review = await reviewer(prepared, selection, ctx.modelRegistry, signal);
+        } catch (error) {
+          // A cancelled or timed-out review still bills the attempts that already reached the provider.
+          if (!(error instanceof ReviewInterrupted)) throw error;
+          recordUsage(error.attempts);
+          throw error.cause;
         }
+        recordUsage(review.details.attempts);
         return {
           ...(review.isError ? { isError: true } : {}),
           content: [{ type: "text" as const, text: review.text }],

@@ -183,6 +183,53 @@ test("a disabled plugin leaves OMP's advisor roster and auditor notes untouched"
   expect((await run("context", { type: "context", messages })).some(result => result !== undefined)).toBe(true);
 });
 
+test("an auditor dropped by /advisor configure is restored before the next prompt", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "om-orche-roster-"));
+  tempRoots.push(root);
+  const { session, ctx } = makeSession();
+  let roster: AdvisorConfig[] = [];
+  let applies = 0;
+  Object.assign(session.sessionManager, { getCwd: () => root });
+  Object.assign(session.settings, { getAgentDir: () => root });
+  Object.assign(session, {
+    isAdvisorEnabled: () => true,
+    getAdvisorStats: () => ({ advisors: roster.map(config => ({ name: config.name })) }),
+    applyAdvisorConfigs: (configs: AdvisorConfig[]) => { roster = configs; applies++; },
+  });
+  registerAsMain(session);
+  const handlers: Record<string, Handler[]> = {};
+  let enabled = true;
+  registerOrcheAdvisor({
+    zod: z,
+    registerTool() {},
+    getActiveTools: () => [],
+    on(event: string, handler: Handler) { (handlers[event] ??= []).push(handler); },
+  } as unknown as ExtensionAPI, undefined, () => enabled);
+  const prompt = async () => { for (const handler of handlers.before_agent_start ?? []) await handler({ systemPrompt: [] }, ctx); };
+
+  for (const handler of handlers.session_start ?? []) await handler({}, ctx);
+  expect(roster.map(config => config.name)).toEqual([AUDITOR_NAME]);
+  await prompt();
+  expect(applies).toBe(1);
+
+  // `/advisor configure` saves a freshly discovered roster, which has no auditor.
+  fs.writeFileSync(path.join(root, "WATCHDOG.yml"), 'advisors:\n  - name: Custom Advisor\n    model: "@advisor"\n');
+  roster = [{ name: "Custom Advisor", model: "@advisor" }];
+  enabled = false;
+  await prompt();
+  expect(roster.map(config => config.name)).toEqual(["Custom Advisor"]);
+  enabled = true;
+  await prompt();
+  expect(roster.map(config => config.name)).toEqual(["Custom Advisor", AUDITOR_NAME]);
+  await prompt();
+  expect(applies).toBe(2);
+
+  // A user-declared auditor, even a disabled one, is theirs to keep.
+  roster = [{ name: AUDITOR_NAME, enabled: false }];
+  await prompt();
+  expect(applies).toBe(2);
+});
+
 test("once the setup has run, a start registers no roles and enables nothing", async () => {
   const { store, written } = markerStore(1);
   const settings = Settings.isolated();
@@ -338,6 +385,21 @@ test("a provider failure is an actual error with its usage accounted, and advice
   expect(state.customEntries).toEqual([]);
 });
 
+test("a cancelled review still records the usage of the attempts that were billed", async () => {
+  const { ctx, tool, state } = adviceFixture();
+  const controller = new AbortController();
+  let attempt = 0;
+  const keep = completionOf("KEEP");
+  state.completion = async (...args) => {
+    const settled = await keep(...args);
+    if (++attempt === 1) return { ...settled, stopReason: "error" };
+    controller.abort();
+    return { ...settled, stopReason: "aborted" };
+  };
+  await expect(tool.execute("advice", example, controller.signal, () => {}, ctx)).rejects.toThrow();
+  expect(state.usage).toMatchObject([{ stopReason: "error" }, { stopReason: "aborted" }]);
+});
+
 test("advice is primary-only and one request runs at a time", async () => {
   const { ctx, tool, state } = adviceFixture();
   let release!: () => void;
@@ -387,6 +449,7 @@ function registeredPlugin(enabled = true, branch: SessionEntry[] = []) {
       return id;
     },
   });
+  Object.assign(session, { isAdvisorEnabled: () => false });
   registerAsMain(session);
   const handlers = new Map<string, Handler[]>();
   const pi = {
@@ -613,7 +676,7 @@ test("a governed turn is composed by the whole plugin with no network call and n
     await plugin.beginTurn("<system-notice>background job finished</system-notice>");
     expect((await plugin.context([user(PROMPT)]))[0]).toEqual(first[0]!);
     // A gated user prompt ends the policy; an explicit request is composed the same way.
-    await plugin.beginTurn("/compact");
+    await plugin.beginTurn("   ");
     expect((await plugin.context([user(PROMPT)])).map(policyModeOf).filter(Boolean)).toEqual([]);
     await plugin.beginTurn(PROMPT);
     const explicit = await plugin.context([keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 1), user(PROMPT)]);

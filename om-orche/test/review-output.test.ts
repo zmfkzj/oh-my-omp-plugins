@@ -5,7 +5,10 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import example from "../examples/initial-plan.json";
 import { AUDITOR_NAME } from "../src/verification-auditor.ts";
 import {
+  collapse,
   prepareReviewInput,
+  ReviewCredentialError,
+  ReviewInterrupted,
   runReview,
   type PreparedReview,
   type ReviewAttemptDetails,
@@ -437,4 +440,104 @@ describe("review completion boundary", () => {
       `Checkpoint: ${prepared.checkpoint}\n\n${JSON.stringify(prepared.snapshot, null, 2)}`,
     );
   });
+});
+
+describe("review structure and returned text", () => {
+  const withReply = (text: string) => review(completionSequence(response({ content: [{ type: "text", text }] })).completion);
+
+  test.each([
+    ["the prompt template echoed back", structuredReview.replace("VERDICT: KEEP", "VERDICT: KEEP | ADJUST | REPLAN | ESCALATE")],
+    ["a token with a glued suffix", structuredReview.replace("VERDICT: KEEP", "VERDICT: KEEP-ish")],
+    ["a token that is only a prefix", structuredReview.replace("VERDICT: KEEP", "VERDICT: KEEPER")],
+    ["a repeated verdict heading", `${structuredReview}\n\nVERDICT: ADJUST`],
+    ["sections out of order", structuredReview.replace("ISSUES:\n- None\n\nORCHESTRATION CHANGES:\n- None", "ORCHESTRATION CHANGES:\n- None\n\nISSUES:\n- None")],
+    ["a section heading inside another section", structuredReview.replace("ISSUES:\n- None", "ISSUES:\nAVOID: x")],
+  ])("rejects %s", async (_name, text) => {
+    expectFailure(await withReply(text), "invalid_structure");
+  });
+
+  test.each([
+    ["a bold verdict line", structuredReview.replace("VERDICT: KEEP", "**VERDICT: KEEP**")],
+    ["a bold token", structuredReview.replace("VERDICT: KEEP", "VERDICT: **ADJUST**")],
+    ["a rationale after a dash", structuredReview.replace("VERDICT: KEEP", "VERDICT: ADJUST - narrow the fan-out")],
+    ["inline section content", structuredReview.replace("ISSUES:\n- None", "ISSUES: None")],
+    ["trailing spaces after headings", structuredReview.replace("AVOID:", "AVOID:  ").replace("ISSUES:", "ISSUES: ")],
+    ["CRLF line endings", structuredReview.replaceAll("\n", "\r\n")],
+  ])("accepts %s", async (_name, text) => {
+    const result = await withReply(text);
+    expect(result.isError).toBe(false);
+  });
+
+  test("returned advice has terminal and invisible characters removed and a bounded length", async () => {
+    const hostile = structuredReview.replace(
+      "- None\n\nORCH",
+      `- \u001b[2J\u001b]0;pwned\u0007a\u202eb\u200bc\u0000d${"x".repeat(20000)}\n\nORCH`,
+    );
+    const result = await withReply(hostile);
+    expect(result.isError).toBe(false);
+    expect(/\p{Cc}/u.test(result.text.replaceAll("\n", ""))).toBe(false);
+    expect(/\p{Cf}/u.test(result.text)).toBe(false);
+    expect(result.text).toContain("abc dxxx");
+    expect(result.text).toContain("[advice truncated at 8000 characters]");
+    expect(result.text.length).toBeLessThan(8500);
+  });
+});
+
+describe("review cancellation and credentials", () => {
+  test("cancelling a retry keeps the usage of the attempts already billed", async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const completion: Completion = async () => {
+      calls++;
+      if (calls === 1) return response({ stopReason: "error" });
+      controller.abort();
+      return response({ stopReason: "aborted" });
+    };
+    const failure = await runReview(prepared, selection, { getApiKey: async () => "key" }, controller.signal, completion)
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(ReviewInterrupted);
+    const interrupted = failure as ReviewInterrupted;
+    expect(interrupted.attempts.map((attempt) => attempt.stopReason)).toEqual(["error", "aborted"]);
+    expect(interrupted.attempts[0]?.usage.cost.total).toBe(0.5);
+    expect(interrupted.cause).toBe(controller.signal.reason);
+  });
+
+  test("a signal that is already aborted never reaches the credential lookup", async () => {
+    let lookups = 0;
+    await expect(runReview(
+      prepared, selection, { getApiKey: async () => { lookups++; return "key"; } },
+      AbortSignal.abort(), completionSequence(response()).completion,
+    )).rejects.toThrow();
+    expect(lookups).toBe(0);
+  });
+
+  test("the credential lookup receives the request signal", async () => {
+    let received: AbortSignal | undefined;
+    const controller = new AbortController();
+    await runReview(
+      prepared, selection,
+      { getApiKey: async (_model, _session, options) => { received = options?.signal; return "key"; } },
+      controller.signal, completionSequence(response()).completion,
+    );
+    expect(received).toBeDefined();
+    controller.abort();
+    expect(received?.aborted).toBe(true);
+  });
+
+  test("a failing credential lookup is a credential error with the secret masked", async () => {
+    const failure = await runReview(
+      prepared, selection,
+      { getApiKey: async () => { throw new Error("\u001b[31mcommand failed\u001b[0m api_key=sk-secret-123456789012 token"); } },
+      undefined, completionSequence(response()).completion,
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(ReviewCredentialError);
+    const message = (failure as Error).message;
+    expect(message).toContain("command failed");
+    expect(message).not.toContain("sk-secret");
+    expect(/\p{Cc}/u.test(message)).toBe(false);
+  });
+});
+
+test("collapse removes zero-width and bidirectional formatting characters", () => {
+  expect(collapse("pay\u202e gnp.exe\u200b\u2066 ok\ufeff", 100)).toBe("pay gnp.exe ok");
 });

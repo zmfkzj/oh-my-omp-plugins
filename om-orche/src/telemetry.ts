@@ -31,7 +31,10 @@
  * reset deletes the files under the same lock. A process that finds the file it
  * last wrote gone, because another process reset, starts a new epoch (new id,
  * new start time) and writes its unwritten counts into it: only what is on disk
- * is ever cleared, so a later write cannot undo a reset.
+ * is ever cleared, so a later write cannot undo a reset. What a process shows
+ * of the file is its last view of it, so a reader that wants what the others
+ * wrote calls `refresh()`: a plain read, since the file is only ever replaced
+ * whole, that takes no lock and writes nothing.
  *
  * Live worker usage comes from OMP's subagent progress/lifecycle frames (see
  * `worker-usage.ts`). `ctx.sessionManager.getUsageStatistics()` is a single
@@ -101,13 +104,13 @@ export interface LiveWorkerCounters {
 	aborted: number;
 	/** Settled turns whose final progress was observed. */
 	usageSamples: number;
-	/** The usage samples that completed: the cost-per-completed denominator. */
+	/** The usage samples that completed: the denominator of cost per completed, whose numerator is all of `costUsd`. */
 	usageSamplesCompleted: number;
 	/** Settled turns without any observed progress: usage unknown, never counted as zero. */
 	usageUnknown: number;
 	/** Input + output + cacheWrite tokens (OMP's `AgentProgress.tokens`; excludes cacheRead), usage samples only. */
 	tokens: number;
-	/** Provider-reported spend, usage samples only. */
+	/** Provider-reported spend of every usage sample, failed and cancelled turns included. */
 	costUsd: number;
 	durationMs: number;
 }
@@ -696,7 +699,8 @@ async function underLock<T>(lockFile: string, work: () => Promise<T>): Promise<T
  * Other OMP processes write the same file, so an instance never writes totals
  * of its own. It holds the file as it last saw it (`#base`) and the counts it
  * recorded itself since (`#pending`), and a write adds the second to the file
- * as it is at that moment, under the state directory's lock.
+ * as it is at that moment, under the state directory's lock. `refresh()` brings
+ * the view up to date without writing.
  */
 export class Telemetry {
 	static readonly #instances = new Map<string, Telemetry>();
@@ -781,6 +785,21 @@ export class Telemetry {
 		return this.#loaded;
 	}
 
+	/**
+	 * Re-read `telemetry.json` so `snapshot()` shows what other processes have
+	 * written since this process last looked. It waits for the first load, so
+	 * telemetry just turned on over an older file has migrated it by the time this
+	 * returns. Read-only: nothing is written and no lock is taken, because the file
+	 * is only ever replaced whole. A suspended process stays as it is; a file this
+	 * version must not touch suspends recording, as the next write would. Never
+	 * rejects.
+	 */
+	async refresh(): Promise<void> {
+		await this.load();
+		this.#enqueue(() => this.#refresh());
+		await this.#io;
+	}
+
 	async #read(): Promise<void> {
 		const resets = this.#resets;
 		let disk: DiskFile;
@@ -809,12 +828,16 @@ export class Telemetry {
 		}
 	}
 
-	/** Take what the file holds as this process's view of it; counts recorded before this stay pending on top. */
-	#adopt(disk: Exclude<DiskFile, OlderFile>): void {
+	/**
+	 * Take the file as this process's view of it; counts recorded before this stay
+	 * pending on top. An older file is never adopted: a load converts it, and one
+	 * that appears under a process that has loaded already suspends its recording.
+	 */
+	#adopt(disk: DiskFile): void {
 		switch (disk.kind) {
 			case "absent":
-				// Nothing to read: whatever was taken from an older file went with it.
-				this.#base = emptySnapshot(this.#base.epoch);
+				// A file this process last saw or wrote that is gone was cleared by a reset elsewhere: its epoch is over.
+				this.#base = emptySnapshot(this.#persisted ? undefined : this.#base.epoch);
 				this.#persisted = false;
 				this.#state = { kind: "active" };
 				return;
@@ -823,10 +846,39 @@ export class Telemetry {
 				this.#persisted = true;
 				this.#state = { kind: "active" };
 				return;
+			case "older":
+				this.#state = {
+					kind: "suspended",
+					reason: "unreadable",
+					detail: `rewritten in the older v${disk.source.version} format by another process`,
+				};
+				return;
 			case "unusable":
 				this.#state = disk.state;
 				return;
 		}
+	}
+
+	/** The read-only part of {@link Telemetry.refresh}, queued behind writes and resets so it never sees half of either. */
+	async #refresh(): Promise<void> {
+		// A suspended process left the file alone on purpose; an unloaded one has no view to correct.
+		if (this.#state.kind !== "active" && this.#state.kind !== "deferred") return;
+		const resets = this.#resets;
+		let disk: DiskFile;
+		try {
+			disk = await readDisk(this.#file);
+		} catch {
+			// A file that cannot be read now leaves the view as it was.
+			return;
+		}
+		if (resets !== this.#resets) return;
+		if (disk.kind === "older" && this.#state.kind === "deferred") {
+			// Still, or again, an older file: shown read-only, as a load that found telemetry off shows it.
+			this.#adoptEarlierEras(disk.raw, disk.source);
+			this.#state = { kind: "deferred", ...disk.source };
+			return;
+		}
+		this.#adopt(disk);
 	}
 
 	/**
@@ -873,7 +925,7 @@ export class Telemetry {
 			await preserve(this.#historyDir, historySnapshotName(now.source.version, now.source.sha256), now.bytes);
 			// Writers are expected to be stopped; still, never replace a file that changed since it was read.
 			if (!(await readFile(this.#file)).equals(now.bytes)) throw new Error("telemetry.json changed during migration");
-			await this.#persist(this.#base);
+			await this.#persist();
 			if (resets === this.#resets) this.#state = { kind: "active" };
 		});
 	}
@@ -1080,37 +1132,21 @@ export class Telemetry {
 		const disk = await readDisk(this.#file);
 		// A reset, or telemetry being turned off, ran while this waited for the lock or the read.
 		if (resets !== this.#resets || !this.#writable()) return;
-		if (disk.kind === "unusable") {
-			this.#state = disk.state;
-			return;
-		}
-		if (disk.kind === "older") {
-			// Only a load converts an older file, and it preserves the original first.
-			const detail = `rewritten in the older v${disk.source.version} format by another process`;
-			this.#state = { kind: "suspended", reason: "unreadable", detail };
-			return;
-		}
-		let base = this.#base;
-		if (disk.kind === "current") base = disk.snapshot;
-		// A file this process wrote that is gone was cleared by a reset elsewhere: its epoch is over.
-		else if (this.#persisted) base = emptySnapshot();
-		if (Object.keys(this.#pending).length === 0) {
-			this.#base = base;
-			this.#persisted = disk.kind === "current";
-			return;
-		}
-		await this.#persist(base);
+		this.#adopt(disk);
+		// A file this version must not touch has suspended recording; only counts to add call for a write.
+		if (this.#writable() && Object.keys(this.#pending).length > 0) await this.#persist();
 	}
 
 	/**
-	 * Replace the file with `base` plus every pending count. The counts travel as
-	 * `#inflight` while the write runs, so `snapshot()` keeps them and a failed
-	 * write gives them back.
+	 * Replace the file with this process's view of it plus every pending count. The
+	 * counts travel as `#inflight` while the write runs, so `snapshot()` keeps them
+	 * and a failed write gives them back.
 	 */
-	async #persist(base: TelemetrySnapshot): Promise<void> {
+	async #persist(): Promise<void> {
 		const resets = this.#resets;
 		this.#inflight = this.#pending;
 		this.#pending = {};
+		const base = this.#base;
 		const merged: TelemetrySnapshot = { ...base, updatedAt: Date.now(), workers: sumWorkers(base.workers, this.#inflight, 0) };
 		try {
 			await replaceAtomically(this.#file, JSON.stringify(merged));

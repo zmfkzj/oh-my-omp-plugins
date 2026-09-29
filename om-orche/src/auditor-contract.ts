@@ -20,8 +20,18 @@ import { slugifyAdvisorName } from "@oh-my-pi/pi-coding-agent/advisor/config";
 import { AUDITOR_SLUG } from "./advisor-review.ts";
 import { AUDITOR_NAME } from "./verification-auditor.ts";
 
-/** A quoted claim: straight or curly double quotes, curly single quotes, or CJK corner brackets. */
-const QUOTATION = /["“”][^"“”\n]{6,}["“”]|‘[^’\n]{6,}’|「[^」\n]{3,}」|『[^』\n]{3,}』/;
+/** Double quotes, straight or curly: paired left to right, so a claim's closing quote never opens the next. */
+const DOUBLE_QUOTED = /["“”]([^"“”\n]*)["“”]/g;
+/** A quoted claim in other quote styles: curly single quotes or CJK corner brackets. */
+const OTHER_QUOTED = /‘[^’\n]{6,}’|「[^」\n]{3,}」|『[^』\n]{3,}』/;
+
+function hasQuotation(note: string): boolean {
+	for (const [, inner] of note.matchAll(DOUBLE_QUOTED)) {
+		if (inner!.length >= 6) return true;
+	}
+	return OTHER_QUOTED.test(note);
+}
+
 /** Checked output or location: a backticked span or a `path.ext:line` reference. */
 const CITATION = /`[^`\n]+`|\b[\w./-]+\.[A-Za-z]\w*:\d+/;
 
@@ -33,7 +43,7 @@ export type AuditorSeverity = "concern" | "blocker";
  */
 export function admittedSeverity(note: string, severity: unknown): AuditorSeverity | undefined {
 	if (severity !== "concern" && severity !== "blocker") return undefined;
-	const quoted = QUOTATION.test(note);
+	const quoted = hasQuotation(note);
 	if (!quoted && !CITATION.test(note)) return undefined;
 	return severity === "blocker" && !quoted ? "concern" : severity;
 }

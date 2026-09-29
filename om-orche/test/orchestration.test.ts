@@ -174,11 +174,10 @@ describe("gate", () => {
 		expect(router.applyToContext(ctx, [nativeOrchestrate(), user(PROMPT)])).toBeUndefined();
 	});
 
-	test("subagents, plan mode, slash commands, synthetic and empty prompts get no notice", () => {
+	test("subagents, plan mode, synthetic and empty prompts get no notice", () => {
 		const skipped: [Parameters<typeof build>[0], string][] = [
 			[{ main: false }, PROMPT],
 			[{ session: { planMode: true } }, PROMPT],
-			[{}, "/compact"],
 			[{}, "<system-notice>continue</system-notice>"],
 			[{}, "   "],
 		];
@@ -193,8 +192,19 @@ describe("gate", () => {
 		const { router, ctx } = build();
 		router.beginTurn(ctx, PROMPT);
 		expect(modes(router.applyToContext(ctx, [user(PROMPT)]))).toEqual(["default"]);
-		router.beginTurn(ctx, "/compact");
+		router.beginTurn(ctx, "   ");
 		expect(router.applyToContext(ctx, [user(PROMPT)])).toBeUndefined();
+	});
+
+	// Commands never reach before_agent_start; OMP hands the model whatever "/" text remains.
+	test("a request that starts with a path or an unknown command is an ordinary turn", () => {
+		for (const prompt of ["/Users/me/app/src/main.ts crashes on startup, fix it", "/nosuchcommand do the thing"]) {
+			const { router, ctx } = build();
+			router.beginTurn(ctx, PROMPT);
+			router.applyToContext(ctx, [nativeOrchestrate(), user(PROMPT)]);
+			router.beginTurn(ctx, prompt);
+			expect(modes(router.applyToContext(ctx, [user(prompt)]))).toEqual(["default"]);
+		}
 	});
 
 	test("plan mode enabled after the turn began withholds the notice from later requests", () => {
@@ -245,12 +255,12 @@ describe("autonomous continuations", () => {
 	});
 
 	test("a following gated user prompt ends the policy; a following governed one gets a fresh notice", () => {
-		for (const gated of ["/compact", "plan"]) {
+		for (const gated of ["empty", "plan"]) {
 			const { router, ctx, session } = build();
 			router.beginTurn(ctx, PROMPT);
 			router.applyToContext(ctx, [user(PROMPT)]);
 			if (gated === "plan") Object.assign(session, { getPlanModeState: () => ({ enabled: true }) });
-			router.beginTurn(ctx, gated === "plan" ? "Next request" : gated);
+			router.beginTurn(ctx, gated === "plan" ? "Next request" : "  ");
 			expect(router.applyToContext(ctx, [user(PROMPT), assistant("done"), user("Next request")])).toBeUndefined();
 			expect(router.applyToContext(ctx, [user(PROMPT), assistant("done"), asyncResult()])).toBeUndefined();
 		}
@@ -474,8 +484,8 @@ describe("debug log", () => {
 		router.beginTurn(ctx, secretPrompt);
 		router.applyToContext(ctx, [user(secretPrompt)]);
 		router.applyToContext(ctx, [user(secretPrompt)]);
-		router.beginTurn(ctx, "/compact");
-		expect(logs).toEqual(["debug om-orche.policy mode=default", "debug om-orche.policy skip=slash-command"]);
+		router.beginTurn(ctx, "   ");
+		expect(logs).toEqual(["debug om-orche.policy mode=default", "debug om-orche.policy skip=empty-prompt"]);
 	});
 
 	test("nothing is logged unless debug logging is on", () => {

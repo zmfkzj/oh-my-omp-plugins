@@ -1,4 +1,5 @@
 import type { AuthStorage } from "@oh-my-pi/pi-ai";
+import { stat } from "node:fs/promises";
 import * as path from "node:path";
 import {
   ModelRegistry,
@@ -13,7 +14,9 @@ import {
 import packageJson from "../package.json" with { type: "json" };
 import {
   ROLE,
+  ReviewCredentialError,
   prepareReviewInput,
+  redactSecrets,
   runReview,
   type PreparedReview,
   type ReviewSelection,
@@ -216,8 +219,10 @@ async function readInput(
   }
 
   const resolved = path.resolve(input);
+  const info = await stat(resolved).catch(() => undefined);
+  if (!info) throw new CliError(`Input file not found: ${resolved}`);
+  if (info.isDirectory()) throw new CliError(`Input path is a directory, not a JSON file: ${resolved}`);
   const file = Bun.file(resolved);
-  if (!(await file.exists())) throw new CliError(`Input file not found: ${resolved}`);
   if (file.size > MAX_INPUT_BYTES) {
     throw new CliError(`Input file exceeds the ${MAX_INPUT_BYTES}-byte input limit: ${resolved}`);
   }
@@ -300,14 +305,7 @@ function resolveSelection(
 function safeErrorMessage(error: unknown): string {
   const raw =
     error instanceof Error ? error.message : typeof error === "string" ? error : "Unknown error";
-  const redacted = raw
-    .replace(
-      /((?:api[-_ ]?key|authorization|bearer|access[-_ ]?token|refresh[-_ ]?token|secret|password)\s*(?::|=)\s*)[^\s,;]+/gi,
-      "$1[REDACTED]",
-    )
-    .replace(/\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED]")
-    .replace(/\s+/g, " ")
-    .trim();
+  const redacted = redactSecrets(raw).replace(/\s+/g, " ").trim();
   return redacted.slice(0, 2000) || "Unknown error";
 }
 
@@ -388,6 +386,13 @@ export async function runCli(args: readonly string[] = process.argv.slice(2)): P
 
     const agentDir =
       options.agentDir === undefined ? getAgentDir() : path.resolve(options.agentDir);
+    // OMP creates its databases in whatever directory it is pointed at, so a mistyped
+    // --agent-dir must fail here rather than leave files behind.
+    if (options.agentDir !== undefined) {
+      const info = await stat(agentDir).catch(() => undefined);
+      if (!info) throw new CliError(`Agent directory not found: ${agentDir}`);
+      if (!info.isDirectory()) throw new CliError(`Agent directory is not a directory: ${agentDir}`);
+    }
     const settings = await Settings.loadReadOnly({ cwd: process.cwd(), agentDir });
     controller.signal.throwIfAborted();
     authStorage = await discoverAuthStorage(agentDir);
@@ -419,7 +424,7 @@ export async function runCli(args: readonly string[] = process.argv.slice(2)): P
       exitCode = interruptedExitCode ?? 1;
     } else {
       process.stderr.write(`Error: ${safeErrorMessage(error)}\n`);
-      exitCode = reviewStarted ? 1 : 2;
+      exitCode = reviewStarted && !(error instanceof ReviewCredentialError) ? 1 : 2;
     }
   } finally {
     process.off("SIGINT", onSigint);

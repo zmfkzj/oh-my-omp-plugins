@@ -196,4 +196,57 @@ describe("review_findings", () => {
       status: "resolved", transition: { evidence: [{ entryId: accepted, kind: "user_message" }] },
     });
   });
+
+  test("a user request that starts with a path counts as user evidence and scope", async () => {
+    const session = primarySession();
+    const request = session.user("/Users/me/app/src/main.ts crashes on startup, fix it");
+    const id = `${session.audit(blocker("The crash was not reproduced."))}:0`;
+    expect(collectFindings(session.manager.getBranch())[0]).toMatchObject({
+      scopeUserEntryId: request, scopeUserText: "/Users/me/app/src/main.ts crashes on startup, fix it",
+    });
+    await session.call({ action: "resolve", findingId: id, reason: "The user named the file.", evidence: [request] });
+    expect(session.status()).toEqual(["resolved"]);
+  });
+
+  test("/clear starts the ledger anew: earlier findings and evidence are gone, history stays", async () => {
+    const session = primarySession();
+    const before = session.result("13 pass, 0 fail");
+    const old = `${session.audit(blocker("Claimed tests pass; no runner output."))}:0`;
+    session.manager.appendResetBoundary();
+    session.user("New task: rename foo to bar.");
+    expect(collectFindings(session.manager.getBranch())).toEqual([]);
+    expect(session.manager.getEntries().some((entry) => entry.id === before)).toBe(true);
+    await expect(session.call({ action: "resolve", findingId: old, reason: "passed earlier", evidence: [before] }))
+      .rejects.toThrow(/No Verification Auditor finding/);
+    // A finding raised after the boundary cannot cite what the model no longer sees.
+    const fresh = `${session.audit(blocker("The rename was not applied."))}:0`;
+    await expect(session.call({ action: "resolve", findingId: fresh, reason: "old run", evidence: [before] }))
+      .rejects.toThrow(/not an entry on the active branch/);
+    expect(await session.text({ action: "list" })).not.toContain(before);
+  });
+
+  test("pruned or uneventful tool results cannot back a resolution; a recorded one stays resolved", async () => {
+    const session = primarySession();
+    const output = session.result("13 pass, 0 fail");
+    const useless = session.manager.appendMessage({
+      role: "toolResult", toolCallId: "u", toolName: "grep", content: [{ type: "text", text: "no matches" }],
+      isError: false, useless: true, timestamp: Date.now(),
+    } as Parameters<typeof session.manager.appendMessage>[0]);
+    const id = `${session.audit(blocker("Claimed tests pass; no runner output."))}:0`;
+    await expect(session.call({ action: "resolve", findingId: id, reason: "no matches", evidence: [useless] }))
+      .rejects.toThrow(/uneventful/);
+    await session.call({ action: "resolve", findingId: id, reason: "The run passed.", evidence: [output] });
+    // Host pruning rewrites the entry in place (pi-agent-core compaction/pruning.ts).
+    const entry = session.manager.getEntries().find((candidate) => candidate.id === output);
+    if (entry?.type !== "message" || entry.message.role !== "toolResult") throw new Error("not a tool result");
+    entry.message.content = [{ type: "text", text: "[Output pruned to save context]" }];
+    entry.message.prunedAt = Date.now();
+    const [finding] = collectFindings(session.manager.getBranch());
+    expect(finding).toMatchObject({ status: "resolved", transition: { evidence: [{ entryId: output }] } });
+    expect(finding!.transition!.evidence[0]!.excerpt).not.toContain("Output pruned");
+    // A different finding cannot cite the pruned output.
+    const other = `${session.audit(blocker("The lint run is missing."))}:0`;
+    await expect(session.call({ action: "resolve", findingId: other, reason: "see output", evidence: [output] }))
+      .rejects.toThrow(/pruned/);
+  });
 });

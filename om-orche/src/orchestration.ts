@@ -56,7 +56,10 @@ export function gateRequest(ctx: ExtensionContext, prompt: string, config: Orche
 
 	const text = prompt.trim();
 	if (!text) return { ok: false, reason: "empty-prompt" };
-	if (text.startsWith("/")) return { ok: false, reason: "slash-command" };
+	// Commands never reach `before_agent_start`: extension and custom commands run inside
+	// `AgentSession.prompt` (agent-session.ts `#dispatchPrompt`) and built-ins in the interactive
+	// input controller. A prompt still starting with "/" is text OMP hands the model (an unknown
+	// command, a path), so it is an ordinary request.
 	if (text.startsWith("<system-")) return { ok: false, reason: "synthetic-notice" };
 	if (session.getPlanModeState?.()?.enabled === true) return { ok: false, reason: "plan-mode" };
 	return { ok: true, session };

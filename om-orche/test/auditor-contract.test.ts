@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AdvisorNote } from "@oh-my-pi/pi-coding-agent/advisor/advise-tool";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { WITHHELD_TAIL, enforceAuditorContract } from "../src/auditor-contract.ts";
+import { WITHHELD_TAIL, admittedSeverity, enforceAuditorContract } from "../src/auditor-contract.ts";
 import { collectFindings } from "../src/findings.ts";
 import { AUDITOR_NAME } from "../src/verification-auditor.ts";
 
@@ -56,5 +56,14 @@ describe("Verification Auditor note contract", () => {
     expect(next![2]?.role === "custom" && next![2].content).toBe(WITHHELD_TAIL);
     // Mid-turn the same card simply disappears; the tool results carry the turn.
     expect(enforceAuditorContract([user, card(PROCESS_BLOCKER), answer])).toEqual([user, answer]);
+  });
+
+  test("quotes are paired left to right: a closing quote never opens the next span", () => {
+    expect(admittedSeverity('Stop now: the "x" claim and then "y" mismatch.', "blocker")).toBeUndefined();
+    expect(admittedSeverity('The "x" claim and then "y" mismatch in `bun test`.', "blocker")).toBe("concern");
+    expect(admittedSeverity('The primary said "all tests pass" but ran "x".', "blocker")).toBe("blocker");
+    expect(admittedSeverity("주장은 “모든 테스트 통과” 였다.", "blocker")).toBe("blocker");
+    expect(admittedSeverity("주장은 「테스트 통과」 였다.", "blocker")).toBe("blocker");
+    expect(admittedSeverity("He claimed ‘everything works’ today.", "blocker")).toBe("blocker");
   });
 });

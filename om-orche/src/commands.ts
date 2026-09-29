@@ -171,7 +171,7 @@ function liveWorkerLines(snapshot: Readonly<TelemetrySnapshot>, recording: boole
 					row("usage coverage", `${counters.usageSamples} measured / ${counters.usageUnknown} unknown (${coverage} of settled turns)`),
 					row("measured usage", `${counters.tokens.toLocaleString()} tokens / $${counters.costUsd.toFixed(4)}`),
 					row("avg per measured turn", `${perTurn(counters.tokens)} tokens / ${perTurn(counters.durationMs)}ms`),
-					row("cost per completed", `${perCompleted} (measured completions only)`),
+					row("cost per completed", `${perCompleted} (all measured spend, failed and cancelled turns included, per measured completion)`),
 				],
 				2,
 			),
@@ -261,11 +261,14 @@ async function runReset(runtime: OrcheRuntime, ctx: ExtensionCommandContext): Pr
 		// Some owned files survived; say so rather than claiming a clean slate.
 		telemetryLine = `Telemetry reset incomplete: ${error instanceof Error ? error.message : String(error)}`;
 	}
-	await clearStoredConfig();
+	// OMP has no API for a project's `plugin-overrides.json`, so what it sets survives the reset and is reported.
+	const overridden = await clearStoredConfig(ctx.cwd);
 	await runtime.reloadConfig(ctx.cwd);
 	return [
 		telemetryLine,
-		`Configuration reset to defaults (${Object.keys(DEFAULT_CONFIG).length} keys; retired keys removed too).`,
+		overridden.length === 0
+			? `Configuration reset to defaults (${Object.keys(DEFAULT_CONFIG).length} keys; retired keys removed too).`
+			: `Stored configuration cleared, but this project's plugin-overrides.json still sets ${overridden.join(", ")} and stays in effect here; OMP cannot edit that file, so remove ${overridden.length === 1 ? "that key" : "those keys"} from it to reach the defaults.`,
 	].join("\n");
 }
 
@@ -290,6 +293,9 @@ export function registerCommands(pi: ExtensionAPI, runtime: OrcheRuntime): void 
 						ctx.ui.notify(await renderStatus(pi, runtime, ctx), "info");
 						return;
 					case "stats":
+						// The file may have changed under this process: another process wrote or reset it, or telemetry was
+						// just turned on over an older one, which the first load migrates.
+						await runtime.telemetry.refresh();
 						ctx.ui.notify(renderStats(runtime), "info");
 						return;
 					case "reset":

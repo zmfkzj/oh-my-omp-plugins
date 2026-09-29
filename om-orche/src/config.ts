@@ -87,23 +87,34 @@ export interface LoadedConfig {
 	retiredKeys: string[];
 }
 
-/** Read the merged (global + project-override) plugin settings record. */
-export async function loadConfig(cwd: string): Promise<LoadedConfig> {
-	let raw: Record<string, unknown> | undefined;
+/** The merged (global + project-override) plugin settings record for `cwd`; `undefined` outside OMP's plugin manager. */
+async function readStoredSettings(cwd: string): Promise<Record<string, unknown> | undefined> {
 	try {
-		raw = await getPluginSettings(PLUGIN_NAME, cwd);
+		return await getPluginSettings(PLUGIN_NAME, cwd);
 	} catch {
 		// Loaded outside the plugin manager (e.g. `--extension ./src/index.ts`): defaults apply.
-		raw = undefined;
+		return undefined;
 	}
+}
+
+/** Read the merged (global + project-override) plugin settings record. */
+export async function loadConfig(cwd: string): Promise<LoadedConfig> {
+	const raw = await readStoredSettings(cwd);
 	return { config: normalizeConfig(raw), retiredKeys: retiredConfigKeys(raw) };
 }
 
-/** Drop every stored key, restoring defaults. */
-export async function clearStoredConfig(): Promise<void> {
+/**
+ * Drop every key stored for this plugin in OMP's plugin settings, restoring
+ * defaults, and resolve to the keys the project override for `cwd` still sets.
+ * `plugin-overrides.json` belongs to the project and OMP offers no way to edit
+ * it, so what it sets stays in effect there.
+ */
+export async function clearStoredConfig(cwd: string): Promise<string[]> {
 	const manager = new PluginManager();
 	const stored = await manager.getPluginSettings(PLUGIN_NAME);
 	for (const key of Object.keys(stored)) {
 		await manager.deletePluginSetting(PLUGIN_NAME, key);
 	}
+	// The global settings are gone, so what the merged record still holds is the project's.
+	return Object.keys((await readStoredSettings(cwd)) ?? {});
 }
