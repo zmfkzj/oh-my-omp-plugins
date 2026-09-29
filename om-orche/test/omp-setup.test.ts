@@ -13,10 +13,21 @@ import {
 	type LiveAdvisorSession,
 	runOmpSetup,
 } from "../src/omp-setup.ts";
+import { withStateLock } from "../src/state-lock.ts";
 import { clearRegistry, makeApi, makeSession, registerAsMain } from "./harness.ts";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
-afterEach(clearRegistry);
+const tempRoots: string[] = [];
+afterEach(() => {
+	clearRegistry();
+	for (const root of tempRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+function stateDir(): string {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "om-orche-setup-state-"));
+	tempRoots.push(root);
+	return path.join(root, "state");
+}
 
 const AUDITOR = "verification-auditor";
 const ADVISOR = "orche-advisor";
@@ -61,6 +72,7 @@ function harness(initial?: number, overrides: Record<string, unknown> = {}) {
 	const options: HostSetupOptions = {
 		settings: watch.settings,
 		store,
+		stateDir: stateDir(),
 		logger: new RouteLogger(pi.logger),
 		notify: message => void notes.push(message),
 	};
@@ -107,6 +119,40 @@ describe("fresh install", () => {
 		expect(cfgTaskMaxRecursionDepth.get(h.settings)).toBe(2);
 		expect(h.notes).toHaveLength(1);
 		expect(h.written).toEqual([2]);
+	});
+
+	test("concurrent starts share one setup attempt and report once", async () => {
+		const h = harness();
+		const second = watched(Settings.isolated());
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const version = h.store.version.bind(h.store);
+		h.store.version = async () => {
+			// Snapshot before yielding: without serialization, both calls see an absent marker.
+			const snapshot = await version();
+			entered.resolve();
+			await release.promise;
+			return snapshot;
+		};
+		const firstRun = h.run();
+		await entered.promise;
+		const secondRun = applyOmpSetup({ ...h.options, settings: second.settings });
+		release.resolve();
+		await Promise.all([firstRun, secondRun]);
+
+		expect(cfgAdvisorEnabled.get(h.settings)).toBe(true);
+		expect(h.settings.getModelRole(AUDITOR)).toBe("@smol");
+		expect(h.settings.getModelRole(ADVISOR)).toBe("@slow");
+		expect(cfgTaskMaxRecursionDepth.get(h.settings)).toBe(1);
+		expect(cfgAdvisorEnabled.get(second.settings)).toBe(false);
+		expect(second.settings.getModelRole(AUDITOR)).toBeUndefined();
+		expect(second.settings.getModelRole(ADVISOR)).toBeUndefined();
+		expect(cfgTaskMaxRecursionDepth.get(second.settings)).toBe(2);
+		expect(h.flushes()).toBe(1);
+		expect(second.flushes()).toBe(0);
+		expect(h.written).toEqual([2]);
+		expect(h.notes).toHaveLength(1);
+		expect(warnings(h.logs)).toEqual([]);
 	});
 });
 
@@ -220,6 +266,25 @@ describe("the marker", () => {
 		expect(cfgTaskMaxRecursionDepth.get(h.settings)).toBe(1);
 		expect(h.written).toEqual([2]);
 	});
+
+	test("a competing lock holder's marker is read after acquisition, so the loser writes nothing", async () => {
+		const h = harness();
+		fs.mkdirSync(h.options.stateDir, { recursive: true });
+		await withStateLock(path.join(h.options.stateDir, "setup.lock"), async () => {
+			const attempt = h.run();
+			await h.store.markApplied(2);
+			return { attempt };
+		}).then(async ({ attempt }) => await attempt);
+
+		expect(h.written).toEqual([2]);
+		expect(cfgAdvisorEnabled.get(h.settings)).toBe(false);
+		expect(h.settings.getModelRole(AUDITOR)).toBeUndefined();
+		expect(h.settings.getModelRole(ADVISOR)).toBeUndefined();
+		expect(cfgTaskMaxRecursionDepth.get(h.settings)).toBe(2);
+		expect(h.flushes()).toBe(0);
+		expect(h.notes).toEqual([]);
+		expect(warnings(h.logs)).toEqual([]);
+	});
 });
 
 describe("upgrading from v1", () => {
@@ -288,6 +353,27 @@ describe("upgrading from v1", () => {
 
 describe("failures never reach the session", () => {
 	const boom = new Error("disk full");
+
+	test("an unavailable lock warns once without writing, and a later start retries", async () => {
+		const h = harness();
+		h.options.lock = { waitMs: 0 };
+		fs.mkdirSync(h.options.stateDir, { recursive: true });
+		await withStateLock(path.join(h.options.stateDir, "setup.lock"), async () => {
+			await h.run();
+			expect(warnings(h.logs)).toHaveLength(1);
+			expect(warnings(h.logs)[0]).toContain("held by another process");
+			expect(h.written).toEqual([]);
+			expect(h.flushes()).toBe(0);
+			expect(cfgAdvisorEnabled.get(h.settings)).toBe(false);
+			expect(h.settings.getModelRole(ADVISOR)).toBeUndefined();
+			expect(h.notes).toEqual([]);
+		});
+		await h.run();
+		expect(h.written).toEqual([2]);
+		expect(h.settings.getModelRole(ADVISOR)).toBe("@slow");
+		expect(h.notes).toHaveLength(1);
+		expect(warnings(h.logs)).toHaveLength(1);
+	});
 
 	test("a failing setting write warns once and leaves no marker, and the next start retries", async () => {
 		const h = harness();
@@ -367,7 +453,7 @@ describe("gates", () => {
 		const { fake, ctx, notes } = contextFor(settings);
 		registerAsMain(fake.session);
 		const { pi } = makeApi();
-		await runOmpSetup(ctx, { enabled: true, store, logger: new RouteLogger(pi.logger) });
+		await runOmpSetup(ctx, { enabled: true, store, stateDir: stateDir(), logger: new RouteLogger(pi.logger) });
 
 		expect(settings.getModelRole(ADVISOR)).toBe("@slow");
 		expect(written).toEqual([2]);
@@ -380,7 +466,7 @@ describe("gates", () => {
 		const { fake, ctx, notes } = contextFor(settings, false);
 		registerAsMain(fake.session);
 		const { pi, logs } = makeApi();
-		await runOmpSetup(ctx, { enabled: true, store, logger: new RouteLogger(pi.logger) });
+		await runOmpSetup(ctx, { enabled: true, store, stateDir: stateDir(), logger: new RouteLogger(pi.logger) });
 
 		expect(written).toEqual([2]);
 		expect(notes).toEqual([]);
@@ -393,7 +479,7 @@ describe("gates", () => {
 		const { fake, ctx, notes } = contextFor(settings);
 		registerAsMain(fake.session);
 		const { pi } = makeApi();
-		await runOmpSetup(ctx, { enabled: false, store, logger: new RouteLogger(pi.logger) });
+		await runOmpSetup(ctx, { enabled: false, store, stateDir: stateDir(), logger: new RouteLogger(pi.logger) });
 
 		expect(settings.getModelRole(ADVISOR)).toBeUndefined();
 		expect(cfgAdvisorEnabled.get(settings)).toBe(false);
@@ -407,7 +493,7 @@ describe("gates", () => {
 		const child = contextFor(childSettings);
 		registerAsMain(makeSession().session);
 		const { pi } = makeApi();
-		await runOmpSetup(child.ctx, { enabled: true, store, logger: new RouteLogger(pi.logger) });
+		await runOmpSetup(child.ctx, { enabled: true, store, stateDir: stateDir(), logger: new RouteLogger(pi.logger) });
 
 		expect(childSettings.getModelRole(ADVISOR)).toBeUndefined();
 		expect(written).toEqual([]);

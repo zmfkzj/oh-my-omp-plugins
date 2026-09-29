@@ -79,7 +79,7 @@ function plugin(store: HostSetupStore, settings = Settings.isolated()) {
       if (event === "session_start") handlers.push(handler);
     },
   } as unknown as ExtensionAPI;
-  const runtime = registerOmOrche(pi, store);
+  const runtime = registerOmOrche(pi, store, path.join(root, "state"));
   runtime.reloadConfig = async () => runtime.config;
   runtime.telemetry.load = async () => {};
   return {
@@ -469,7 +469,9 @@ function registeredPlugin(options: { enabled?: boolean; branch?: SessionEntry[];
       handlers.set(event, [...(handlers.get(event) ?? []), handler]);
     },
   } as unknown as ExtensionAPI;
-  const runtimes = Array.from({ length: copies }, () => registerOmOrche(pi));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "om-orche-registered-"));
+  tempRoots.push(root);
+  const runtimes = Array.from({ length: copies }, () => registerOmOrche(pi, markerStore(2).store, path.join(root, "state")));
   for (const runtime of runtimes) {
     runtime.config.enabled = enabled;
     // `syncConfig` would replace the config with the real stored one on every prompt.

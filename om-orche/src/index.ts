@@ -44,7 +44,12 @@ export function registerOmOrche(
 		// One-time OMP setup. It must finish before the auditor installer registered by
 		// `registerOrcheAdvisor` runs in this same session_start, so OMP's live
 		// `advisor.enabled` toggle can start the auditor in the first session.
-		await runOmpSetup(ctx, { enabled: runtime.config.enabled, store: setupStore, logger: runtime.logger });
+		await runOmpSetup(ctx, {
+			enabled: runtime.config.enabled,
+			store: setupStore,
+			stateDir: runtime.stateDir,
+			logger: runtime.logger,
+		});
 		if (main) await runtime.telemetry.load();
 	});
 	// Live usage covers workers named `task`, whichever native path spawned them.

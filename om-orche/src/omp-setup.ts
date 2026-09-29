@@ -29,11 +29,14 @@
  * om-orche hostSetupVersion` remove it; `/om-orche reset` keeps it, because a
  * re-run would re-fill keys the user deliberately deleted.
  */
+import { mkdir } from "node:fs/promises";
+import path from "node:path";
 import { cfgAdvisorEnabled } from "@oh-my-pi/pi-coding-agent/advisor/settings";
 import { PluginManager } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/manager";
 import { cfgTaskMaxRecursionDepth } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { HOST_SETUP_KEY, PLUGIN_NAME } from "./config.ts";
 import { mainSessionOf } from "./host.ts";
+import { DEFAULT_LOCK_TIMING, LockLostError, type LockTiming, withStateLock } from "./state-lock.ts";
 import { AUDITOR_ROLE } from "./verification-auditor.ts";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -118,6 +121,10 @@ export interface HostSetupOptions {
 	/** The running main session; its advisor flag is switched on when this run writes `advisor.enabled`. */
 	liveAdvisor?: LiveAdvisorSession;
 	store: HostSetupStore;
+	/** The plugin's state directory; concurrent sessions and processes share its `setup.lock`. */
+	stateDir: string;
+	/** Bounded acquisition timing, with the same defaults as other state-directory locks. */
+	lock?: Partial<LockTiming>;
 	logger: Pick<RouteLogger, "info" | "warn" | "describeError">;
 	/** Shows the one-time report in the UI; omitted without one. */
 	notify?: (message: string) => void;
@@ -158,33 +165,59 @@ function enableLiveAdvisor(session: LiveAdvisorSession): void {
 	if (!session.isAdvisorEnabled()) session.setAdvisorEnabled(true);
 }
 
+/** One attempt per state directory in this process; followers share its result, including a failure. */
+const setupRuns = new Map<string, Promise<void>>();
+
 /**
- * Apply the setup once. Never throws: a failure is one warning and leaves the
- * marker unwritten, so the next main-session start retries. Whatever was written
- * before the failure is still reported, because those values are live in the settings.
+ * Apply the setup once, single-flight in this process and locked across processes.
+ * Never throws: a failure is one warning and leaves the marker unwritten, so the
+ * next main-session start retries. Partial writes are still reported.
+ * Host settings writes cannot be atomically fenced if a holder is paused beyond the lock's stale limit.
  */
-export async function applyOmpSetup({ settings, liveAdvisor, store, logger, notify }: HostSetupOptions): Promise<void> {
+export async function applyOmpSetup(options: HostSetupOptions): Promise<void> {
+	const lockPath = path.resolve(options.stateDir, "setup.lock");
+	const existing = setupRuns.get(lockPath);
+	if (existing) return existing;
+	const run = applyLockedSetup(options, lockPath);
+	setupRuns.set(lockPath, run);
+	try {
+		await run;
+	} finally {
+		setupRuns.delete(lockPath);
+	}
+}
+
+async function applyLockedSetup(
+	{ settings, liveAdvisor, store, stateDir, lock: timing, logger, notify }: HostSetupOptions,
+	lockPath: string,
+): Promise<void> {
 	const written: SetupItem[] = [];
 	try {
-		const stored = await store.version();
-		if (stored !== undefined && stored >= HOST_SETUP_VERSION) return;
+		await mkdir(stateDir, { recursive: true });
+		await withStateLock(lockPath, async lock => {
+			// Read only after acquisition: another process may have finished while this one waited.
+			const stored = await store.version();
+			if (stored !== undefined && stored >= HOST_SETUP_VERSION) return;
 
-		let pending = 0;
-		for (const item of SETUP_ITEMS) {
-			if (stored !== undefined && item.since <= stored) continue;
-			const provenance = item.provenance(settings);
-			if (provenance === "default") {
-				item.write(settings);
-				written.push(item);
-			} else if (!isUserLayer(provenance)) {
-				pending++;
+			let pending = 0;
+			for (const item of SETUP_ITEMS) {
+				if (stored !== undefined && item.since <= stored) continue;
+				const provenance = item.provenance(settings);
+				if (provenance === "default") {
+					item.write(settings);
+					written.push(item);
+				} else if (!isUserLayer(provenance)) {
+					pending++;
+				}
 			}
-		}
-		if (written.length > 0) await settings.flush();
-		// OMP's own `advisor.enabled` listener does not toggle an already-built session (verified
-		// on a real host), so do what it would: turn the live flag on, and only for a value this run wrote.
-		if (liveAdvisor && written.some(item => item.key === ADVISOR_ENABLED_KEY)) enableLiveAdvisor(liveAdvisor);
-		if (pending === 0) await store.markApplied(HOST_SETUP_VERSION);
+			if (written.length > 0) await settings.flush();
+			// OMP's listener does not toggle an already-built session; enable only a value this run wrote.
+			if (liveAdvisor && written.some(item => item.key === ADVISOR_ENABLED_KEY)) enableLiveAdvisor(liveAdvisor);
+			if (pending === 0) {
+				if (!(await lock.holds())) throw new LockLostError(lockPath);
+				await store.markApplied(HOST_SETUP_VERSION);
+			}
+		}, { ...DEFAULT_LOCK_TIMING, ...timing });
 	} catch (error) {
 		logger.warn(`OMP setup failed and will be retried at the next session start: ${logger.describeError(error)}`);
 	}
@@ -203,7 +236,7 @@ export async function applyOmpSetup({ settings, liveAdvisor, store, logger, noti
  */
 export async function runOmpSetup(
 	ctx: ExtensionContext,
-	options: { enabled: boolean; store: HostSetupStore; logger: HostSetupOptions["logger"] },
+	options: { enabled: boolean } & Pick<HostSetupOptions, "store" | "stateDir" | "lock" | "logger">,
 ): Promise<void> {
 	const session = mainSessionOf(ctx);
 	if (!session || !options.enabled) return;
@@ -211,6 +244,8 @@ export async function runOmpSetup(
 		settings: session.settings,
 		liveAdvisor: session,
 		store: options.store,
+		stateDir: options.stateDir,
+		lock: options.lock,
 		logger: options.logger,
 		notify: ctx.hasUI ? message => ctx.ui.notify(message, "info") : undefined,
 	});

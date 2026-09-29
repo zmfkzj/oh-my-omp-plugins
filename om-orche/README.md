@@ -791,7 +791,12 @@ in your global or project config is never overwritten.
 om-orche stores an internal marker, `hostSetupVersion: 2`, in its plugin settings.
 It is not one of the [three settings](#configuration) and does not appear in
 `omp plugin config list`. With the marker present the setup does nothing, even if
-you later delete one of those OMP keys. If a write fails, the setup logs a
+you later delete one of those OMP keys. Concurrent main sessions share one setup
+attempt in a process; across processes, setup holds the state directory's
+`setup.lock` and re-reads the marker before changing anything, so only the winner
+applies and reports it. The lock uses the same directory-token protocol as
+telemetry's lock, but a separate path so telemetry does not block setup. A lock
+wait is bounded to one second. If acquisition or a write fails, the setup logs a
 warning and tries again at the next start, and writes no marker:
 
 ```text
