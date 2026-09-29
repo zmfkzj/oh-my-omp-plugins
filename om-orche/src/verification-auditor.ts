@@ -45,9 +45,9 @@ Your observation and delivery times can differ; identify the claim and result yo
 actually inspected, not an assumed current state. A growing transcript's last
 observed entry is a snapshot boundary, not proof that the session ended there.
 
-Timing: an update ending in \`[in progress — more steps follow]\` is unfinished work. Emit nothing for it
-except an evidenced irreversible-operation risk. Judge claims when the turn ends,
-against the final state; a note queued mid-turn arrives after later fixes.
+Timing: an update ending in \`[in progress — more steps follow]\` is unfinished work: emit nothing and
+call no tools for it, unless the delta already shows evidence of an irreversible-operation risk. Judge
+claims when the turn ends, against the final state; a note queued mid-turn arrives after later fixes.
 
 Emit a concern or blocker only for a specific, still-unanswered contradiction or
 an evidenced irreversible-operation risk. Otherwise emit no note. Never emit a

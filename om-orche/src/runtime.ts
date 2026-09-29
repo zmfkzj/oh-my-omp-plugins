@@ -16,7 +16,8 @@ import { loadConfig, normalizeConfig, type OrcheConfig, type SettingsReader } fr
 import { mainSessionOf } from "./host.ts";
 import { RouteLogger } from "./logging.ts";
 import { OrchestrationRouter } from "./orchestration.ts";
-import { Telemetry } from "./telemetry.ts";
+import { providerUsageOf, Telemetry } from "./telemetry.ts";
+import { GENERIC_TASK_AGENT } from "./worker-usage.ts";
 
 export interface RuntimeOptions {
 	/** Where stored settings come from; OMP's plugin settings loader unless a test supplies its own. */
@@ -92,6 +93,24 @@ export class OrcheRuntime {
 	 */
 	recordsTelemetry(): boolean {
 		return this.telemetry.recordsFor(this.#telemetrySession);
+	}
+
+	/**
+	 * Count one finished assistant message: what the provider reported for it goes into the main session's counters
+	 * when it is the main session's own, or into the generic `task` worker's row when it is a worker session's. Every
+	 * session runs its own extension, so `ctx` says whose message it is; other subagents, `/tan` clones and
+	 * advisors are not counted. The message is read structurally and only its token counts and cost are kept. Like the
+	 * worker frames, it follows the telemetry choice of the session's top-level session.
+	 */
+	recordProviderUsage(ctx: ExtensionContext, message: unknown): void {
+		if (!this.recordsTelemetry()) return;
+		const usage = providerUsageOf(message);
+		if (!usage) return;
+		if (mainSessionOf(ctx) !== undefined) {
+			this.telemetry.observeMainRequest(usage);
+		} else if (ctx.agent?.kind === "sub" && ctx.agent.name === GENERIC_TASK_AGENT) {
+			this.telemetry.observeWorkerRequest(GENERIC_TASK_AGENT, usage);
+		}
 	}
 
 	/**

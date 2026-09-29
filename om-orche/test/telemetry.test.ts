@@ -11,7 +11,17 @@ import { registerOmOrche } from "../src/index.ts";
 import { RouteLogger } from "../src/logging.ts";
 import { HOST_SETUP_VERSION } from "../src/omp-setup.ts";
 import { OrcheRuntime } from "../src/runtime.ts";
-import { historySnapshotName, Telemetry, type TelemetryOptions, type TelemetryWriteError } from "../src/telemetry.ts";
+import {
+	cacheHitRatio,
+	historySnapshotName,
+	type LiveWorkerCounters,
+	providerUsageOf,
+	type RequestUsage,
+	Telemetry,
+	TELEMETRY_VERSION,
+	type TelemetryOptions,
+	type TelemetryWriteError,
+} from "../src/telemetry.ts";
 import { SUBAGENT_LIFECYCLE_CHANNEL, SUBAGENT_PROGRESS_CHANNEL, trackWorkerUsage } from "../src/worker-usage.ts";
 import { clearRegistry, makeSession, registerAsMain } from "./harness.ts";
 import { registeredSession } from "./sessions.ts";
@@ -180,13 +190,13 @@ describe("live epoch", () => {
 		expect(snapshot.jevRouting).toBeUndefined();
 	});
 
-	test("the live epoch holds workers only: no routing counter is kept, and no decision log is written", async () => {
+	test("the live epoch holds worker and main-session usage only: no routing counter is kept, and no decision log is written", async () => {
 		const dir = await stateDir();
 		const { telemetry, bus } = await following(dir);
 		firstRun([bus], "0-W", FIRST);
 		await telemetry.flush();
 
-		expect(Object.keys(JSON.parse(await readFile(telemetry.file, "utf8")))).toEqual(["version", "updatedAt", "epoch", "workers"]);
+		expect(Object.keys(JSON.parse(await readFile(telemetry.file, "utf8")))).toEqual(["version", "updatedAt", "epoch", "workers", "mainSession"]);
 		expect(await tree(dir)).toEqual(["telemetry.json"]);
 	});
 
@@ -221,6 +231,24 @@ describe("live epoch", () => {
 		expect(text).not.toContain("billing");
 		expect(text).not.toContain("Ledger");
 		expect(JSON.parse(text).workers.task).toMatchObject({ startedObserved: 1, followUpTurns: 1, completed: 2 });
+	});
+
+	test("no message text reaches the file with a request's usage", async () => {
+		const dir = await stateDir();
+		const telemetry = await loaded(dir);
+		const secret = "ts_live_secret refactor the billing ledger";
+		const message = {
+			...assistantMessage({ input: 1, output: 1, cacheRead: 1, cacheWrite: 1, cost: 0.01 }),
+			content: [{ type: "text", text: secret }],
+			errorMessage: secret,
+		};
+		const usage = providerUsageOf(message);
+		if (!usage) throw new Error("the message reported usage");
+		telemetry.observeMainRequest(usage);
+		telemetry.observeWorkerRequest("task", usage);
+		await telemetry.flush();
+
+		expect(await readFile(telemetry.file, "utf8")).not.toContain(secret);
 	});
 
 	test("counts recorded before the first load are merged into the loaded epoch", async () => {
@@ -265,7 +293,7 @@ describe("live epoch", () => {
 	test("a malformed field degrades to zero without discarding the rest", async () => {
 		const dir = await stateDir(
 			JSON.stringify({
-				version: 6,
+				version: TELEMETRY_VERSION,
 				epoch: { id: "epoch-1", startedAt: 1 },
 				workers: { task: { completed: 2, tokens: null }, bogus: 7 },
 				jevRouting: { source: { version: 5, sha256: "not-a-hash" }, orchestration: { requests: 4 } },
@@ -298,7 +326,7 @@ describe("migration from the Jev-routing era (v5)", () => {
 		expect(snapshot.workers).toEqual({});
 
 		const persisted = JSON.parse(await readFile(telemetry.file, "utf8"));
-		expect(persisted).toMatchObject({ version: 6, epoch: snapshot.epoch, workers: {}, jevRouting: V5_JEV_ROUTING, historical: V5.historical });
+		expect(persisted).toMatchObject({ version: TELEMETRY_VERSION, epoch: snapshot.epoch, workers: {}, jevRouting: V5_JEV_ROUTING, historical: V5.historical });
 		expect(persisted.orchestration).toBeUndefined();
 	});
 
@@ -331,7 +359,7 @@ describe("migration from the Jev-routing era (v5)", () => {
 
 		const telemetry = await loaded(dir);
 		expect(telemetry.state()).toEqual({ kind: "active" });
-		expect(JSON.parse(await readFile(telemetry.file, "utf8")).version).toBe(6);
+		expect(JSON.parse(await readFile(telemetry.file, "utf8")).version).toBe(TELEMETRY_VERSION);
 		expect(telemetry.snapshot().jevRouting).toEqual(V5_JEV_ROUTING);
 		expect(await readdir(history)).toEqual([V5_BACKUP]);
 	});
@@ -391,10 +419,10 @@ describe("migration from the Jev-routing era (v5)", () => {
 		firstRun([bus], "0-W", FIRST);
 		await upgraded.flush();
 
-		// Rollback: archive the v6 file, then the previous plugin counts on in a restored v5 file.
-		const v6Text = await readFile(upgraded.file, "utf8");
-		const v6Archive = historySnapshotName(6, sha256(v6Text));
-		await writeFile(path.join(upgraded.historyDir, v6Archive), v6Text, { flag: "wx" });
+		// Rollback: archive the current file, then the previous plugin counts on in a restored v5 file.
+		const currentText = await readFile(upgraded.file, "utf8");
+		const currentArchive = historySnapshotName(TELEMETRY_VERSION, sha256(currentText));
+		await writeFile(path.join(upgraded.historyDir, currentArchive), currentText, { flag: "wx" });
 		const rolledBack = JSON.stringify({ ...V5, orchestration: { ...V5.orchestration, requests: 12, DEFAULT: 8 } });
 		await writeFile(upgraded.file, rolledBack);
 
@@ -406,10 +434,10 @@ describe("migration from the Jev-routing era (v5)", () => {
 		expect(snapshot.jevRouting?.orchestration).toMatchObject({ requests: 12, DEFAULT: 8 });
 		expect(snapshot.historical).toEqual(V5.historical);
 		expect((await readdir(upgraded.historyDir)).sort()).toEqual(
-			[V5_BACKUP, historySnapshotName(5, sha256(rolledBack)), v6Archive].sort(),
+			[V5_BACKUP, historySnapshotName(5, sha256(rolledBack)), currentArchive].sort(),
 		);
 		expect(await readFile(path.join(upgraded.historyDir, V5_BACKUP), "utf8")).toBe(V5_TEXT);
-		expect(await readFile(path.join(upgraded.historyDir, v6Archive), "utf8")).toBe(v6Text);
+		expect(await readFile(path.join(upgraded.historyDir, currentArchive), "utf8")).toBe(currentText);
 	});
 
 	test("a v5 file without a tier era, or with a malformed epoch, still converts", async () => {
@@ -446,7 +474,7 @@ describe("migration from the tier-routing era (pre-v5)", () => {
 		expect(snapshot.workers).toEqual({});
 		expect(await readFile(path.join(telemetry.historyDir, V4_BACKUP), "utf8")).toBe(V4_TEXT);
 		expect(JSON.parse(await readFile(telemetry.file, "utf8"))).toMatchObject({
-			version: 6,
+			version: TELEMETRY_VERSION,
 			epoch: snapshot.epoch,
 			historical: { source: { version: 4, sha256: sha256(V4_TEXT) } },
 		});
@@ -532,7 +560,7 @@ describe("files this version does not write", () => {
 		expect(await readFile(telemetry.file, "utf8")).toBe(V5_TEXT);
 		expect(await tree(dir)).toEqual(["telemetry.json"]);
 
-		const current = JSON.stringify({ version: 6, epoch: { id: "epoch-6", startedAt: 1 }, workers: { task: { completed: 1 } } });
+		const current = JSON.stringify({ version: TELEMETRY_VERSION, epoch: { id: "epoch-6", startedAt: 1 }, workers: { task: { completed: 1 } } });
 		const readOnly = await following(await stateDir(current), false);
 		firstRun([readOnly.bus], "0-W", FIRST);
 		await readOnly.telemetry.flush();
@@ -1118,7 +1146,7 @@ describe("refreshing what a process sees of the file", () => {
 		expect(telemetry.state()).toEqual({ kind: "active" });
 		expect(telemetry.snapshot().jevRouting).toEqual(V5_JEV_ROUTING);
 		expect(await readFile(path.join(telemetry.historyDir, V5_BACKUP), "utf8")).toBe(V5_TEXT);
-		expect(JSON.parse(await readFile(telemetry.file, "utf8")).version).toBe(6);
+		expect(JSON.parse(await readFile(telemetry.file, "utf8")).version).toBe(TELEMETRY_VERSION);
 	});
 
 	test("a deferred view follows another process's migration of the file without writing it", async () => {
@@ -1138,7 +1166,7 @@ describe("refreshing what a process sees of the file", () => {
 		const dir = await stateDir("{ truncated");
 		const telemetry = await loaded(dir);
 		expect(telemetry.state()).toMatchObject({ kind: "suspended", reason: "unreadable" });
-		await writeFile(telemetry.file, JSON.stringify({ version: 6, epoch: { id: "e", startedAt: 1 }, workers: { task: { completed: 3 } } }));
+		await writeFile(telemetry.file, JSON.stringify({ version: TELEMETRY_VERSION, epoch: { id: "e", startedAt: 1 }, workers: { task: { completed: 3 } } }));
 
 		await telemetry.refresh();
 
@@ -1149,6 +1177,7 @@ describe("refreshing what a process sees of the file", () => {
 
 type SessionStart = (event: object, ctx: ExtensionContext) => Promise<void>;
 type CommandHandler = (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+type MessageEnd = (event: object, ctx: ExtensionContext) => void | Promise<void>;
 
 /** A project directory whose plugin override sets `telemetryEnabled`. */
 async function project(telemetryEnabled: boolean): Promise<string> {
@@ -1180,6 +1209,7 @@ function sessionIn(cwd: string, main: boolean, notes: string[] = []): ExtensionC
  */
 function host(dir: string) {
 	const starts: SessionStart[] = [];
+	const messageEnds: MessageEnd[] = [];
 	let handler: CommandHandler | undefined;
 	const bus = new EventBus();
 	const pi = {
@@ -1195,6 +1225,7 @@ function host(dir: string) {
 		setActiveTools: async () => {},
 		on(event: string, listener: SessionStart) {
 			if (event === "session_start") starts.push(listener);
+			else if (event === "message_end") messageEnds.push(listener);
 		},
 	} as unknown as ExtensionAPI;
 	const store = { version: async () => HOST_SETUP_VERSION, markApplied: async () => {} };
@@ -1205,6 +1236,9 @@ function host(dir: string) {
 		bus,
 		async start(ctx: ExtensionContext) {
 			for (const listener of starts) await listener({}, ctx);
+		},
+		async messageEnd(ctx: ExtensionContext, message: object) {
+			for (const listener of messageEnds) await listener({ type: "message_end", message }, ctx);
 		},
 		async command(args: string, ctx: ExtensionCommandContext) {
 			await handler?.(args, ctx);
@@ -1267,7 +1301,7 @@ describe("subagent sessions and the process's shared telemetry", () => {
 		await main.start(mainCtx);
 		expect(main.runtime.telemetry.state()).toEqual({ kind: "active" });
 		expect(await readFile(path.join(main.runtime.telemetry.historyDir, V5_BACKUP), "utf8")).toBe(V5_TEXT);
-		expect(JSON.parse(await readFile(main.runtime.telemetry.file, "utf8")).version).toBe(6);
+		expect(JSON.parse(await readFile(main.runtime.telemetry.file, "utf8")).version).toBe(TELEMETRY_VERSION);
 	});
 
 	test("a running main session's recording follows telemetryEnabled as it changes in the stored settings, from its next turn on", async () => {
@@ -1371,7 +1405,7 @@ describe("/om-orche stats", () => {
 		expect(shown).toContain("Jev routing era (v5)");
 		expect(shown).toContain(`Source snapshot: ${path.join(app.runtime.telemetry.historyDir, V5_BACKUP)}`);
 		expect(shown).not.toContain("not migrated");
-		expect(JSON.parse(await readFile(app.runtime.telemetry.file, "utf8")).version).toBe(6);
+		expect(JSON.parse(await readFile(app.runtime.telemetry.file, "utf8")).version).toBe(TELEMETRY_VERSION);
 	});
 
 	test("shows what another process has counted, without writing anything", async () => {
@@ -1419,5 +1453,225 @@ describe("/om-orche stats", () => {
 		const row = shown.split("\n").find(line => line.includes("cost per completed")) ?? "";
 		expect(row).toContain("$1.1000");
 		expect(row).toMatch(/failed and cancelled/);
+	});
+});
+
+/** A finished assistant message as the host emits it: its usage as the provider reported it. The text is never read. */
+function assistantMessage(usage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }) {
+	const { cost, ...tokens } = usage;
+	return {
+		role: "assistant",
+		content: [{ type: "text", text: "never recorded" }],
+		usage: { ...tokens, totalTokens: tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite, cost: { total: cost } },
+		stopReason: "stop",
+	};
+}
+
+/** What the provider reported for one request, as telemetry counts it. */
+function request(input: number, output: number, cacheRead: number, cacheWrite: number, costUsd = 0): RequestUsage {
+	return { input, output, cacheRead, cacheWrite, costUsd };
+}
+
+describe("provider usage and the cache hit ratio", () => {
+	test("the main session's requests add up, persist with the file, and give the hit ratio", async () => {
+		const dir = await stateDir();
+		const telemetry = await loaded(dir);
+		telemetry.observeMainRequest(request(100, 50, 0, 900, 0.25));
+		telemetry.observeMainRequest(request(20, 30, 900, 80, 0.05));
+
+		const expected = { requests: 2, inputTokens: 120, cacheReadTokens: 900, cacheWriteTokens: 980, outputTokens: 80 };
+		expect(telemetry.snapshot().mainSession).toMatchObject(expected);
+		// 900 cache reads of 2,000 prompt tokens.
+		expect(cacheHitRatio(telemetry.snapshot().mainSession)).toBeCloseTo(0.45, 10);
+
+		await telemetry.flush();
+		const file = JSON.parse(await readFile(telemetry.file, "utf8"));
+		expect(file.version).toBe(TELEMETRY_VERSION);
+		expect(file.mainSession).toMatchObject(expected);
+		expect(file.mainSession.costUsd).toBeCloseTo(0.3, 10);
+		expect((await loaded(dir)).snapshot().mainSession).toMatchObject(expected);
+	});
+
+	test("the ratio is undefined until a prompt token was counted", () => {
+		expect(cacheHitRatio({ inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 })).toBeUndefined();
+		expect(cacheHitRatio({ inputTokens: 0, cacheReadTokens: 50, cacheWriteTokens: 0 })).toBe(1);
+		expect(cacheHitRatio({ inputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 50 })).toBe(0);
+	});
+
+	test("only a finished assistant message that reported tokens is a request, and only its numbers are read", () => {
+		const message = assistantMessage({ input: 10, output: 5, cacheRead: 200, cacheWrite: 30, cost: 0.02 });
+
+		expect(providerUsageOf(message)).toEqual({ input: 10, output: 5, cacheRead: 200, cacheWrite: 30, costUsd: 0.02 });
+		expect(providerUsageOf({ role: "user", content: "text", usage: message.usage })).toBeUndefined();
+		expect(providerUsageOf({ role: "toolResult", usage: message.usage })).toBeUndefined();
+		expect(providerUsageOf(assistantMessage({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }))).toBeUndefined();
+		expect(providerUsageOf({ role: "assistant", usage: "garbage" })).toBeUndefined();
+		expect(providerUsageOf({ role: "assistant" })).toBeUndefined();
+		expect(providerUsageOf(undefined)).toBeUndefined();
+		expect(providerUsageOf({ role: "assistant", usage: { input: -5, output: Number.NaN, cacheRead: 7 } })).toEqual({
+			input: 0,
+			output: 0,
+			cacheRead: 7,
+			cacheWrite: 0,
+			costUsd: 0,
+		});
+	});
+
+	test("a worker session's requests join its row beside the frame counters and give the worker's own ratio", async () => {
+		const { telemetry, bus } = await following(await stateDir());
+		firstRun([bus], "0-W", FIRST);
+		telemetry.observeWorkerRequest("task", request(50, 10, 0, 450));
+		telemetry.observeWorkerRequest("task", request(5, 10, 450, 20));
+
+		const row: LiveWorkerCounters | undefined = telemetry.snapshot().workers.task;
+		if (!row) throw new Error("no worker row");
+		// The frame counters are untouched by the provider counters, and the other way round.
+		expect(row).toMatchObject({ startedObserved: 1, completed: 1, tokens: 500, requests: 2, inputTokens: 55, cacheReadTokens: 450, cacheWriteTokens: 470, outputTokens: 20 });
+		expect(cacheHitRatio(row)).toBeCloseTo(450 / 975, 10);
+		expect(telemetry.snapshot().mainSession.requests).toBe(0);
+	});
+
+	test("the requests of several processes add, whichever writes last", async () => {
+		const dir = await stateDir();
+		const a = await loaded(dir);
+		const b = await loaded(dir);
+		a.observeMainRequest(request(10, 1, 100, 0, 0.1));
+		b.observeMainRequest(request(20, 2, 0, 200, 0.2));
+		b.observeWorkerRequest("task", request(1, 1, 1, 1));
+		await a.flush();
+		await b.flush();
+
+		const file = JSON.parse(await readFile(a.file, "utf8"));
+		expect(file.mainSession).toMatchObject({ requests: 2, inputTokens: 30, cacheReadTokens: 100, cacheWriteTokens: 200, outputTokens: 3 });
+		expect(file.workers.task).toMatchObject({ requests: 1, cacheReadTokens: 1 });
+	});
+
+	test("nothing is counted while telemetry is off", async () => {
+		const dir = await stateDir();
+		const telemetry = await loaded(dir, false);
+		telemetry.observeMainRequest(request(1, 1, 1, 1));
+		telemetry.observeWorkerRequest("task", request(1, 1, 1, 1));
+		await telemetry.flush();
+
+		expect(telemetry.snapshot().mainSession.requests).toBe(0);
+		expect(telemetry.snapshot().workers).toEqual({});
+		expect(await tree(dir)).toEqual([]);
+	});
+
+	test("stats shows the main session's requests and hit ratio, and each worker's own ratio", async () => {
+		const { telemetry, bus } = await following(await stateDir());
+		firstRun([bus], "0-W", FIRST);
+		telemetry.observeMainRequest(request(100, 50, 0, 900, 0.25));
+		telemetry.observeMainRequest(request(20, 30, 900, 80, 0.05));
+		telemetry.observeWorkerRequest("task", request(10, 5, 90, 0));
+
+		const shown = renderStats({ telemetry, config: normalizeConfig(undefined) } as unknown as OrcheRuntime);
+
+		expect(shown).toMatch(/requests\s+2\b/);
+		expect(shown).toMatch(/cache hit ratio\s+45\.0%/);
+		expect(shown).toMatch(/cache hit ratio\s+90\.0%/);
+		expect(shown).toContain("$0.3000");
+	});
+});
+
+describe("which sessions' finished assistant messages are counted", () => {
+	test("each follows its own top-level session's choice, and only main and generic worker sessions count", async () => {
+		const dir = await stateDir();
+		const [on, off, worker, explorer] = [host(dir), host(dir), host(dir), host(dir)] as const;
+		const mainOn = registeredSession("acp:on", await project(true));
+		const mainOff = registeredSession("acp:off", await project(false));
+		// A worker's own directory says off, but it belongs to the main session that says on.
+		const taskWorker = registeredSession("1-task", await project(false), "acp:on");
+		const other = registeredSession("2-explore", await project(true), "acp:on");
+		const explorerCtx = { ...other, agent: { ...other.agent, name: "explore" } } as ExtensionCommandContext;
+		await on.start(mainOn);
+		await off.start(mainOff);
+		await worker.start(taskWorker);
+		await explorer.start(explorerCtx);
+
+		const message = assistantMessage({ input: 10, output: 5, cacheRead: 100, cacheWrite: 20, cost: 0.01 });
+		await on.messageEnd(mainOn, message);
+		await off.messageEnd(mainOff, message);
+		await worker.messageEnd(taskWorker, message);
+		await explorer.messageEnd(explorerCtx, message);
+		await on.messageEnd(mainOn, { role: "user", content: "not a request" });
+
+		const { mainSession, workers } = on.runtime.telemetry.snapshot();
+		expect(mainSession).toMatchObject({ requests: 1, inputTokens: 10, cacheReadTokens: 100, cacheWriteTokens: 20, outputTokens: 5 });
+		expect(workers.task).toMatchObject({ requests: 1, cacheReadTokens: 100 });
+	});
+});
+
+/** A file of the format before provider-usage counters, with a live epoch worth keeping and both read-only eras. */
+const V6 = {
+	version: 6,
+	updatedAt: 1_760_000_000_000,
+	epoch: { id: "epoch-v6", startedAt: 1_759_000_000_000 },
+	workers: {
+		task: {
+			startedObserved: 3,
+			followUpTurns: 1,
+			completed: 3,
+			failed: 1,
+			aborted: 0,
+			usageSamples: 4,
+			usageSamplesCompleted: 3,
+			usageUnknown: 0,
+			tokens: 900,
+			costUsd: 0.9,
+			durationMs: 3000,
+		},
+	},
+	jevRouting: V5_JEV_ROUTING,
+	historical: V5.historical,
+};
+/** Pretty-printed with a trailing newline, so a backup that re-serialized the JSON would differ. */
+const V6_TEXT = `${JSON.stringify(V6, null, 2)}\n`;
+
+describe("a file of the version before provider usage", () => {
+	test("converts with its live epoch and read-only eras intact, and the new counters start at zero", async () => {
+		const dir = await stateDir(V6_TEXT);
+		const telemetry = await loaded(dir);
+
+		expect(telemetry.state()).toEqual({ kind: "active" });
+		const snapshot = telemetry.snapshot();
+		expect(snapshot.epoch).toEqual(V6.epoch);
+		expect(snapshot.workers.task).toMatchObject({ ...V6.workers.task, requests: 0, cacheReadTokens: 0 });
+		expect(snapshot.mainSession).toMatchObject({ requests: 0, cacheReadTokens: 0 });
+		expect(snapshot.jevRouting).toEqual(V5_JEV_ROUTING);
+		expect(snapshot.historical).toEqual(V5.historical);
+		// The original is kept byte for byte, and what is on disk now is the new version.
+		expect(await readFile(path.join(telemetry.historyDir, historySnapshotName(6, sha256(V6_TEXT))), "utf8")).toBe(V6_TEXT);
+		expect(JSON.parse(await readFile(telemetry.file, "utf8"))).toMatchObject({
+			version: TELEMETRY_VERSION,
+			epoch: V6.epoch,
+			workers: { task: V6.workers.task },
+		});
+
+		// The epoch goes on: new counts add to the carried ones.
+		telemetry.observeMainRequest(request(1, 1, 8, 1));
+		await telemetry.flush();
+		expect(JSON.parse(await readFile(telemetry.file, "utf8"))).toMatchObject({
+			epoch: V6.epoch,
+			mainSession: { requests: 1, cacheReadTokens: 8 },
+			workers: { task: { startedObserved: 3 } },
+		});
+	});
+
+	test("with telemetry off is shown as it is and left untouched, and converts once telemetry is on", async () => {
+		const dir = await stateDir(V6_TEXT);
+		const telemetry = await loaded(dir, false);
+
+		expect(telemetry.state()).toEqual({ kind: "deferred", version: 6, sha256: sha256(V6_TEXT) });
+		expect(telemetry.snapshot().workers.task).toMatchObject({ startedObserved: 3 });
+		expect(await readFile(telemetry.file, "utf8")).toBe(V6_TEXT);
+		const shown = renderStats({ telemetry, config: normalizeConfig({ telemetryEnabled: false }) } as unknown as OrcheRuntime);
+		expect(shown).toMatch(/workers started\s+3 observed/);
+
+		telemetry.setEnabled(true);
+		await telemetry.refresh();
+
+		expect(telemetry.state()).toEqual({ kind: "active" });
+		expect(JSON.parse(await readFile(telemetry.file, "utf8")).version).toBe(TELEMETRY_VERSION);
 	});
 });

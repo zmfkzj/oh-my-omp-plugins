@@ -7,17 +7,19 @@ import path from "node:path";
 import { clearStoredConfig, DEFAULT_CONFIG, PLUGIN_NAME } from "./config.ts";
 import { mainSessionOf } from "./host.ts";
 import { HOST_SETUP_VERSION, type HostSetupStore, pluginSetupStore } from "./omp-setup.ts";
-import { POLICY_NOTICE_TYPE } from "./orchestration-policy.ts";
+import { AUDITOR_NAME } from "./verification-auditor.ts";
 import {
+	cacheHitRatio,
 	type HistoricalJevRouting,
 	type HistoricalTelemetry,
 	historySnapshotName,
+	type MainSessionUsage,
 	type OrchestrationCounters,
 	type Telemetry,
 	type TelemetrySnapshot,
 	type TelemetryState,
 } from "./telemetry.ts";
-import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
+import type { AgentSession, ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import type { OrcheRuntime } from "./runtime.ts";
 
 export const COMMAND_NAME = PLUGIN_NAME;
@@ -43,6 +45,33 @@ async function ompSetupStatus(enabled: boolean, store: HostSetupStore): Promise<
 /** Model roles the retired tier router created; user-owned, never deleted or read. */
 const RETIRED_TIER_ROLES = ["task_easy", "task_hard", "task_challenge"] as const;
 
+/**
+ * The Verification Auditor's usage in this session so far, from the host's own advisor accounting
+ * (`getAdvisorStats`): its token counts come from the advisor's current transcript, its cost is cumulative.
+ * Nothing when the session has no such advisor.
+ */
+function auditorLines(session: AgentSession | undefined): string[] {
+	if (typeof session?.getAdvisorStats !== "function") return [];
+	try {
+		const auditor = session.getAdvisorStats().advisors.find(advisor => advisor.name === AUDITOR_NAME);
+		if (!auditor) return [];
+		const { tokens } = auditor;
+		const ratio = cacheHitRatio({ inputTokens: tokens.input, cacheReadTokens: tokens.cacheRead, cacheWriteTokens: tokens.cacheWrite });
+		return [
+			"",
+			row(AUDITOR_NAME, auditor.status),
+			row(
+				"  tokens",
+				`input ${grouped(tokens.input)} / output ${grouped(tokens.output)} / cache read ${grouped(tokens.cacheRead)} / cache write ${grouped(tokens.cacheWrite)}`,
+			),
+			row("  cache hit ratio", percent(ratio)),
+			row("  cost", `$${auditor.cost.toFixed(4)}`),
+		];
+	} catch (error) {
+		return ["", row(AUDITOR_NAME, `usage unavailable: ${(error instanceof Error ? error.message : String(error)).slice(0, 200)}`)];
+	}
+}
+
 export async function renderStatus(
 	pi: ExtensionAPI,
 	runtime: OrcheRuntime,
@@ -57,7 +86,7 @@ export async function renderStatus(
 
 	const lines = [
 		row(PLUGIN_NAME, config.enabled ? "enabled" : "disabled"),
-		row("Execution policy", config.enabled ? `judgment/production (${POLICY_NOTICE_TYPE})` : "native (plugin disabled)"),
+		row("Execution policy", config.enabled ? "judgment/production (system prompt)" : "native (plugin disabled)"),
 		row("Primary model", "unchanged — no model switching"),
 		row("OMP setup", await ompSetupStatus(config.enabled, setupStore)),
 		"",
@@ -72,6 +101,7 @@ export async function renderStatus(
 			`  @${GENERIC_TASK_AGENT} does not resolve in this session; task workers use the main session's active model.`,
 		);
 	}
+	lines.push(...auditorLines(session));
 
 	if (runtime.configError !== undefined) {
 		lines.push(
@@ -153,6 +183,35 @@ function routingDecisionRows(counters: OrchestrationCounters & { legacyDecisions
 	];
 }
 
+function grouped(value: number): string {
+	return value.toLocaleString();
+}
+
+/** A share as a percentage, or a dash while no prompt token has been counted. */
+function percent(ratio: number | undefined): string {
+	return ratio === undefined ? "—" : `${(ratio * 100).toFixed(1)}%`;
+}
+
+/** The main session's provider usage for the live epoch; the workers' is under each worker. */
+function mainSessionLines(usage: Readonly<MainSessionUsage>, recording: boolean): string[] {
+	const rows = [
+		row("requests", grouped(usage.requests)),
+		row("input (uncached)", grouped(usage.inputTokens)),
+		row("cache read", grouped(usage.cacheReadTokens)),
+		row("cache write", grouped(usage.cacheWriteTokens)),
+		row("output", grouped(usage.outputTokens)),
+		row("cache hit ratio", `${percent(cacheHitRatio(usage))} (cache read ÷ (input + cache read + cache write))`),
+		row("cost", `$${usage.costUsd.toFixed(4)}`),
+	];
+	return [
+		recording
+			? "Main session — provider usage, live epoch"
+			: "Main session — provider usage (recording is off; what the state file holds)",
+		...indent(rows, 1),
+		"  Finished assistant messages of the main session only; compaction, title and advisor requests are not in it.",
+	];
+}
+
 /** The live epoch: per worker agent, how many workers and turns were observed and what the settled turns measured. */
 function liveWorkerLines(snapshot: Readonly<TelemetrySnapshot>, recording: boolean): string[] {
 	const epoch = `epoch ${snapshot.epoch.id} since ${isoOf(snapshot.epoch.startedAt)}`;
@@ -181,6 +240,15 @@ function liveWorkerLines(snapshot: Readonly<TelemetrySnapshot>, recording: boole
 					row("measured usage", `${counters.tokens.toLocaleString()} tokens / $${counters.costUsd.toFixed(4)}`),
 					row("avg per measured turn", `${perTurn(counters.tokens)} tokens / ${perTurn(counters.durationMs)}ms`),
 					row("cost per completed", `${perCompleted} (all measured spend, failed and cancelled turns included, per measured completion)`),
+					...(counters.requests === 0
+						? [row("cache hit ratio", "— (no provider usage observed)")]
+						: [
+								row("cache hit ratio", `${percent(cacheHitRatio(counters))} over ${grouped(counters.requests)} requests`),
+								row(
+									"provider tokens",
+									`input ${grouped(counters.inputTokens)} / cache read ${grouped(counters.cacheReadTokens)} / cache write ${grouped(counters.cacheWriteTokens)} / output ${grouped(counters.outputTokens)}`,
+								),
+							]),
 				],
 				2,
 			),
@@ -191,6 +259,7 @@ function liveWorkerLines(snapshot: Readonly<TelemetrySnapshot>, recording: boole
 		"  Every turn of a worker — its first run and each follow-up — settles and is measured on its own.",
 		"  completed = the turn finished, not acceptance of its result.",
 		"  Not observed: turns of a worker OMP revives from disk after a restart.",
+		"  Cache figures count each worker session's own finished assistant messages: a progress frame carries no cache reads.",
 	);
 	return lines;
 }
@@ -243,10 +312,15 @@ export function renderStats(runtime: OrcheRuntime): string {
 	const note = telemetryStateNote(state, telemetry.file);
 	if (note) lines.push(note, "");
 
-	if (state.kind === "deferred" || state.kind === "suspended") {
+	if (state.kind === "suspended" || (state.kind === "deferred" && snapshot.updatedAt === 0)) {
 		lines.push("Task workers — not recording");
 	} else {
-		lines.push(...liveWorkerLines(snapshot, runtime.config.telemetryEnabled));
+		// A deferred v6 file keeps its live epoch, shown read-only; a deferred older one converted it into an era.
+		lines.push(
+			...mainSessionLines(snapshot.mainSession, runtime.config.telemetryEnabled),
+			"",
+			...liveWorkerLines(snapshot, runtime.config.telemetryEnabled),
+		);
 	}
 
 	const eras = [

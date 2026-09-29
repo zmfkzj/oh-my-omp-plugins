@@ -13,8 +13,9 @@ import { registerOmOrche } from "../src/index.ts";
 import { AUDITOR_NAME, VERIFICATION_AUDITOR } from "../src/verification-auditor.ts";
 import { cfgAdvisorEnabled } from "@oh-my-pi/pi-coding-agent/advisor/settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { ORCHESTRATE_GUIDANCE, registerOrcheAdvisor } from "../src/orche-advisor.ts";
+import { ADVISOR_GUIDANCE, registerOrcheAdvisor } from "../src/orche-advisor.ts";
 import {
+  isPolicySection,
   NATIVE_ORCHESTRATE_NOTICE_TYPE,
   NATIVE_WORKFLOW_NOTICE_TYPE,
   policyModeOf,
@@ -417,6 +418,8 @@ test("advice is primary-only and one request runs at a time", async () => {
 });
 
 const PROMPT = "Refactor the ingestion pipeline.";
+/** Stands in for OMP's base system prompt. */
+const BASE = ["base system prompt"];
 
 function user(text: string): AgentMessage {
   return { role: "user", content: [{ type: "text", text }], timestamp: 0 } as AgentMessage;
@@ -427,20 +430,19 @@ function assistant(text: string): AgentMessage {
 function keywordNotice(customType: string, timestamp: number, content = customType): AgentMessage {
   return { role: "custom", customType, content, display: false, attribution: "user", timestamp } as AgentMessage;
 }
-function guidanceCount(message: AgentMessage | undefined): number {
-  return message?.role === "custom" && typeof message.content === "string"
-    ? message.content.split(ORCHESTRATE_GUIDANCE).length - 1
-    : 0;
-}
-function totalGuidance(messages: AgentMessage[]): number {
-  return messages.reduce((total, message) => total + guidanceCount(message), 0);
-}
 function ofType(messages: AgentMessage[], customType: string): AgentMessage[] {
   return messages.filter(message => message.role === "custom" && message.customType === customType);
 }
+function modesOf(messages: AgentMessage[]) {
+  return messages.flatMap(message => policyModeOf(message) ?? []);
+}
 
-/** The whole plugin as OMP loads it, with no network, credentials or disk writes. */
-function registeredPlugin(enabled = true, branch: SessionEntry[] = []) {
+/**
+ * The whole plugin as OMP loads it, with no network, credentials or disk writes. `copies` loads it more than
+ * once, as happens when it is both installed and passed with `-e`.
+ */
+function registeredPlugin(options: { enabled?: boolean; branch?: SessionEntry[]; adviceActive?: boolean; copies?: number } = {}) {
+  const { enabled = true, branch = [], adviceActive = true, copies = 1 } = options;
   const { session, ctx } = makeSession({ branch });
   Object.assign(session.sessionManager, {
     appendCustomEntry(customType: string, data: unknown) {
@@ -449,9 +451,10 @@ function registeredPlugin(enabled = true, branch: SessionEntry[] = []) {
       return id;
     },
   });
-  // The router reads the model's context off the session, as the host's `AgentSession.messages` getter does.
-  const messages: AgentMessage[] = [];
-  Object.assign(session, { isAdvisorEnabled: () => false, messages });
+  Object.assign(session, { isAdvisorEnabled: () => false });
+  // The agent's live system prompt, which `ctx.getSystemPrompt()` reads.
+  const system = [...BASE];
+  Object.assign(ctx, { getSystemPrompt: () => system });
   registerAsMain(session);
   const handlers = new Map<string, Handler[]>();
   const pi = {
@@ -461,18 +464,20 @@ function registeredPlugin(enabled = true, branch: SessionEntry[] = []) {
     events: { on: () => () => {} },
     registerCommand() {},
     registerTool() {},
-    getActiveTools: () => [TOOL],
+    getActiveTools: () => (adviceActive ? [TOOL] : []),
     on(event: string, handler: Handler) {
       handlers.set(event, [...(handlers.get(event) ?? []), handler]);
     },
   } as unknown as ExtensionAPI;
-  const runtime = registerOmOrche(pi);
-  runtime.config.enabled = enabled;
-  // `syncConfig` would replace the config with the real stored one on every turn.
-  runtime.syncConfig = async () => {};
-  runtime.telemetry.setEnabled(false);
+  const runtimes = Array.from({ length: copies }, () => registerOmOrche(pi));
+  for (const runtime of runtimes) {
+    runtime.config.enabled = enabled;
+    // `syncConfig` would replace the config with the real stored one on every prompt.
+    runtime.syncConfig = async () => {};
+    runtime.telemetry.setEnabled(false);
+  }
   return {
-    branch, session, ctx, runtime, messages,
+    branch, session, ctx, runtime: runtimes[0]!,
     async endTurn() {
       for (const handler of handlers.get("agent_end") ?? []) await handler({ type: "agent_end", willContinue: false }, ctx);
     },
@@ -485,21 +490,18 @@ function registeredPlugin(enabled = true, branch: SessionEntry[] = []) {
       return undefined;
     },
     /**
-     * Deliver a prompt as the host does: the user message joins the session's context, then the hidden
-     * message a `before_agent_start` handler returned is appended after it. Returns that appended message.
+     * Deliver a prompt as the host does (`ExtensionRunner.emitBeforeAgentStart`): the handlers chain the system
+     * prompt in registration order, and what comes out is the turn's system prompt, the base if none changed it.
      */
-    async beginTurn(prompt: string): Promise<AgentMessage[]> {
-      messages.push(user(prompt));
-      const appended: AgentMessage[] = [];
+    async beginTurn(prompt: string): Promise<string[]> {
+      let current = BASE;
       for (const handler of handlers.get("before_agent_start") ?? []) {
-        const result = await handler({ type: "before_agent_start", prompt, systemPrompt: [] }, ctx) as
-          { message?: Record<string, unknown> } | undefined;
-        if (result?.message) {
-          appended.push({ role: "custom", ...result.message, attribution: "user", timestamp: 0 } as AgentMessage);
-        }
+        const result = await handler({ type: "before_agent_start", prompt, systemPrompt: current }, ctx) as
+          { systemPrompt?: string[] } | undefined;
+        if (result?.systemPrompt !== undefined) current = result.systemPrompt;
       }
-      messages.push(...appended);
-      return appended;
+      system.splice(0, system.length, ...current);
+      return [...system];
     },
     /** Mirrors `ExtensionRunner.emitContext`: a cloned array flows through handlers in registration order. */
     async context(messages: AgentMessage[]): Promise<AgentMessage[]> {
@@ -537,7 +539,7 @@ function staleGateHistory(): SessionEntry[] {
 for (const explicit of [false, true]) {
   test(`${explicit ? "explicit orchestrate" : "default"}: stale gate records, findings, failed and REPLAN/ESCALATE advice never block mutation or spawn`, async () => {
     const branch = staleGateHistory();
-    const plugin = registeredPlugin(true, branch);
+    const plugin = registeredPlugin({ branch });
     const advisor = adviceFixture(branch);
     // Real advice results persisted on the same branch: rejection-style verdicts and a provider failure.
     for (const verdict of ["REPLAN", "ESCALATE"]) {
@@ -565,25 +567,38 @@ for (const explicit of [false, true]) {
   });
 }
 
-test("explicit orchestration composes stand-in policy notices with Advisor guidance once", async () => {
+test("the system prompt is the base, then the execution policy, then the advice guidance, each once and always the same", async () => {
   const plugin = registeredPlugin();
-  const historical = keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 1, "earlier native");
-  const persisted = [historical, user("Earlier request"), assistant("done"),
+  const system = await plugin.beginTurn(PROMPT);
+  expect(system).toHaveLength(3);
+  expect(system[0]).toBe(BASE[0]!);
+  expect(isPolicySection(system[1]!)).toBe(true);
+  expect(system[2]).toBe(ADVISOR_GUIDANCE);
+  // A user prompt, a synthetic one and a blank one all get exactly this system prompt.
+  for (const prompt of ["Next request", "<system-notice>background job finished</system-notice>", "   "]) {
+    expect(await plugin.beginTurn(prompt)).toEqual(system);
+  }
+  // Nothing enters the transcript: the model's messages carry none of it.
+  const messages = [user(PROMPT), assistant("done"), user("Next request")];
+  expect(await plugin.context(messages)).toEqual(messages);
+});
+
+test("without the advice tool there is no guidance, and a second copy of the plugin adds neither element twice", async () => {
+  expect((await registeredPlugin({ adviceActive: false }).beginTurn(PROMPT)).map(isPolicySection)).toEqual([false, true]);
+  expect(await registeredPlugin({ copies: 2 }).beginTurn(PROMPT)).toEqual(await registeredPlugin().beginTurn(PROMPT));
+});
+
+test("explicit orchestration: every native notice becomes a stand-in in place, and nothing else is added or repeated", async () => {
+  const plugin = registeredPlugin();
+  await plugin.beginTurn(PROMPT);
+  const persisted = [keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 1, "earlier native"), user("Earlier request"), assistant("done"),
     keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 2), user(PROMPT)];
   const snapshot = structuredClone(persisted);
 
   const first = await plugin.context(persisted);
   expect(persisted).toEqual(snapshot);
-  // Every native notice, historical or current, becomes a stand-in in place; the default copy trails.
   expect(ofType(first, NATIVE_ORCHESTRATE_NOTICE_TYPE)).toEqual([]);
-  const policy = first.filter(message => policyModeOf(message) !== undefined);
-  expect(policy.map(policyModeOf)).toEqual(["orchestrate", "orchestrate", "default"]);
-  expect(first[0]).toBe(policy[0]!);
-  expect(first[3]).toBe(policy[1]!);
-  expect(first.at(-1)).toBe(policy[2]!);
-  expect(guidanceCount(policy[0])).toBe(1);
-  expect(totalGuidance(first)).toBe(1);
-
+  expect(first.map(policyModeOf)).toEqual(["orchestrate", undefined, undefined, "orchestrate", undefined]);
   // A later provider request re-runs every hook on persisted history, or on an already composed copy.
   expect(await plugin.context(persisted)).toEqual(first);
   expect(await plugin.context(first)).toEqual(first);
@@ -592,67 +607,27 @@ test("explicit orchestration composes stand-in policy notices with Advisor guida
   expect(await plugin.context(persisted)).toEqual(first);
 });
 
-test("a workflow turn keeps the native workflow notice and gets one guided supplement", async () => {
+test("a workflow turn keeps the native workflow notice and adds one supplement", async () => {
   for (const explicit of [false, true]) {
     const plugin = registeredPlugin();
+    await plugin.beginTurn(PROMPT);
     const workflow = keywordNotice(NATIVE_WORKFLOW_NOTICE_TYPE, 3);
     const persisted = [assistant("previous"),
       ...(explicit ? [keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 3)] : []), workflow, user(PROMPT)];
     for (const composed of [await plugin.context(persisted), await plugin.context(persisted)]) {
       expect(ofType(composed, NATIVE_WORKFLOW_NOTICE_TYPE)).toEqual([workflow]);
       expect(ofType(composed, NATIVE_ORCHESTRATE_NOTICE_TYPE)).toEqual([]);
-      const policy = composed.filter(message => policyModeOf(message) !== undefined);
-      expect(policy.map(policyModeOf)).toEqual(["workflow", "default"]);
-      expect(guidanceCount(policy[0])).toBe(1);
-      expect(totalGuidance(composed)).toBe(1);
+      expect(modesOf(composed)).toEqual(["workflow"]);
     }
   }
 });
 
-test("a default turn carries the Judgment/Production policy without orchestration guidance", async () => {
-  const plugin = registeredPlugin();
-  const appended = await plugin.beginTurn(PROMPT);
-  expect(appended.map(policyModeOf)).toEqual(["default"]);
-  const composed = await plugin.context([user(PROMPT), ...appended]);
-  expect(composed.map(message => policyModeOf(message) ?? null).filter(Boolean)).toEqual(["default"]);
-  expect(totalGuidance(composed)).toBe(0);
-  // The persisted notice is still in the model's context, so the next prompt persists no second one.
-  expect(await plugin.beginTurn("Next request")).toEqual([]);
-});
-
-test("master disable leaves native guidance unchanged and does not gate execution", async () => {
-  const plugin = registeredPlugin(false);
-  expect(await plugin.beginTurn(PROMPT)).toEqual([]);
+test("master disable leaves the system prompt and OMP's native notices unchanged and does not gate execution", async () => {
+  const plugin = registeredPlugin({ enabled: false });
+  expect(await plugin.beginTurn(PROMPT)).toEqual(BASE);
   const messages = [keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 1), user(PROMPT)];
   expect(await plugin.context(messages)).toEqual(messages);
   expect(await plugin.attempt("edit")).toBeUndefined();
-});
-
-test("without a router policy, only the current turn's native notice is guided, by copy", async () => {
-  const branch: SessionEntry[] = [];
-  const { session, ctx } = makeSession({ branch });
-  registerAsMain(session);
-  let context: Handler | undefined;
-  registerOrcheAdvisor({
-    zod: z,
-    registerTool() {},
-    getActiveTools: () => [TOOL],
-    on(event: string, handler: Handler) { if (event === "context") context = handler; },
-  } as unknown as ExtensionAPI);
-  const historical = keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 1);
-  const current = keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 2);
-  const messages = [historical, user("Earlier request"), assistant("done"), current, user(PROMPT)]
-    .map(message => Object.freeze(message));
-  const snapshot = structuredClone(messages);
-  const result = await context!({ type: "context", messages }, ctx) as { messages: AgentMessage[] };
-  expect(messages).toEqual(snapshot);
-  expect(result.messages[0]).toBe(historical);
-  expect(guidanceCount(result.messages[3])).toBe(1);
-  expect(totalGuidance(result.messages)).toBe(1);
-  expect(await context!({ type: "context", messages: result.messages }, ctx)).toBeUndefined();
-  // A workflow notice alone carries no orchestration contract to annotate.
-  expect(await context!({ type: "context", messages: [keywordNotice(NATIVE_WORKFLOW_NOTICE_TYPE, 4), user(PROMPT)] }, ctx))
-    .toBeUndefined();
 });
 
 test("a governed turn is composed by the whole plugin with no network call and no credential access", async () => {
@@ -667,19 +642,14 @@ test("a governed turn is composed by the whole plugin with no network call and n
     });
     const modelBefore = plugin.ctx.model;
 
-    const appended = await plugin.beginTurn(PROMPT);
-    expect(appended.map(policyModeOf)).toEqual(["default"]);
-    const first = await plugin.context([user(PROMPT), ...appended]);
-    expect(first.map(message => policyModeOf(message) ?? null).filter(Boolean)).toEqual(["default"]);
-    // The persisted notice follows its user message, exactly as the host places it.
-    expect(first.findIndex(message => policyModeOf(message) === "default")).toBe(1);
-    expect(await plugin.context([user(PROMPT), ...appended])).toEqual(first);
+    const system = await plugin.beginTurn(PROMPT);
+    expect(system.some(isPolicySection)).toBe(true);
+    const first = await plugin.context([user(PROMPT)]);
+    expect(first).toEqual([user(PROMPT)]);
 
-    // Agent-attributed steering continues the turn and keeps the single notice where it is.
+    // Agent-attributed steering continues the turn and changes nothing about it.
     const steering = { ...user("Worker A is available."), steering: true, attribution: "agent" } as AgentMessage;
-    const steered = await plugin.context([user(PROMPT), ...appended, steering]);
-    expect(steered.map(policyModeOf).filter(Boolean)).toEqual(["default"]);
-    expect(steered[1]).toEqual(first[1]!);
+    expect(await plugin.context([user(PROMPT), steering])).toEqual([user(PROMPT), steering]);
 
     // agent_end settles the turn; a worker delivery then wakes the session without before_agent_start.
     await plugin.endTurn();
@@ -688,20 +658,15 @@ test("a governed turn is composed by the whole plugin with no network call and n
       ["irc:incoming", "<irc from=\"Worker\">done</irc>"],
     ]) {
       const delivery = { role: "custom", customType, content: text, display: false, attribution: "agent", timestamp: 7 } as AgentMessage;
-      const woken = await plugin.context([user(PROMPT), ...appended, assistant("workers started"), delivery]);
-      expect(woken.map(policyModeOf).filter(Boolean)).toEqual(["default"]);
-      expect(woken[1]).toEqual(first[1]!);
-      expect(woken[0]).toEqual(user(PROMPT));
+      const woken = [user(PROMPT), assistant("workers started"), delivery];
+      expect(await plugin.context(woken)).toEqual(woken);
     }
-    // A synthetic prompt or a blank one persists nothing: the notice is already in the context.
-    expect(await plugin.beginTurn("<system-notice>background job finished</system-notice>")).toEqual([]);
-    expect(await plugin.beginTurn("   ")).toEqual([]);
-    // A request whose context lost the persisted notice still carries a default copy, at the end.
-    const bare = await plugin.context([user(PROMPT)]);
-    expect(bare.map(policyModeOf).filter(Boolean)).toEqual(["default"]);
-    expect(policyModeOf(bare.at(-1))).toBe("default");
-    const explicit = await plugin.context([keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 1), user(PROMPT), ...appended]);
-    expect(explicit.map(policyModeOf).filter(Boolean)).toEqual(["orchestrate", "default"]);
+    // A synthetic prompt or a blank one keeps the very same system prompt.
+    expect(await plugin.beginTurn("<system-notice>background job finished</system-notice>")).toEqual(system);
+    expect(await plugin.beginTurn("   ")).toEqual(system);
+    // An explicit request is composed the same way.
+    const explicit = await plugin.context([keywordNotice(NATIVE_ORCHESTRATE_NOTICE_TYPE, 1), user(PROMPT)]);
+    expect(modesOf(explicit)).toEqual(["orchestrate"]);
 
     expect(fetches).toBe(0);
     expect(credentialAccesses).toBe(0);

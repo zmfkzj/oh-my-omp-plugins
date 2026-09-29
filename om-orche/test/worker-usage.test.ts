@@ -53,6 +53,11 @@ const NONE = {
 	tokens: 0,
 	costUsd: 0,
 	durationMs: 0,
+	requests: 0,
+	inputTokens: 0,
+	cacheReadTokens: 0,
+	cacheWriteTokens: 0,
+	outputTokens: 0,
 };
 const FIRST = { tokens: 500, cost: 0.25, durationMs: 800 };
 /** A follow-up turn restarts from zero, so its final usage sits below the first turn's. */

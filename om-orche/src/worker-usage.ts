@@ -61,7 +61,8 @@
 import type { SubagentLifecyclePayload, SubagentProgressPayload } from "@oh-my-pi/pi-coding-agent";
 import type { Telemetry, WorkerSource } from "./telemetry.ts";
 
-const GENERIC_TASK_AGENT = "task";
+/** OMP's bundled generic worker agent: the only one whose workers are measured. */
+export const GENERIC_TASK_AGENT = "task";
 
 export const SUBAGENT_PROGRESS_CHANNEL = "task:subagent:progress";
 export const SUBAGENT_LIFECYCLE_CHANNEL = "task:subagent:lifecycle";

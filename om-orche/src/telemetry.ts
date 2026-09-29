@@ -1,11 +1,14 @@
 /**
- * Aggregate telemetry of OMP's generic `task` workers, format v6.
+ * Aggregate telemetry of OMP's generic `task` workers and of the main session's provider usage, format v7.
  *
  * No prompt text, no task text, no source, no transcript, no credential. The
  * files live outside the repository and the plugin source tree, in the
  * plugin's state directory under OMP's agent directory:
  *
- * - `telemetry.json` — the live epoch's worker counters, plus the read-only
+ * - `telemetry.json` — the live epoch's counters: per worker agent its turns
+ *   and the provider usage of its requests, and `mainSession`, the main
+ *   session's provider usage (requests, uncached input, cache read and write,
+ *   output, cost — the numbers behind the cache hit ratio); plus the read-only
  *   sections earlier eras were converted into: `jevRouting`, the v5 live epoch
  *   (front-door routing counters and worker rows), and `historical`, the
  *   tier-routing era of pre-v5 files.
@@ -20,7 +23,9 @@
  * v5 file's live epoch into `jevRouting`, carries its tier-routing
  * `historical` section over unchanged (a pre-v5 file's counters are converted
  * into `historical` instead), and starts an empty live epoch; reset starts
- * another. Historical numbers are never added to live ones: they count other
+ * another. A v6 file only lacks the provider-usage counters, so its live epoch
+ * and its read-only sections carry over unchanged and those counters start at
+ * zero. Historical numbers are never added to live ones: they count other
  * things — routing decisions and selections, and (in v5) workers counted once,
  * without their follow-up turns.
  *
@@ -49,8 +54,12 @@
  * until it succeeds.
  *
  * Live worker usage comes from OMP's subagent progress/lifecycle frames (see
- * `worker-usage.ts`). `ctx.sessionManager.getUsageStatistics()` is a single
- * session-wide total with no per-agent breakdown, so it cannot substitute.
+ * `worker-usage.ts`); the provider usage behind the cache hit ratio comes from
+ * each session's own finished assistant messages (`message_end`, see
+ * `providerUsageOf`), because a progress frame folds input, output and cache
+ * writes into one number and carries no cache reads at all.
+ * `ctx.sessionManager.getUsageStatistics()` is a single session-wide total with
+ * no per-agent breakdown, so it cannot substitute.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { link, mkdir, open, readdir, readFile, rm, rmdir, unlink } from "node:fs/promises";
@@ -59,7 +68,9 @@ import { DEFAULT_LOCK_TIMING, isLockStaging, LockLostError, type LockTiming, typ
 import type { RouteLogger } from "./logging.ts";
 
 const HISTOGRAM_BUCKETS = 10;
-export const TELEMETRY_VERSION = 6;
+export const TELEMETRY_VERSION = 7;
+/** The last format without provider-usage counters; its files convert with the live epoch intact. */
+const PRE_USAGE_VERSION = 6;
 /** The last format whose live epoch held routing counters; its files convert into `jevRouting`. */
 const JEV_ROUTING_VERSION = 5;
 
@@ -99,11 +110,42 @@ export interface OrchestrationCounters extends RouteCounters {
 }
 
 /**
+ * What the provider reported for finished assistant messages ("requests"): the numbers behind the cache hit
+ * ratio. Counted from each session's own `message_end` events, independently of the worker frames.
+ */
+export interface ProviderUsage {
+	/** Assistant messages that reported any token usage. */
+	requests: number;
+	/** Uncached input tokens (`usage.input`). */
+	inputTokens: number;
+	cacheReadTokens: number;
+	cacheWriteTokens: number;
+	outputTokens: number;
+}
+
+/** The main session's provider usage for the live epoch. */
+export interface MainSessionUsage extends ProviderUsage {
+	/** Provider-reported spend (`usage.cost.total`) of those messages. */
+	costUsd: number;
+}
+
+/** One finished assistant message's provider-reported usage. Never any text. */
+export interface RequestUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	costUsd: number;
+}
+
+/**
  * One worker agent name's counters for the live epoch. Workers are counted once
  * (`startedObserved`); every turn — the first run and each follow-up — settles
- * and is measured on its own.
+ * and is measured on its own. The provider usage of the workers' requests
+ * (`ProviderUsage`) is counted apart from `tokens` and `costUsd`, which come
+ * from the progress frames.
  */
-export interface LiveWorkerCounters {
+export interface LiveWorkerCounters extends ProviderUsage {
 	/** Distinct workers whose first observed turn began: a `started` lifecycle frame or a first progress frame. */
 	startedObserved: number;
 	/** Later turns of a worker already tracked (a message to an idle worker, a resume); not new workers. */
@@ -202,6 +244,8 @@ export interface TelemetrySnapshot {
 	epoch: TelemetryEpoch;
 	/** Live workers by agent name; only OMP's generic `task` worker is tracked. */
 	workers: Record<string, LiveWorkerCounters>;
+	/** The main session's provider usage; the workers' is in their rows. */
+	mainSession: MainSessionUsage;
 	/** Present after a v5 → v6 migration; absent on a fresh start, after a pre-v5 migration, or after reset. */
 	jevRouting?: HistoricalJevRouting;
 	/** Present after a migration of a file that carried, or was, a tier-routing era; absent otherwise. */
@@ -339,7 +383,16 @@ function emptyLiveWorker(): LiveWorkerCounters {
 		tokens: 0,
 		costUsd: 0,
 		durationMs: 0,
+		requests: 0,
+		inputTokens: 0,
+		cacheReadTokens: 0,
+		cacheWriteTokens: 0,
+		outputTokens: 0,
 	};
+}
+
+function emptyMainSession(): MainSessionUsage {
+	return { requests: 0, inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, costUsd: 0 };
 }
 
 function emptyJevRoutingWorker(): JevRoutingWorkerCounters {
@@ -371,7 +424,7 @@ function emptyTaskRouting(): HistoricalTaskRoutingCounters {
 }
 
 function emptySnapshot(epoch: TelemetryEpoch = { id: randomUUID(), startedAt: Date.now() }): TelemetrySnapshot {
-	return { version: TELEMETRY_VERSION, updatedAt: 0, epoch, workers: {} };
+	return { version: TELEMETRY_VERSION, updatedAt: 0, epoch, workers: {}, mainSession: emptyMainSession() };
 }
 
 function finite(value: unknown): number | undefined {
@@ -502,7 +555,7 @@ function reviveJevRouting(value: unknown): HistoricalJevRouting | undefined {
 	return source ? jevRoutingFrom(fields, source) : undefined;
 }
 
-/** Parse a v6 file, discarding anything malformed field by field. */
+/** Parse a v6 or v7 file, discarding anything malformed field by field. */
 function reviveSnapshot(raw: Record<string, unknown>): TelemetrySnapshot {
 	const epoch = fieldsOf(raw.epoch);
 	const snapshot = emptySnapshot(
@@ -510,6 +563,7 @@ function reviveSnapshot(raw: Record<string, unknown>): TelemetrySnapshot {
 	);
 	snapshot.updatedAt = finite(raw.updatedAt) ?? 0;
 	snapshot.workers = reviveMap(raw.workers, fields => reviveCounters(emptyLiveWorker(), fields));
+	snapshot.mainSession = reviveCounters(emptyMainSession(), fieldsOf(raw.mainSession));
 	const jevRouting = reviveJevRouting(raw.jevRouting);
 	if (jevRouting) snapshot.jevRouting = jevRouting;
 	const historical = reviveHistorical(raw.historical);
@@ -547,6 +601,56 @@ function latestOf(previous: WorkerUsage | undefined, next: WorkerUsage): WorkerU
 		costUsd: Math.max(previous.costUsd, next.costUsd),
 		durationMs: Math.max(previous.durationMs, next.durationMs),
 	};
+}
+
+/** `left` plus `right`, field by field, as a fresh record. */
+function sumMain(left: MainSessionUsage, right: MainSessionUsage): MainSessionUsage {
+	return {
+		requests: left.requests + right.requests,
+		inputTokens: left.inputTokens + right.inputTokens,
+		cacheReadTokens: left.cacheReadTokens + right.cacheReadTokens,
+		cacheWriteTokens: left.cacheWriteTokens + right.cacheWriteTokens,
+		outputTokens: left.outputTokens + right.outputTokens,
+		costUsd: left.costUsd + right.costUsd,
+	};
+}
+
+/** Count one request into `target`. */
+function addRequest(target: ProviderUsage, usage: RequestUsage): void {
+	target.requests++;
+	target.inputTokens += usage.input;
+	target.cacheReadTokens += usage.cacheRead;
+	target.cacheWriteTokens += usage.cacheWrite;
+	target.outputTokens += usage.output;
+}
+
+/**
+ * What the provider reported for a finished assistant message. Nothing for any other message, and nothing for an
+ * assistant message that reported no tokens (a request that failed before the provider answered): it would only
+ * inflate the request count. Read structurally, so a shape change degrades to "no sample", never to a throw.
+ */
+export function providerUsageOf(message: unknown): RequestUsage | undefined {
+	const fields = fieldsOf(message);
+	if (fields.role !== "assistant") return undefined;
+	const usage = fieldsOf(fields.usage);
+	const count = (value: unknown) => Math.max(0, finite(value) ?? 0);
+	const request: RequestUsage = {
+		input: count(usage.input),
+		output: count(usage.output),
+		cacheRead: count(usage.cacheRead),
+		cacheWrite: count(usage.cacheWrite),
+		costUsd: count(fieldsOf(usage.cost).total),
+	};
+	return request.input + request.output + request.cacheRead + request.cacheWrite > 0 ? request : undefined;
+}
+
+/**
+ * The share of prompt tokens the provider served from its cache: cacheRead ÷ (input + cacheRead + cacheWrite).
+ * Undefined until a prompt token has been counted.
+ */
+export function cacheHitRatio(usage: Pick<ProviderUsage, "inputTokens" | "cacheReadTokens" | "cacheWriteTokens">): number | undefined {
+	const prompt = usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens;
+	return prompt > 0 ? usage.cacheReadTokens / prompt : undefined;
 }
 
 /** The parsed top-level object, or `undefined` when the bytes are not a JSON object. */
@@ -694,6 +798,10 @@ export class Telemetry {
 	#pending: Record<string, LiveWorkerCounters> = {};
 	/** The increments a write in progress carries; they return to `#pending` if it fails. */
 	#inflight: Record<string, LiveWorkerCounters> = {};
+	/** The main session's provider usage recorded since the last write began: increments over `#base.mainSession`. */
+	#pendingMain: MainSessionUsage = emptyMainSession();
+	/** The main-session increments a write in progress carries; they return to `#pendingMain` if it fails. */
+	#inflightMain: MainSessionUsage = emptyMainSession();
 	#state: TelemetryState = { kind: "unloaded" };
 	/** Each session's own choice, by the id of its top-level session: see {@link Telemetry.setEnabled}. */
 	readonly #choices = new Map<string, boolean>();
@@ -771,7 +879,8 @@ export class Telemetry {
 
 	/** What the file held when this process last looked, plus every count this process has recorded since. */
 	snapshot(): Readonly<TelemetrySnapshot> {
-		return { ...this.#base, workers: sumWorkers(this.#base.workers, sumWorkers(this.#inflight, this.#pending), 0) };
+		const main = sumMain(this.#base.mainSession, sumMain(this.#inflightMain, this.#pendingMain));
+		return { ...this.#base, workers: sumWorkers(this.#base.workers, sumWorkers(this.#inflight, this.#pending), 0), mainSession: main };
 	}
 
 	/** Read the persisted counters once, migrating an older file; later sessions reuse the result. Never rejects. */
@@ -879,11 +988,17 @@ export class Telemetry {
 	}
 
 	/**
-	 * Set the read-only sections an older file converts into; the live epoch stays
-	 * empty. A v5 file becomes the Jev-routing era and hands over the tier-routing
-	 * era it carried; a pre-v5 file is the tier-routing era itself.
+	 * Set the sections an older file converts into. A v6 file lacks only the
+	 * provider-usage counters, so all of it carries over: the live epoch and the
+	 * eras it held. Otherwise the live epoch stays empty: a v5 file becomes the
+	 * Jev-routing era and hands over the tier-routing era it carried; a pre-v5
+	 * file is the tier-routing era itself.
 	 */
 	#adoptEarlierEras(raw: Record<string, unknown>, source: HistoricalTelemetry["source"]): void {
+		if (source.version === PRE_USAGE_VERSION) {
+			this.#base = reviveSnapshot(raw);
+			return;
+		}
 		delete this.#base.jevRouting;
 		delete this.#base.historical;
 		if (source.version === JEV_ROUTING_VERSION) {
@@ -1082,6 +1197,24 @@ export class Telemetry {
 		return track;
 	}
 
+	/**
+	 * Add one finished assistant message of the main session: what the provider reported, never any text. Like
+	 * every count it is dropped while telemetry is off or the file is not this version's to write.
+	 */
+	observeMainRequest(usage: RequestUsage): void {
+		if (!this.#recording()) return;
+		addRequest(this.#pendingMain, usage);
+		this.#pendingMain.costUsd += usage.costUsd;
+		this.#touch();
+	}
+
+	/** Add one finished assistant message of a worker session of `agent`, into that agent's row. */
+	observeWorkerRequest(agent: string, usage: RequestUsage): void {
+		if (!this.#recording()) return;
+		addRequest(this.#counters(agent), usage);
+		this.#touch();
+	}
+
 	/** The pending row of `agent`, created on first use: increments over what the file holds. */
 	#counters(agent: string): LiveWorkerCounters {
 		const existing = this.#pending[agent];
@@ -1161,7 +1294,7 @@ export class Telemetry {
 		if (resets !== this.#resets || !this.#writable()) return;
 		this.#adopt(disk);
 		// A file this version must not touch has suspended recording; only counts to add call for a write.
-		if (this.#writable() && Object.keys(this.#pending).length > 0) await this.#persist(lock);
+		if (this.#writable() && (Object.keys(this.#pending).length > 0 || this.#pendingMain.requests > 0)) await this.#persist(lock);
 	}
 
 	/**
@@ -1173,8 +1306,15 @@ export class Telemetry {
 		const resets = this.#resets;
 		this.#inflight = this.#pending;
 		this.#pending = {};
+		this.#inflightMain = this.#pendingMain;
+		this.#pendingMain = emptyMainSession();
 		const base = this.#base;
-		const merged: TelemetrySnapshot = { ...base, updatedAt: Date.now(), workers: sumWorkers(base.workers, this.#inflight, 0) };
+		const merged: TelemetrySnapshot = {
+			...base,
+			updatedAt: Date.now(),
+			workers: sumWorkers(base.workers, this.#inflight, 0),
+			mainSession: sumMain(base.mainSession, this.#inflightMain),
+		};
 		try {
 			await lock.commit(this.#file, JSON.stringify(merged));
 		} catch (error) {
@@ -1182,6 +1322,8 @@ export class Telemetry {
 			if (resets === this.#resets) {
 				this.#pending = sumWorkers(this.#inflight, this.#pending);
 				this.#inflight = {};
+				this.#pendingMain = sumMain(this.#inflightMain, this.#pendingMain);
+				this.#inflightMain = emptyMainSession();
 			}
 			throw error;
 		}
@@ -1190,6 +1332,7 @@ export class Telemetry {
 		this.#base = merged;
 		this.#persisted = true;
 		this.#inflight = {};
+		this.#inflightMain = emptyMainSession();
 	}
 
 	/**
@@ -1210,6 +1353,8 @@ export class Telemetry {
 		this.#persisted = false;
 		this.#pending = {};
 		this.#inflight = {};
+		this.#pendingMain = emptyMainSession();
+		this.#inflightMain = emptyMainSession();
 		this.#dirty = false;
 		this.#failures = 0;
 		this.#writeError = undefined;
