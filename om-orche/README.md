@@ -71,17 +71,14 @@ stays warm (see [Modes and skip conditions](#modes-and-skip-conditions)).
 
 ## Execution policies
 
-The policy is about 7.1K characters with the full tool set (about 6.6K without
-`write`, about 7.5K with `task.enableEffort` on); the workflow supplement is about
-0.5K next to it (2.4K when the policy is not in the system prompt) and an explicit
-`orchestrate` notice about 0.4K. The policy reads in this order: the header and
-precedence line, the rule for choosing (with switching), Judgment, Production
-(with assets), reuse, the task-item contract with the worker-local checks (and the
-`effort` line when the setting is on), verification. Shared guidance is written
-once; the policy does not hold two complete execution prompts. It is guidance for
-the model, not a scheduler or permission system, and it renders only instructions
-backed by the tools enabled and the settings in force when it is rendered (a
-change of either changes the system prompt once, from the next prompt).
+The policy reads in this order: the header and precedence line, the rule for
+choosing (with switching), Judgment, Production (with assets), reuse, the task-item
+contract with worker-local checks (and the `effort` line when enabled), and
+verification. Shared guidance is written once; the policy does not hold two
+complete execution prompts. It is guidance for the model, not a scheduler or
+permission system, and it renders only instructions backed by the tools enabled
+and settings in force when rendered. A relevant change updates the system prompt
+from the next prompt.
 
 | | Judgment (판단형) | Production (제작형) |
 | --- | --- | --- |
@@ -101,10 +98,17 @@ main chooses from the request and from what it learns while working:
 1. Ask what the user must receive for the request to be done.
 2. Explanation, analysis, judgment, proposal or design alone → Judgment.
 3. A real change to code, files, features, assets or state → Production.
-4. Both → start in Judgment and switch to Production once cause, scope and
-   contract are settled enough to implement. A **mixed request is a Judgment →
-   Production transition, not a third mode.** If the user already asked for both,
-   the main switches without asking for approval again.
+4. Both → start in Judgment and switch to Production once **change authorization,
+   scope/non-goals, expected behavior and acceptance criteria** are settled. The
+   main need not solve the root cause first: a worker owns local investigation and
+   design within that contract. Unconfirmed causes remain hypotheses, not
+   mandatory code changes. A **mixed request is a Judgment → Production
+   transition, not a third mode.** If the user already asked for both, the main
+   switches without asking for approval again.
+   An authorized repair/implementation continues from diagnosis through worker
+   implementation and acceptance in the same request unless a real scope,
+   permission or environment blocker remains. An initially unknown cause alone is
+   not a reason to end at analysis or ask for redundant approval.
 5. Analysis or proposal only → the main does not move into Production just because
    the fix has become clear. If permission to change the product is unclear, it
    gives the result and the decision needed.
@@ -162,6 +166,12 @@ mode and read-only limits come first.
   implementation, conflict-free local checks, failure analysis and re-fixes, and
   results with evidence. The main does not work out the whole implementation and
   have a worker type it in.
+- The **first persistent product, config or asset mutation** belongs to an
+  assigned worker, even one config value, a trivial edit or a single asset call.
+- If worker evidence refutes a symptom, cause or supposedly fixed decision, stop
+  **only that change** and return the evidence. Calling a premise "confirmed" in
+  the task does not override contrary evidence; do not implement "just in case"
+  to satisfy a false premise. Unrelated work continues.
 - The main may read code, check diffs, run verification and talk to workers; it
   never duplicates a worker's implementation or overwrites in-progress changes.
 - A blocked worker is not a takeover signal; see [Verification](#verification)
@@ -181,8 +191,9 @@ These are two separate decisions.
 
 #### The main's direct edits: a narrow exception
 
-The main edits source directly only for a small integration finish when **all
-five** hold:
+The main edits source directly only to integrate **already-completed worker
+work** in a small finish when **all five** hold. This never permits initial
+implementation:
 
 1. the cause and the fix are settled;
 2. no new investigation, design or substantial debugging is needed;
@@ -190,8 +201,11 @@ five** hold:
 4. there is no conflict with another writer's ownership or in-progress writes;
 5. the edit is clearly smaller than delegating it.
 
-Otherwise the owning worker continues; a run of exceptions must not make the main
-the implementer.
+Integration uses fully read relevant content, never truncated or unseen content.
+If it opens new investigation or design, the owning worker continues. A run of
+exceptions must not make the main the implementer.
+Isolated Judgment experiments and the main's designated shared-runtime
+verification remain permitted; neither is a takeover of worker implementation.
 
 #### Game assets are Production, not a separate organization
 
@@ -247,8 +261,13 @@ message a worker itself.
 
 ### Verification
 
-A worker's success report is not acceptance: the main checks the integrated
-result and the evidence it needs, without redoing every step.
+A worker's success report is not acceptance. Each return ties key acceptance
+criteria to the command and environment, expected versus observed result,
+**original tool-output/artifact/entry references**, and unverified items. The main
+checks the integrated result and reads the key original evidence before accepting,
+re-running only missing checks rather than every worker step. Tests do not
+substitute for actual host or engine behavior. These duties also apply to
+workflow results and direct execution when delegation is unavailable.
 
 On a contract change or a conflict, the main checks running, pending and
 completed work, holds overlapping writes, checks host-visible writer status,
@@ -285,7 +304,7 @@ capability.
 
 | | |
 | --- | --- |
-| **The plugin enforces** | which text goes where: the policy once, in the system prompt, identical for every prompt of a governed session, and a counterpart in place of each of OMP's keyword notices; the skip gates (below); that the primary model, `@task`/`@default` roles, custom/specialist agents, tool permissions and task inputs are never changed; that no tool is removed from the main agent (`write` stays available); local telemetry |
+| **The plugin enforces** | which text goes where: the policy once, in the system prompt, identical for every prompt of a governed session, and a counterpart in place of each of OMP's keyword notices; the skip gates (below); that the primary model, `@task`/`@default` roles, custom/specialist agents, tool permissions and task inputs are never changed; that no tool is removed from the main agent (`write` stays available); local telemetry; best-effort non-message policy observations (not delivery receipts) |
 | **The plugin only instructs** | which policy the main picks for a stage, whether it delegates, reuses an existing worker or parallelizes, whether it stays within an analysis-only request, how it limits its own direct edits, and that it verifies before accepting |
 
 There is no guarantee that the model follows the instructions, chooses the
@@ -300,8 +319,8 @@ The policy is one element of the system prompt. OMP's keyword notices get a coun
 | text | when | what the model reads |
 | --- | --- | --- |
 | `default` (the policy) | the `task` tool is enabled | both policies and the rule for choosing, as an element of the system prompt (the advice guidance, when active, follows it). |
-| `orchestrate` | a native `orchestrate-notice` is in the transcript | the native notice is replaced in place by a short notice (about 0.4K characters): the user explicitly asked for orchestration, so within the current goal the main leans further toward delegation under the policy (production work and independent investigations go to workers); it does not turn an analysis-only request into permission to change the product. The two never appear together. Without `task`, a notice of about 0.7K characters says orchestration was requested but `task` is not enabled for this request: judgment work is done directly, production is implemented directly within permissions or the limitation is stated precisely, delegation is never claimed or simulated, and an analysis-only request stays analysis and changes no product code, config or assets; plus the verification lines. With a native `workflow-notice` in the same keyword prefix the native `orchestrate-notice` is dropped and only the workflow supplement is added. |
-| `workflow` | a native `workflow-notice` is in the transcript | the native notice stays and a supplement follows it. For that request the native workflow alone chooses execution method, agents, fan-out and reuse, overriding the policy's stage selection and delegation guidance; the supplement adds no dispatch, parallelism or reuse instruction and no "the main analyzes directly" instruction. With the policy in the system prompt (about 0.5K characters) it only says that the policy's task-item contract, worker-local checks, result labels, analysis-only boundary and verification apply to workflow item prompts and results, with failures routed through the workflow. Without the policy in it (about 2.4K) it carries those duties itself. |
+| `orchestrate` | a native `orchestrate-notice` is in the transcript | the native notice is replaced in place by a short notice: the user explicitly asked for orchestration, so within the current goal the main leans further toward delegation under the policy (production work and independent investigations go to workers); it does not turn an analysis-only request into permission to change the product. The two never appear together. Without `task`, a notice says orchestration was requested but `task` is not enabled for this request: judgment work is done directly, production is implemented directly within permissions or the limitation is stated precisely, delegation is never claimed or simulated, and an analysis-only request stays analysis and changes no product code, config or assets; plus the verification lines. With a native `workflow-notice` in the same keyword prefix the native `orchestrate-notice` is dropped and only the workflow supplement is added. |
+| `workflow` | a native `workflow-notice` is in the transcript | the native notice stays and a supplement follows it. For that request the native workflow alone chooses execution method, agents, fan-out and reuse, overriding the policy's stage selection and delegation guidance; the supplement adds no dispatch, parallelism or reuse instruction and no "the main analyzes directly" instruction. With the policy in the system prompt it only says that the policy's task-item contract, worker-local checks, result labels, analysis-only boundary and verification apply to workflow item prompts and results, with failures routed through the workflow. Without the policy in it, it carries those duties itself. |
 
 **System prompt.** `before_agent_start` appends the policy to the main session's
 system prompt as an element of its own (tagged `<om-orche-policy>`), after
@@ -367,6 +386,48 @@ loses the policy.
 prompt, appended after the policy whenever the advice tool is active and never
 twice. It is not repeated in any message, and no advisor call is ever automatic.
 
+### Durable policy observations
+
+When enabled in a main session, the orchestration `context` hook appends a
+non-message session entry of type `om-orche-policy-exposure` when its observed
+policy view changes. It uses OMP's `sessionManager.appendCustomEntry`, not
+`custom_message`, `sendMessage`, or a context message. It changes neither the
+model-visible messages nor the system prompt, so it adds no cache-prefix text.
+This is separate from aggregate telemetry and needs no new setting.
+
+The bounded record contains schema version `1`, policy identity/revision
+`judgment-production-2026-09-30-r2`, phase `orchestration-context-view`, the current
+governance gate (`governed`, `plan-mode`, or `task-tool-unavailable`), and three
+section digests (`system`, `orchestrate`, `workflow`). Each is SHA-256 over that
+location's ordered UTF-8 text sections, each prefixed by its UTF-8 byte length and
+`:`; `null` means no section was present. Only `<om-orche-policy>` system elements
+and this plugin's keyword counterparts in this hook's output are hashed. Many
+historical keyword notices still produce only one digest per mode.
+
+Presence and governance are distinct: for example, an already installed system
+policy can remain present after entering plan mode or losing `task`, until the
+next prompt rebuild. The hook observes tool loops and autonomous continuations
+that do not run `before_agent_start`, including an absent policy after a base
+prompt rebuild. Preparation alone writes no observation. **This is not proof of
+provider delivery**: subsequent extensions/transforms may change the view, and a
+request may be cancelled or retried. It neither infers nor records the model's
+selected Judgment/Production stage.
+
+Unchanged observations deduplicate against the latest applicable record on the
+active branch. Resume and forks retain an inherited baseline; a branch without
+one, a `reset_boundary` (such as `/clear`), or a changed observation gets a new
+record. OMP supplies the entry ID, parent linkage and timestamp; a copied record
+is historical evidence, not a claim that a new provider request occurred.
+
+No policy text, base prompt, task content, paths, tool names, credentials or raw
+sessions are retained in these records. The hashes identify rendered guidance,
+not user input. The master switch's native-behavior promise takes precedence:
+disabled and subagent sessions make **no automatic metadata writes**, including
+no "disabled" marker. Missing records therefore cannot distinguish opt-out,
+subagents, an unobserved/cancelled request, an older plugin, or persistence failure.
+Observation/persistence exceptions are isolated from the user turn; durability
+and flushing are owned by OMP, not guaranteed by this hook.
+
 ### Task body contract
 
 The plugin defines no separate `solutionSpace` or contract field and does not
@@ -381,7 +442,7 @@ the task tool's generic Target/Change/Acceptance headings:
 # Decided and open              fixed decisions with reasons and user constraints; judgments left to the worker
 # Inputs and dependencies       artifacts by reference; unverified hypotheses marked
 # Acceptance and verification   by type (below)
-# Return                        results, new facts, wrong premises, evidence location, open issues, decisions needed
+# Return                        results, wrong premises, decisions/open issues; key criteria → command/environment, expected vs observed, original evidence references, unverified items
 ```
 
 The policy asks for each item to be self-contained.
@@ -395,9 +456,11 @@ The policy asks for each item to be self-contained.
 - Worker-local checks on owned files are expected; global checks, formatters and
   shared runtimes stay with a named owner (normally the main) and never run
   concurrently.
-- A worker that finds a broken fixed decision, an ownership conflict or an invalid
-  prerequisite pauses that change and reports evidence and partial work; it does
-  not redesign, widen scope or overwrite others' edits.
+- A worker that refutes a symptom, cause or fixed decision stops only that change
+  and reports evidence, even if the task called the premise confirmed. Ownership
+  conflicts and invalid prerequisites likewise pause affected changes only;
+  unrelated work continues. It does not redesign the shared contract, widen
+  scope, overwrite others' edits, or implement "just in case".
 
 The layout is guidance, not a runtime schema: free-form task calls are never
 rejected for missing sections. OMP validates and executes the native task input.
@@ -870,6 +933,10 @@ is built locally from fixed text, the names of the enabled tools and one host
 setting, and joins the system prompt sent with the conversation. It is not
 written to the transcript, and no prompt text is copied to telemetry.
 
+The durable policy observations contain bounded guidance hashes and lifecycle
+facts, not policy or task text; their opt-out and observability limits are
+described under [Durable policy observations](#durable-policy-observations).
+
 The plan advisor receives the submitted seven-field snapshot plus bounded
 findings and explicitly cited finding-resolution evidence. It never receives
 the whole transcript or execution-approval metadata. Inspect evidence IDs
@@ -1274,18 +1341,120 @@ notices and their dependence on the system prompt, dropping notices an earlier
 build persisted, advice verdicts and real error handling, absence of plugin
 execution gates (including old persisted approval records), finding
 evidence/lifecycle, settings and retired settings, telemetry migration and worker
-accounting, and status rendering. Only which parts of the policy text render for
-which tools, settings and modes is checked, not the wording; none of it is
-evidence of how a model behaves.
+accounting, status rendering, and durable policy observation gates, hashes,
+branch baselines, privacy and context isolation. These deterministic tests do
+not establish how a model behaves; policy prose is not snapshot-tested.
+
+### Opt-in multi-step policy evaluation
+
+The development-only evaluator runs real model conversations over inert fixtures
+with a main/worker tool adapter. It exercises analysis-only boundaries,
+delegation with an unresolved cause, refuted premises, viable/unavailable worker
+reuse, evidence acceptance (complete/missing/failed), assets, and shared-runtime
+ownership with publishing preflight. Scoring uses event-backed invariants, not
+prose matching or an LLM judge.
+Reports declare their scoring version/notes. Events cannot establish private
+reasoning or cause attribution: the unknown-cause case accepts a worker's fresh
+pre-mutation fixture inspection or failing reproduction, with its own actual
+post-repair check; failing-before is recorded, not a universal requirement.
+For settled asset specifications, the responsible worker or main may check a
+fresh sample's format/state before batching—no extra user/Main approval gate is
+imposed. Final asset acceptance requires current raw all-asset evidence and the
+explicit absence of engine/visual verification.
+
+```bash
+bun run eval:policy -- --help
+bun run eval:policy -- --list
+bun run eval:policy -- --case analysis-only --model provider/model:low --check
+
+# Paid model calls: opt in explicitly; choose an existing authorized model.
+bun run eval:policy -- --case unknown-cause,refuted-premise \
+  --model provider/model:low --output /tmp/orche-policy-run-new
+
+# Paired fresh fixtures: current policy vs a single component omission.
+bun run eval:policy -- --case evidence-acceptance \
+  --model provider/model:low --omit-component evidence
+```
+
+`--case` is repeatable or comma-separated; without selection all cases run. IDs
+are `analysis-only`, `unknown-cause`, `refuted-premise`, `reuse-viable`,
+`reuse-unavailable`, `evidence-acceptance`, `evidence-missing`, `evidence-failed`,
+`assets`, and `shared-runtime-publishing`. Without `--model`, only the configured
+`modelRoles.default` is used, with no fallback. `--agent-dir` selects an existing
+OMP agent directory. `--check` validates selection/configuration without model
+calls. Importing the runner or running `bun test test/policy-behavior.test.ts`
+does not perform paid calls.
+
+Default per-case bounds shared across main and workers are `--max-calls 48`
+(SDK completion invocations), `--max-tools 160`, and `--timeout-seconds 300`.
+`--max-tokens 1536` bounds each SDK completion, not the whole case. Internal
+transport retries are not counted as separate model calls; the wall-time bound
+still applies. Override these limits explicitly if needed. `--omit-component`
+accepts `selection`, `production`, `reuse`, `evidence`, or `assets`; omission
+compares one component at a time on fresh equivalent fixtures and does not
+presume that removal degrades behavior.
+
+`--output` must name a nonexistent directory; otherwise a fresh retained
+OS-temp directory is used. `report.json` aggregates pass/fail/incomplete results,
+event-backed criteria, model/effort, policy hashes, call/usage data and unexercised
+cases. Per-case `trace.jsonl`, `state.json`, `policy.txt`, and `result.json` retain
+the trace, final inert-file state/raw evidence, actual policy and result. The
+mutable fixture sandbox is removed. Reports contain synthetic fixture/model
+content, not real user sessions; review them before sharing.
+
+Aggregate reports declare `schemaVersion: 2` and list supported
+`decisionLimitCodes`. The evaluator's `decision.limits` interface accepts unique
+machine-readable codes `no-engine-visual-verification` and
+`no-external-publishing`, not free-form prose.
+An empty array is valid when neither adapter limit applies. Human explanations
+remain in original tool evidence and the trace; the codes keep declaration and
+scoring on the same explicit contract.
+
+**Limits:** this adapter performs real provider/worker conversations and actual
+JSON/SVG file operations, but is not OMP's native `task` runtime, a real UI/engine
+run, or visual verification. It exposes no arbitrary code, shell, network or
+host-filesystem access to the model. Publishing is preflight-only; the external
+operation is blocked. A passing score therefore cannot substitute for production
+host/engine verification, and a bounded/incomplete run is not a pass.
 
 ### Verification record
 
 OMP 18.4.1 is the compatibility target.
 
-**Static and unit checks.** `bun run check` clean; `bun run lint` 0 errors (2
-existing `no-control-regex` warnings); `bun test` 174 pass, 0 fail across 13
-files. The policy text is checked only as content: those checks show what the
-model is told, not what it does.
+**Current integration record (2026-09-30, policy revision
+`judgment-production-2026-09-30-r2`).** `bun run check && bun run lint && bun test`:
+TypeScript clean, lint 0 errors with exactly 2 pre-existing `no-control-regex`
+warnings, and 387 tests passing, 0 failing, across 20 files (1,563 assertions).
+A real isolated OMP SessionManager smoke confirmed durable non-message policy
+records, unchanged context, inherited fork baseline and fresh reset-boundary
+baseline. Those records remain context-view observations, not provider-delivery
+receipts.
+
+The opt-in live evaluator used `@smol:low`, resolving to
+`openai-codex/gpt-6-luna:low`, with evaluator policy hash
+`b4ce2f4d42d7f7e3800838c0d15f7872b484c2273f0e302c6cfe8fcc335a196b`.
+Latest per-case observations across the initial full-ten run (`YT1qer`) and
+corrective affected-six run (`5mMu90`) were **8 pass, 1 fail, 1 incomplete**—not
+one clean run or a statistical compliance rate. The first run had provider
+connection interruptions and a decision-limit schema mismatch; the second used
+the corrected schema and reran affected cases after connectivity recovered.
+The assets case still failed: the main generated all three assets directly and
+skipped sample-first sequencing. The refuted-premise case remained incomplete
+because a worker returned plain text instead of the adapter's required
+`worker_return`; this is not evidence of a native OMP policy failure. Original
+failure reports are preserved for comparison, not replaced by prompting or
+scoring until green. The adapter still does not establish native OMP task
+behavior, engine/visual verification or real publishing.
+
+The older checks below are **historical records of the source versions tested
+at the time**, not current suite counts or claims that later features were
+exercised.
+
+**Historical static and unit checks (before durable policy observations).**
+`bun run check` clean; `bun run lint` 0 errors (2 existing `no-control-regex`
+warnings); `bun test` 174 pass, 0 fail across 13 files. These deterministic checks
+were not evidence of model behavior; incidental policy-prose tests have since
+been removed in favor of mechanism invariants and opt-in behavioral evaluation.
 
 **Mechanism checks** (pinned OMP 18.4.1 CLI, isolated agent directory,
 deterministic local fake model, no paid requests). They cover policy placement,
@@ -1304,8 +1473,9 @@ bullet checks the system-prompt design.
   `--no-extensions -e src/index.ts`. Four requests (two processes on one session
   with `-c`, then two prompts in one process) carried the same system prompt (same
   sha-256), with the policy and the advice guidance as its last two elements, and
-  messages that were each an exact prefix of the next; the plugin wrote no session
-  entry. The previous release had moved its notice in front of the new user
+  messages that were each an exact prefix of the next; that version, before
+  durable policy observations, wrote no session entry. The previous release had
+  moved its notice in front of the new user
   message (common prefix 0). A `custom_message` written by hand as an earlier
   build persisted it, placed on the active branch, never reached the provider. An
   explicit `orchestrate` prompt sent the short counterpart and never the native

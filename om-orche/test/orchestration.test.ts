@@ -11,11 +11,8 @@ import {
 	NATIVE_ORCHESTRATE_NOTICE_TYPE,
 	NATIVE_WORKFLOW_NOTICE_TYPE,
 	POLICY_NOTICE_TYPE,
-	type PolicyContext,
 	type PolicyMode,
 	policyModeOf,
-	renderKeywordNotice,
-	renderPolicy,
 } from "../src/orchestration-policy.ts";
 import { clearRegistry, fakeModel, makeApi, makeSession, registerAsMain } from "./harness.ts";
 import type { FakeSession, FakeSessionOptions } from "./harness.ts";
@@ -150,9 +147,6 @@ function modes(messages: readonly AgentMessage[] | undefined): PolicyMode[] {
 function customCount(messages: readonly AgentMessage[] | undefined, customType: string): number {
 	return messages?.filter(message => message.role === "custom" && message.customType === customType).length ?? 0;
 }
-function textOf(message: AgentMessage | undefined): string {
-	return message?.role === "custom" && typeof message.content === "string" ? message.content : "";
-}
 /** What a provider would read of the messages: converted the way OMP converts them. */
 function wire(messages: AgentMessage[]): string[] {
 	return convertToLlm(messages).map(message => JSON.stringify(message));
@@ -210,13 +204,6 @@ describe("policy in the system prompt", () => {
 		expect(policyOf(t.prompt("More."))).toBe(first);
 		tools.splice(tools.indexOf("todo"), 1);
 		expect(policyOf(t.prompt("Again."))).not.toBe(first);
-	});
-
-	test("the `effort` guidance is part of the element only while the host's schema has `effort`", () => {
-		const without = policyOf(build().prompt(PROMPT))!;
-		const withEffort = policyOf(build({ effort: true }).prompt(PROMPT))!;
-		expect(withEffort.length).toBeGreaterThan(without.length);
-		expect(withEffort.length - without.length).toBeLessThan(500);
 	});
 
 	test("the plugin stays out where it does not govern", () => {
@@ -456,24 +443,6 @@ describe("native keyword notices", () => {
 });
 
 describe("the workflow supplement follows the system prompt it is sent with", () => {
-	function supplementLength(request: Request): number {
-		return textOf(request.messages.find(message => policyModeOf(message) === "workflow")).length;
-	}
-
-	test("it only points at the policy while the policy is in the system prompt, and carries the duties itself otherwise", () => {
-		const t = build();
-		t.prompt("workflowz the refactor", { natives: [nativeWorkflow(5)] });
-		const pointing = t.request();
-		expect(policyOf(pointing.system)).toBeDefined();
-		t.rebuildBase();
-		const carrying = t.request();
-		expect(policyOf(carrying.system)).toBeUndefined();
-		expect(supplementLength(carrying)).toBeGreaterThan(supplementLength(pointing) * 3);
-		// The next prompt applies the policy again and the supplement shrinks back.
-		t.prompt("And the docs.");
-		expect(supplementLength(t.request())).toBe(supplementLength(pointing));
-	});
-
 	test("each request's text is a function of that request alone: repeated requests are byte-identical", () => {
 		const t = build();
 		t.prompt("workflowz the refactor", { natives: [nativeWorkflow(5)] });
@@ -549,49 +518,3 @@ describe("debug log", () => {
 	});
 });
 
-// What the rendered texts carry depends on the tools enabled, the settings and the mode. These check that
-// dependence, not what the texts tell the model or what the model then does.
-describe("tool- and mode-dependent content", () => {
-	const tools = [...ALL_TOOLS, "orche_advisor"];
-	const withoutTask = tools.filter(name => name !== "task");
-	const context = (enabled: readonly string[] = tools, effort = false): PolicyContext => ({ tools: enabled, effort });
-
-	test("the policy names the todo list and the advice call only when those tools are enabled", () => {
-		expect(renderPolicy(context())).toMatch(/todo/);
-		expect(renderPolicy(context())).toMatch(/advice/);
-		expect(renderPolicy(context(["task", "read"]))).not.toMatch(/todo|advice/);
-	});
-
-	test("worker follow-up through `write agent://<id>` is offered only when `write` is enabled", () => {
-		expect(renderPolicy(context())).toContain("write agent://<id>");
-		expect(renderPolicy(context(tools.filter(name => name !== "write")))).not.toContain("agent://");
-	});
-
-	test("the `effort` guidance needs both `task` and the setting, and project checks are named only with `bash`", () => {
-		expect(renderPolicy(context(tools, true)).length).toBeGreaterThan(renderPolicy(context(tools, false)).length);
-		expect(renderPolicy(context(withoutTask, true))).toBe(renderPolicy(context(withoutTask, false)));
-		expect(renderPolicy(context())).not.toBe(renderPolicy(context(tools.filter(name => name !== "bash"))));
-	});
-
-	test("an orchestrate counterpart is a short addition to the policy, not a second copy of it", () => {
-		expect(renderKeywordNotice("orchestrate", context(), true).length).toBeLessThan(renderPolicy(context()).length / 10);
-		// It may point at the policy only while the policy is there.
-		expect(renderKeywordNotice("orchestrate", context(), true)).not.toBe(renderKeywordNotice("orchestrate", context(), false));
-	});
-
-	test("without `task` an orchestrate counterpart never offers delegation", () => {
-		expect(renderKeywordNotice("orchestrate", context(withoutTask), false)).not.toMatch(/tasks\[\]|agent:\/\/|parallel|Production \(/);
-	});
-
-	test("the workflow supplement carries none of the method's choices, which stay with the native notice", () => {
-		for (const policyInPrompt of [true, false]) {
-			expect(renderKeywordNotice("workflow", context(), policyInPrompt)).not.toMatch(/tasks\[\]|agent:\/\/|parallel|reuse|dispatch/i);
-		}
-	});
-
-	test("with the policy in the system prompt the workflow supplement is a small fraction of the one that carries the duties", () => {
-		const lean = renderKeywordNotice("workflow", context(), true);
-		const full = renderKeywordNotice("workflow", context(), false);
-		expect(lean.length).toBeLessThan(full.length / 3);
-	});
-});

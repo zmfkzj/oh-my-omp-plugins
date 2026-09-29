@@ -46,6 +46,7 @@ import {
 	prefixHas,
 	renderPolicy,
 } from "./orchestration-policy.ts";
+import { observePolicyExposure } from "./policy-exposure.ts";
 
 type Gate =
 	| { ok: true; session: AgentSession }
@@ -145,6 +146,14 @@ export class OrchestrationRouter {
 				next.push(this.#keywordNotice("workflow", message, context, policyInPrompt));
 				changed = true;
 			}
+		}
+		// Observe this hook's view, including autonomous continuations and residual system policy
+		// after gate changes. This is not provider delivery; subsequent hooks may change the view.
+		const session = this.#deps.config().enabled ? mainSessionOf(ctx) : undefined;
+		if (session) {
+			const governance = !gate.ok ? "plan-mode" :
+				context!.tools.includes("task") ? "governed" : "task-tool-unavailable";
+			observePolicyExposure(ctx, session, governance, changed ? next : messages);
 		}
 		return changed ? next : undefined;
 	}
