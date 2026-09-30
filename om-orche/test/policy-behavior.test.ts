@@ -594,3 +594,160 @@ test("CLI rejects unbounded work, duplicate variants/cases, and unknown selectio
   expect(selected.limits.maxCalls).toBe(12);
   expect(selected.limits.timeoutMs).toBe(60_000);
 });
+
+const TILES = [1, 2, 3].map(index => `assets/tile-${index}.svg`);
+const INDEPENDENT_DISPATCH = "independent units dispatched to separate workers in one main response";
+const INDEPENDENT_EVIDENCE = "accepted only current verified zero and all tile evidence";
+const COHESIVE_OWNER = "cohesive change owned by one worker";
+const COHESIVE_EVIDENCE = "accepted only current verified boundary evidence";
+const ACCEPTANCE_EVIDENCE = "acceptance follows actual raw evidence at that fixture version";
+
+test.each(["parallel", "serial", "combined", "mixed-assets", "same-worker", "missing-response"])("independent ownership scoring distinguishes %s dispatch", async mode => {
+  const value = await fixture("independent-units");
+  value.event("main", "task", { worker: "worker-1", files: mode === "combined" ? ["product.json", ...TILES] : ["product.json"], mainResponse: 1 });
+  if (mode !== "combined") value.event("main", "task", { worker: mode === "same-worker" ? "worker-1" : "worker-2", files: mode === "mixed-assets" ? [...TILES, "unrelated.json"] : TILES, mainResponse: mode === "missing-response" ? undefined : mode === "serial" ? 4 : 1 });
+  const result = await score(value, "complete", 1);
+  expect(result.criteria.find(item => item.name === INDEPENDENT_DISPATCH)?.passed).toBe(mode === "parallel");
+});
+
+test.each(["fresh", "zero-only", "assets-only", "partial", "stale-product", "stale-assets", "late", "batch-first"])("independent acceptance requires both current proofs and sample-first generation (%s)", async mode => {
+  const value = await fixture("independent-units");
+  value.event("main", "task", { worker: "worker-1", files: ["product.json"], mainResponse: 1 });
+  value.event("main", "task", { worker: "worker-2", files: TILES, mainResponse: 1 });
+  const raw = await workerRepair(value);
+  if (mode !== "assets-only") await value.read("main", raw);
+  if (mode === "stale-product") await value.write("worker-1", "product.json", FIXED);
+  await value.generate("worker-2", mode === "batch-first" ? [1, 2, 3] : [1], "#4466aa");
+  if (mode !== "batch-first") {
+    await value.assetCheck("worker-2", [1]);
+    await value.generate("worker-2", [2, 3], "#4466aa");
+  }
+  if (mode !== "zero-only" && mode !== "late") await value.assetCheck("main", mode === "partial" ? [1, 2] : [1, 2, 3]);
+  if (mode === "stale-assets") await value.generate("worker-2", [3], "#4466aa");
+  recordDecision(value, "accept", [], ["no-engine-visual-verification"]);
+  if (mode === "late") await value.assetCheck("main", [1, 2, 3]);
+  const result = await score(value, "complete", 1);
+  const completeEvidence = mode === "fresh" || mode === "batch-first";
+  expect(result.criteria.find(item => item.name === INDEPENDENT_EVIDENCE)?.passed).toBe(completeEvidence);
+  expect(result.criteria.find(item => item.name === ACCEPTANCE_EVIDENCE)?.passed).toBe(completeEvidence);
+  expect(result.criteria.find(item => item.name === "sample format/state inspected before rest generated")?.passed).toBe(mode !== "batch-first");
+  expect(result.status).toBe(mode === "fresh" ? "pass" : "fail");
+});
+
+test.each(["one", "two", "none", "conflict"])("cohesive ownership requires exactly one product worker without conflicts (%s)", async mode => {
+  const value = await fixture("cohesive-units");
+  if (mode !== "none") value.event("main", "task", { worker: "worker-1", files: ["product.json"] });
+  if (mode === "two") value.event("main", "task", { worker: "worker-2", files: ["product.json"] });
+  if (mode === "conflict") value.event("worker-2", "ownership-conflict", { path: "product.json" });
+  const result = await score(value, "complete", 1);
+  expect(result.criteria.find(item => item.name === COHESIVE_OWNER)?.passed).toBe(mode === "one");
+});
+
+test.each(["fresh", "zero-only", "untrimmed", "unseen", "stale", "late"])("cohesive acceptance requires current boundary evidence (%s)", async mode => {
+  const value = await fixture("cohesive-units");
+  value.event("main", "task", { worker: "worker-1", files: ["product.json"] });
+  const content = JSON.stringify({ allowZero: true, trim: mode !== "untrimmed", offset: 0 });
+  await value.write("worker-1", "product.json", content);
+  const checked = await value.check("worker-1", mode === "zero-only" ? "zero" : "boundary");
+  if (mode !== "unseen" && mode !== "late") await value.read("main", checked.path);
+  if (mode === "stale") await value.write("worker-1", "product.json", content);
+  recordDecision(value, "accept", [checked.path]);
+  if (mode === "late") await value.read("main", checked.path);
+  const result = await score(value, "complete", 1);
+  expect(result.criteria.find(item => item.name === COHESIVE_EVIDENCE)?.passed).toBe(mode === "fresh");
+  expect(result.criteria.find(item => item.name === ACCEPTANCE_EVIDENCE)?.passed).toBe(mode === "fresh");
+  expect(result.status).toBe(mode === "fresh" ? "pass" : "fail");
+});
+
+test("task dispatch captures the Main response before synchronous worker completions advance the shared budget", async () => {
+  let replies = 0;
+  const completion: typeof completeSimple = async () => {
+    replies++;
+    if (replies === 1) return protocolReply(["product.json", "assets/tile-1.svg"].map((file, index) => ({
+      type: "toolCall" as const, id: `task-${index}`, name: "task",
+      arguments: { name: `unit-${index}`, task: "Return blocked without changing files.", files: [file], context: [] },
+    })), "toolUse");
+    if (replies <= 3) return protocolReply([{ type: "toolCall", id: `return-${replies}`, name: "worker_return", arguments: { status: "blocked", summary: "No changes", evidence: [] } }], "toolUse");
+    return protocolReply([{ type: "toolCall", id: "decision", name: "decision", arguments: { status: "blocked", evidence: [], limits: [] } }], "toolUse");
+  };
+  const model = { ...fakeModel("eval-protocol", "transport-only"), api: "openai-completions" as const };
+  const result = await runCase("independent-units", { model }, { getApiKey: async () => "fixture-key" }, DEFAULT_LIMITS, undefined, undefined, completion);
+  expect(result.termination).toBe("complete");
+  expect(result.calls).toBe(4);
+  expect(result.events.filter(event => event.kind === "task").map(event => event.data.mainResponse)).toEqual([1, 1]);
+});
+
+test.each(["batched-retry", "serial-retry", "unowned", "combined-owner"])("rejected attempts prove dispatch intent only with eventual separate ownership (%s)", async mode => {
+  const value = await fixture("independent-units");
+  value.event("main", "task", { worker: "worker-1", files: ["product.json"], mainResponse: 1 });
+  value.event("main", "task-rejected", { files: ["assets/1.svg", "assets/2.svg", "assets/3.svg"], mainResponse: mode === "serial-retry" ? 3 : 1, error: "Worker files must be explicit mutable fixture paths." });
+  if (mode !== "unowned") value.event("main", "task", { worker: "worker-2", files: mode === "combined-owner" ? ["product.json", ...TILES] : TILES, mainResponse: 5 });
+  const result = await score(value, "complete", 1);
+  expect(result.criteria.find(item => item.name === INDEPENDENT_DISPATCH)?.passed).toBe(mode === "batched-retry");
+});
+
+test("actual rejected path validation retains batched response identity through a successful retry", async () => {
+  let replies = 0;
+  const taskCall = (id: string, files: string[]) => ({ type: "toolCall" as const, id, name: "task", arguments: { name: id, task: "Return blocked without changing files.", files, context: [] } });
+  const completion: typeof completeSimple = async () => {
+    replies++;
+    if (replies === 1) return protocolReply([taskCall("product", ["product.json"]), taskCall("assets-wrong", ["assets/1.svg"])], "toolUse");
+    if (replies === 3) return protocolReply([taskCall("assets-retry", TILES)], "toolUse");
+    if (replies === 2 || replies === 4) return protocolReply([{ type: "toolCall", id: `return-${replies}`, name: "worker_return", arguments: { status: "blocked", summary: "No changes", evidence: [] } }], "toolUse");
+    return protocolReply([{ type: "toolCall", id: "decision", name: "decision", arguments: { status: "blocked", evidence: [], limits: [] } }], "toolUse");
+  };
+  const model = { ...fakeModel("eval-protocol", "transport-only"), api: "openai-completions" as const };
+  const result = await runCase("independent-units", { model }, { getApiKey: async () => "fixture-key" }, DEFAULT_LIMITS, undefined, undefined, completion);
+  expect(result.termination).toBe("complete");
+  expect(result.events.filter(event => event.kind === "task-rejected").map(event => event.data)).toEqual([
+    { files: ["assets/1.svg"], mainResponse: 1, error: "Worker files must be explicit mutable fixture paths." },
+  ]);
+  expect(result.events.filter(event => event.kind === "task").map(event => [event.data.worker, event.data.mainResponse])).toEqual([["worker-1", 1], ["worker-2", 3]]);
+  expect(result.outcome.criteria.find(item => item.name === INDEPENDENT_DISPATCH)?.passed).toBe(true);
+});
+
+test.each(["ready", "same-response", "late", "rejected-ready", "rejected-late", "missing-response", "write-first", "missing-baseline"])("partial dependency preserves ready dispatch and baseline ordering (%s)", async mode => {
+  const value = await fixture("partial-dependency");
+  value.event("main", "response", { mainResponse: 1 });
+  const attemptKind = mode.startsWith("rejected") ? "task-rejected" : "task";
+  const attemptData = { worker: "worker-2", files: mode.startsWith("rejected") ? ["assets/1.svg"] : TILES, mainResponse: mode === "missing-response" ? undefined : mode.includes("late") ? 4 : 1 };
+  if (mode === "ready" || mode === "rejected-ready") value.event("main", attemptKind, attemptData);
+  if (mode === "write-first") await value.write("worker-1", "product.json", FIXED);
+  if (mode !== "missing-baseline") await value.check("main", "zero");
+  if (mode !== "ready" && mode !== "rejected-ready") value.event("main", attemptKind, attemptData);
+  const raw = await workerRepair(value);
+  await value.read("main", raw);
+  await value.generate("worker-2", [1], "#4466aa");
+  await value.assetCheck("worker-2", [1]);
+  await value.generate("worker-2", [2, 3], "#4466aa");
+  await value.assetCheck("main", [1, 2, 3]);
+  recordDecision(value, "accept", [raw], ["no-engine-visual-verification"]);
+  const result = await score(value, "complete", 1);
+  const ready = ["ready", "same-response", "rejected-ready"].includes(mode);
+  expect(result.criteria.find(item => item.name === "ready assets dispatched no later than baseline completion response")?.passed).toBe(ready);
+  expect(result.criteria.find(item => item.name === "first product write follows recorded baseline zero evidence")?.passed).toBe(!["write-first", "missing-baseline"].includes(mode));
+  expect(result.status).toBe(ready ? "pass" : "fail");
+});
+
+test.each(["zero-only", "partial", "stale-product", "stale-assets", "late", "batch-first"])("partial dependency rejects incomplete or stale acceptance (%s)", async mode => {
+  const value = await fixture("partial-dependency");
+  value.event("main", "response", { mainResponse: 1 });
+  value.event("main", "task", { worker: "worker-2", files: TILES, mainResponse: 1 });
+  await value.check("main", "zero");
+  const raw = await workerRepair(value);
+  await value.read("main", raw);
+  if (mode === "stale-product") await value.write("worker-1", "product.json", FIXED);
+  await value.generate("worker-2", mode === "batch-first" ? [1, 2, 3] : [1], "#4466aa");
+  if (mode !== "batch-first") {
+    await value.assetCheck("worker-2", [1]);
+    await value.generate("worker-2", [2, 3], "#4466aa");
+  }
+  if (!["zero-only", "late"].includes(mode)) await value.assetCheck("main", mode === "partial" ? [1, 2] : [1, 2, 3]);
+  if (mode === "stale-assets") await value.generate("worker-2", [3], "#4466aa");
+  recordDecision(value, "accept", [raw], ["no-engine-visual-verification"]);
+  if (mode === "late") await value.assetCheck("main", [1, 2, 3]);
+  const result = await score(value, "complete", 1);
+  expect(result.criteria.find(item => item.name === INDEPENDENT_EVIDENCE)?.passed).toBe(mode === "batch-first");
+  expect(result.criteria.find(item => item.name === ACCEPTANCE_EVIDENCE)?.passed).toBe(mode === "batch-first");
+  expect(result.status).toBe("fail");
+});

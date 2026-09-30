@@ -1,7 +1,7 @@
 // Bundled plan advisor and independent Verification Auditor for om-orche.
-// Advice is requested explicitly by the primary on an already formed plan; the auditor runs in OMP's
-// passive WATCHDOG roster when enabled. Neither holds execution authority. The two use distinct
-// configurable model roles.
+// Advice is requested explicitly by the primary on an already formed plan; the auditor runs
+// unconditionally at main-session turn end through OMP's native WATCHDOG runtime. Neither
+// holds execution authority. The two use distinct configurable model roles.
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import {
@@ -56,50 +56,60 @@ not loop on unchanged errors. Existing watchdog advisors retain their existing r
 
 const primarySession = mainSessionOf;
 
+// Shared across plugin copies: only one native auditor runtime is installed per main session.
+const auditorSessions = new WeakMap<AgentSession, { forcedMaster: boolean }>();
+
 /**
- * Add the bundled auditor to the live advisor roster unless the user declares their own.
- *
- * Discovery is re-run rather than mutated blind: `applyAdvisorConfigs` replaces the roster
- * wholesale and the session exposes no getter to read the configs back, so appending to a
- * freshly discovered copy is the only lossless way to add one entry. `/advisor configure`
- * applies a freshly discovered roster on save with no hook for extensions, which drops the
- * auditor; {@link restoreVerificationAuditor} repairs that on the next prompt.
- *
- * A `WATCHDOG.yml` entry whose name slugifies the same wins outright — that is the documented
- * way to repoint the model, retune the instructions, or switch the auditor off entirely.
+ * OMP already feeds every completed primary turn to its live WATCHDOG runtimes. Keep the
+ * owned auditor live, even when the persisted master switch or its WATCHDOG entry is off.
+ * When enabling the master solely for the auditor, pause other entries in the live copy;
+ * neither their persisted configuration nor the fill-only host setup is changed.
  */
 async function installVerificationAuditor(primary: AgentSession): Promise<void> {
-  // Never mutate the roster while advisors are disabled: the auditor cannot run, so an apply
-  // would only rebuild a roster the user turned off. The auditor is installed on the first
-  // session_start that runs with advisors enabled.
-  if (!primary.isAdvisorEnabled()) return;
-
+  const masterEnabled = primary.isAdvisorEnabled();
+  const prior = auditorSessions.get(primary);
+  const forcedMaster = !masterEnabled || prior?.forcedMaster === true;
   const discovered = await discoverAdvisorConfigs(
     primary.sessionManager.getCwd(),
     primary.settings.getAgentDir(),
   );
-  if (discovered.advisors.some((advisor) => slugifyAdvisorName(advisor.name) === AUDITOR_SLUG))
-    return;
-  // Applying a non-empty roster is what removes OMP's synthesized default advisor
-  // (`session-advisors.ts:855-856`); a user who wants a general advisor declares one in `WATCHDOG.yml`.
+  const owned = discovered.advisors.find(advisor => slugifyAdvisorName(advisor.name) === AUDITOR_SLUG);
   primary.applyAdvisorConfigs(
-    [...discovered.advisors, VERIFICATION_AUDITOR],
+    [
+      ...discovered.advisors.filter(advisor => slugifyAdvisorName(advisor.name) !== AUDITOR_SLUG)
+        .map(advisor => forcedMaster ? { ...advisor, enabled: false } : advisor),
+      { ...(owned ?? VERIFICATION_AUDITOR), enabled: true },
+    ],
     discovered.sharedInstructions,
     discovered.sharedMaxNotesPerUpdate,
   );
+  // Apply the restricted roster BEFORE enabling: never briefly start unrelated watchdogs.
+  if (!masterEnabled) primary.setAdvisorEnabled(true);
+  auditorSessions.set(primary, { forcedMaster });
 }
 
-/**
- * Re-install the auditor when the live roster no longer carries it. The roster is replaced
- * wholesale by `/advisor configure` on save, and the status roster (`getAdvisorStats`) is the
- * only view of it an extension has, so the check runs before each prompt. A roster that names the
- * auditor (bundled or the user's own `WATCHDOG.yml` entry, enabled or not) is left alone.
- */
 async function restoreVerificationAuditor(primary: AgentSession): Promise<void> {
-  if (!primary.isAdvisorEnabled()) return;
-  const live = primary.getAdvisorStats().advisors;
-  if (live.some((advisor) => slugifyAdvisorName(advisor.name) === AUDITOR_SLUG)) return;
+  if (primary.isAdvisorEnabled()) {
+    const live = primary.getAdvisorStats().advisors;
+    if (live.some(advisor => slugifyAdvisorName(advisor.name) === AUDITOR_SLUG && advisor.status !== "paused")) {
+      if (!auditorSessions.has(primary)) auditorSessions.set(primary, { forcedMaster: false });
+      return;
+    }
+  }
   await installVerificationAuditor(primary);
+}
+
+async function removeVerificationAuditor(primary: AgentSession): Promise<void> {
+  const installed = auditorSessions.get(primary);
+  if (!installed) return;
+  const discovered = await discoverAdvisorConfigs(primary.sessionManager.getCwd(), primary.settings.getAgentDir());
+  if (installed.forcedMaster) primary.setAdvisorEnabled(false);
+  primary.applyAdvisorConfigs(
+    discovered.advisors.filter(advisor => slugifyAdvisorName(advisor.name) !== AUDITOR_SLUG),
+    discovered.sharedInstructions,
+    discovered.sharedMaxNotesPerUpdate,
+  );
+  auditorSessions.delete(primary);
 }
 
 export function registerOrcheAdvisor(pi: ExtensionAPI, reviewer: typeof runReview = runReview, enabled: () => boolean = () => true): void {
@@ -107,28 +117,37 @@ export function registerOrcheAdvisor(pi: ExtensionAPI, reviewer: typeof runRevie
   const field = z.string().min(1).max(2000);
   let inFlight = false;
 
-  // Only the explicit tool invokes the advisor model. Lifecycle hooks never request advice;
-  // the auditor installed here is OMP's own passive advisor runtime, billed as an advisor.
-  // While the plugin is disabled the roster is left exactly as OMP built it. `enabled` is read
-  // at each event, but an auditor installed by an earlier enabled session_start stays in OMP's live
-  // roster (the session exposes no getter to reconstruct it), so disabling mid-session takes full
-  // effect at the next session start; only the contract rewriting stops at once.
+  // Only the explicit tool invokes the plan advisor. The auditor uses OMP's native
+  // turn-end callback and cursor/in-flight drain, not a second extension turn-end request.
   pi.on("session_start", async (_event, ctx) => {
     const primary = primarySession(ctx);
     if (!primary) {
       await pi.setActiveTools(pi.getActiveTools().filter((name) => name !== TOOL));
       return;
     }
-    if (enabled()) await installVerificationAuditor(primary);
+    if (enabled()) await restoreVerificationAuditor(primary);
+    else await removeVerificationAuditor(primary);
   });
   // Registered after the router's handler, so the execution policy is already in `event.systemPrompt`
   // and the guidance follows it; never appended twice (a second copy of the plugin, an earlier attempt).
   pi.on("before_agent_start", async (event, ctx) => {
-    const primary = enabled() ? primarySession(ctx) : undefined;
+    const primary = primarySession(ctx);
     if (!primary) return;
+    if (!enabled()) {
+      await removeVerificationAuditor(primary);
+      return;
+    }
     await restoreVerificationAuditor(primary);
     if (pi.getActiveTools().includes(TOOL) && !event.systemPrompt.includes(ADVISOR_GUIDANCE)) {
       return { systemPrompt: [...event.systemPrompt, ADVISOR_GUIDANCE] };
+    }
+  });
+  pi.on("turn_end", (_event, ctx) => {
+    const primary = enabled() ? primarySession(ctx) : undefined;
+    if (!primary) return;
+    const auditor = primary.getAdvisorStats().advisors.find(advisor => slugifyAdvisorName(advisor.name) === AUDITOR_SLUG);
+    if (!auditor || ["no_model", "quota_exhausted", "error", "paused"].includes(auditor.status)) {
+      pi.logger.warn(`${AUDITOR_NAME} turn-end audit skipped: ${auditor?.status ?? "no live runtime"}`);
     }
   });
   // Enforce the auditor's note contract in what the primary reads; runs whether or not the

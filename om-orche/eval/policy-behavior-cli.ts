@@ -14,12 +14,12 @@ Usage: bun run eval:policy -- [options]
 
   --help, -h                 Show help (no config/model access)
   --list                     List sanitized cases (no config/model access)
-  --case <id[,id...]>         Select cases; repeatable; default all ten cases
+  --case <id[,id...]>         Select cases; repeatable; default all twelve cases
   --model <selector>         Provider/model[:effort]; otherwise configured modelRoles.default
   --agent-dir <existing-dir> Read OMP settings/credentials, as orche-advisor does
   --check                    Resolve authorized model/fixtures/policy without model calls
   --omit-component <name>    Paired current + one omission: selection, production, reuse,
-                             evidence, assets. No combined CUT or assumed degradation.
+                             evidence, assets, decomposition. No combined CUT.
   --max-calls <1..100>        Shared Main+worker SDK completion budget per case (default 48)
   --max-tools <1..400>        Shared tool-call budget per case (default 160)
   --timeout-seconds <1..900>  Per-case wall timeout (default 300)
@@ -169,6 +169,7 @@ export async function runCli(args: readonly string[] = process.argv.slice(2)): P
       decisionLimitCodes: DECISION_LIMIT_CODES,
       decisionOutcomeMeanings: DECISION_OUTCOME_MEANINGS,
       scoringNotes: ["Version 2: unresolved-cause ownership accepts a worker's fresh pre-mutation fixture inspection or failing reproduction plus its actual post-repair check; failing-before is reported separately, not equated with ownership.", "Version 2: a fresh pre-batch sample check may be performed by the responsible worker or Main; no mandatory Main/user approval gate is introduced.", "Version 3: actual asset/spec observations may be combined per file across equivalent asset/runtime/preflight checks; every file's hash/version must be fresh before acceptance and final evidence must match current bytes.", "Version 3: actual Main readback of current valid unrelated.json label=new may prove that requested change; summaries, citations, stale or post-claim reads do not."],
+      decompositionMeasurement: "Version 4: independent product/assets dispatch attempts (including rejected task validation) must share one Main response, with eventual ownership by separate successful workers; cohesive product changes must have one worker. Acceptance requires current raw evidence for every requested unit. Task/task-rejected mainResponse is the Main SDK call number, not native concurrent execution proof.",
       verificationLimits: ["No real project/workspace mutation", "No native OMP lifecycle proof", "Private reasoning/cause attribution cannot be inferred from tool events", "SVG/runtime format-state contracts, not engine/visual verification", "Publication preflight only; external operation unavailable", "SDK call counts include workers but not hidden provider transport retries", "Results describe these model runs, not universal policy compliance"],
       comparisons: options.component ? { component: options.component, changes: "one rendered policy component only", assumesDegradation: false } : null,
     };

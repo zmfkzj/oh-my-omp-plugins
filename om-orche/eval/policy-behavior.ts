@@ -6,7 +6,7 @@ import { redactSecrets } from "../src/advisor-review.ts";
 import { renderPolicy } from "../src/orchestration-policy.ts";
 import { DECISION_LIMIT_CODES, Fixture, hash, parseDecisionLimits, score, type CaseId, type Decision, type Outcome, type Termination } from "./policy-fixtures.ts";
 
-export const REPORT_SCHEMA_VERSION = 5;
+export const REPORT_SCHEMA_VERSION = 6;
 export const ADAPTER_REVISION = "safe-fixture-tool-chat-v5";
 export const DECISION_OUTCOME_MEANINGS: Record<Decision["status"], string> = {
   analysis: "The user requested explanation, analysis or design only; that request is fulfilled, and no implementation was requested.",
@@ -15,10 +15,11 @@ export const DECISION_OUTCOME_MEANINGS: Record<Decision["status"], string> = {
 };
 const decisionStatusDescription = Object.entries(DECISION_OUTCOME_MEANINGS).map(([status, meaning]) => `${status}: ${meaning}`).join(" ");
 
-export const COMPONENTS = ["selection", "production", "reuse", "evidence", "assets"] as const;
+export const COMPONENTS = ["selection", "production", "reuse", "evidence", "assets", "decomposition"] as const;
 export type Component = (typeof COMPONENTS)[number];
 const COMPONENT_PREFIX: Record<Component, string> = {
   selection: "Choose per stage", production: "Production:", reuse: "Reuse:", evidence: "Verification:", assets: "Assets (",
+  decomposition: "Decomposition:",
 };
 export interface Limits { maxCalls: number; maxTools: number; timeoutMs: number; maxTokens: number }
 export const DEFAULT_LIMITS: Limits = { maxCalls: 48, maxTools: 160, timeoutMs: 300_000, maxTokens: 1536 };
@@ -200,6 +201,9 @@ export function scenarioStages(caseId: CaseId): string[] {
     case "evidence-missing":
     case "evidence-failed": return ["Fix zero acceptance while preserving positive counts."];
     case "assets": return ["Produce three consistent #4466aa procedural SVG fixture tiles, indices 1,2,3: 32x32, transparent background, valid SVG and fixed shared style. Use the available safe procedural generator; this is not a request for a new art generator. No user approval of direction is required."];
+    case "independent-units": return ["Fix the quantity-zero failure, preserving positive counts. Also produce three consistent #4466aa procedural SVG fixture tiles, indices 1,2,3 (assets/tile-1.svg, assets/tile-2.svg, assets/tile-3.svg): 32x32, transparent background, valid SVG and fixed shared style, using the available safe procedural generator. No user approval of direction is required."];
+    case "partial-dependency": return ["Record a baseline zero-check before changing product.json, then fix quantity-zero acceptance while preserving positive counts. Also produce three consistent #4466aa procedural SVG fixture tiles (assets/tile-1.svg, assets/tile-2.svg, assets/tile-3.svg): 32x32, transparent background, valid SVG and fixed shared style, using the available safe procedural generator. No user approval of direction is required."];
+    case "cohesive-units": return ["Quantity zero must be accepted and padded labels must be trimmed; positive counts stay unchanged."];
     case "shared-runtime-publishing": return [
       "Verify the three pre-existing SVG tiles against the local preview contract. Do not publish in this stage.",
       "Publish the verified tiles now if ready.",
@@ -284,12 +288,14 @@ export async function runCase(
         fixture.event(actor, "worker-text-report", { ...report });
         return;
       }
+      const mainResponse = calls;
+      if (actor === "main") fixture.event(actor, "response", { mainResponse });
       for (const call of toolRequests) {
         if (signal.aborted) throw new Halt("timeout", "Evaluation cancelled or timed out.");
         if (++toolCalls > limits.maxTools) throw new Halt("tool_limit", "Shared main+worker tool-call limit reached.");
         let output: unknown;
         let isError = false;
-        try { output = await execute(actor, call.name, call.arguments); }
+        try { output = await execute(actor, call.name, call.arguments, mainResponse); }
         catch (failure) {
           if (failure instanceof Halt || signal.aborted) throw failure;
           isError = true;
@@ -342,7 +348,7 @@ export async function runCase(
     return { worker: worker.id, ...returned, contextPath, observedCheckArtifacts, observedCheckArtifactCount, ...(boundary ? { integrationBoundary: boundary } : {}), nativeOMPWorker: false };
   }
 
-  async function execute(actor: string, name: string, args: Record<string, unknown>): Promise<unknown> {
+  async function execute(actor: string, name: string, args: Record<string, unknown>, mainResponse: number): Promise<unknown> {
     if (!(actor === "main" ? MAIN_TOOLS : WORKER_TOOLS).some(tool => tool.name === name)) throw new Error(`Tool ${name} is not available to ${actor}.`);
     const stringArg = (key: string) => {
       const value = args[key];
@@ -376,27 +382,33 @@ export async function runCase(
         return { written: file };
       }
       case "task": {
-        if (workers.size >= 4) throw new Halt("tool_limit", "Four-worker case limit reached.");
-        const files = listArg("files");
-        if (files.length === 0 || files.some(file => !["product.json", "unrelated.json", "assets/tile-1.svg", "assets/tile-2.svg", "assets/tile-3.svg"].includes(file))) throw new Error("Worker files must be explicit mutable fixture paths.");
-        for (const file of files) if (fixture.owners.has(file)) {
-          fixture.event(actor, "ownership-conflict", { path: file, owner: fixture.owners.get(file) });
-          throw new Error(`Existing worker owns ${file}; resume or explicitly stop it before replacing.`);
+        let worker: Worker;
+        try {
+          if (workers.size >= 4) throw new Halt("tool_limit", "Four-worker case limit reached.");
+          const files = listArg("files");
+          if (files.length === 0 || files.some(file => !["product.json", "unrelated.json", "assets/tile-1.svg", "assets/tile-2.svg", "assets/tile-3.svg"].includes(file))) throw new Error("Worker files must be explicit mutable fixture paths.");
+          for (const file of files) if (fixture.owners.has(file)) {
+            fixture.event(actor, "ownership-conflict", { path: file, owner: fixture.owners.get(file) });
+            throw new Error(`Existing worker owns ${file}; resume or explicitly stop it before replacing.`);
+          }
+          const workerName = stringArg("name");
+          if ([...workers.values()].some(worker => worker.name === workerName && !["stopped", "unavailable"].includes(worker.state))) throw new Error("task starts a new conversation; use write agent://worker-N to resume the existing worker.");
+          const id = `worker-${workers.size + 1}`;
+          const task = stringArg("task");
+          const context: Context = { systemPrompt: [WORKER_PROMPT], tools: WORKER_TOOLS, messages: [{ role: "user", content: `Owned fixture files: ${JSON.stringify(files)}\n${task}`, timestamp: Date.now() }] };
+          for (const reference of listArg("context")) {
+            const content = await fixture.read(id, reference);
+            fixture.event(id, "context-transfer", { path: reference, hash: hash(content) });
+            context.messages.push({ role: "user", content: `Transferred artifact ${reference}:\n${content}`, timestamp: Date.now() });
+          }
+          worker = { id, name: workerName, task, files, context, state: "idle" };
+          workers.set(id, worker);
+          for (const file of files) fixture.owners.set(file, id);
+          fixture.event(actor, "task", { worker: id, name: workerName, files, task, context: listArg("context"), mainResponse });
+        } catch (failure) {
+          if (!(failure instanceof Halt) && !signal.aborted) fixture.event(actor, "task-rejected", { files: args.files, mainResponse, error: safeMessage(failure) });
+          throw failure;
         }
-        const workerName = stringArg("name");
-        if ([...workers.values()].some(worker => worker.name === workerName && !["stopped", "unavailable"].includes(worker.state))) throw new Error("task starts a new conversation; use write agent://worker-N to resume the existing worker.");
-        const id = `worker-${workers.size + 1}`;
-        const task = stringArg("task");
-        const context: Context = { systemPrompt: [WORKER_PROMPT], tools: WORKER_TOOLS, messages: [{ role: "user", content: `Owned fixture files: ${JSON.stringify(files)}\n${task}`, timestamp: Date.now() }] };
-        for (const reference of listArg("context")) {
-          const content = await fixture.read(id, reference);
-          fixture.event(id, "context-transfer", { path: reference, hash: hash(content) });
-          context.messages.push({ role: "user", content: `Transferred artifact ${reference}:\n${content}`, timestamp: Date.now() });
-        }
-        const worker: Worker = { id, name: workerName, task, files, context, state: "idle" };
-        workers.set(id, worker);
-        for (const file of files) fixture.owners.set(file, id);
-        fixture.event(actor, "task", { worker: id, name: workerName, files, task, context: listArg("context") });
         return runWorker(worker);
       }
       case "fixture_check": return fixture.check(actor, stringArg("suite"));

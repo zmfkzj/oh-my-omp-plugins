@@ -27,6 +27,7 @@ import { clearRegistry, makeSession, registerAsMain } from "./harness.ts";
 import { registeredSession } from "./sessions.ts";
 import { firstRun, NO_TOOL_CALL, progress, publish, settled, turn } from "./worker-frames.ts";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { AdvisorConfig } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 
 const roots: string[] = [];
 const instances: Telemetry[] = [];
@@ -1197,7 +1198,20 @@ async function setTelemetryOverride(cwd: string, telemetryEnabled: boolean): Pro
 /** The main session, or a subagent's, working in `cwd`; what the plugin shows the user lands in `notes`. */
 function sessionIn(cwd: string, main: boolean, notes: string[] = []): ExtensionCommandContext {
 	const fake = makeSession();
-	Object.assign(fake.session, { isAdvisorEnabled: () => false });
+	// A real main AgentSession always has these live-roster APIs. Keep discovery isolated
+	// in this fixture's project, rather than using the developer's WATCHDOG configuration.
+	let advisorsEnabled = false;
+	let advisors: AdvisorConfig[] = [];
+	Object.assign(fake.session.sessionManager, { getCwd: () => cwd });
+	Object.assign(fake.session.settings, { getAgentDir: () => path.join(cwd, ".omp") });
+	Object.assign(fake.session, {
+		isAdvisorEnabled: () => advisorsEnabled,
+		setAdvisorEnabled: (enabled: boolean) => { advisorsEnabled = enabled; },
+		applyAdvisorConfigs: (configs: AdvisorConfig[]) => { advisors = configs; },
+		getAdvisorStats: () => ({
+			advisors: advisors.map(advisor => ({ name: advisor.name, status: advisor.enabled === false ? "paused" : "running" })),
+		}),
+	});
 	if (main) registerAsMain(fake.session);
 	const ui = { notify: (message: string) => void notes.push(message) };
 	return { ...fake.ctx, cwd, ui } as unknown as ExtensionCommandContext;

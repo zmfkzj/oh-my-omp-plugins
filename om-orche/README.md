@@ -72,8 +72,8 @@ stays warm (see [Modes and skip conditions](#modes-and-skip-conditions)).
 ## Execution policies
 
 The policy reads in this order: the header and precedence line, the rule for
-choosing (with switching), Judgment, Production (with assets), reuse, the task-item
-contract with worker-local checks (and the `effort` line when enabled), and
+choosing (with switching), Judgment, Production, Decomposition, assets, reuse,
+the task-item contract with worker-local checks (and the `effort` line when enabled), and
 verification. Shared guidance is written once; the policy does not hold two
 complete execution prompts. It is guidance for the model, not a scheduler or
 permission system, and it renders only instructions backed by the tools enabled
@@ -84,7 +84,7 @@ from the next prompt.
 | --- | --- | --- |
 | Delivers | an explanation, analysis, judgment, proposal or design | a real change to code, files, features, assets or state |
 | Who works | the main: frames the question, reads the key code, logs and docs, forms hypotheses, gathers evidence, runs key experiments, tests counterexamples, decides | workers own investigation, local design, implementation, local checks, failure analysis and re-fixes within their scope; the main owns goal, scope, shared decisions, integration and acceptance |
-| Workers | zero is normal; bounded, independent investigations only | one worker end to end for cohesive or sequential work; several only for independent units |
+| Workers | zero is normal; independent unknown areas or hypotheses go to parallel bounded investigations, while the main owns judgment | one worker end to end for a cohesive or strictly sequential unit; disjoint write sets, settled interfaces and separate acceptance define independent units, whose ready workers start together; explain bundling or serialization in the plan |
 | Changes the product? | never: analysis-only is not permission to change code, config or assets | yes, through workers |
 
 In both policies the main owns the user's intent, scope, global decisions and the
@@ -182,13 +182,31 @@ mode and read-only limits come first.
 
 These are two separate decisions.
 
-- **Delegation.** Cohesive or strongly sequential work goes to **one worker end
-  to end**; "it can't be parallelized" never moves it to the main. A single worker
-  is a normal path, not a fallback.
-- **Parallelism.** Only for units that are independent under verified
-  prerequisites, not by file count or volume; no artificial splitting. Ready
-  independent units start together (one host batch or async dispatch); order only
-  for a real dependency, ownership or resource conflict.
+- **Delegation.** A cohesive or strictly sequential unit goes to **one worker
+  end to end**; "it can't be parallelized" never moves it to the main. Shared
+  write sets, an unsettled shared decision or a single acceptance check define
+  one cohesive unit. A single worker is a normal path, not a fallback.
+- **Decomposition.** Before dispatching, list each unit's write set (the files,
+  modules and assets it changes), interfaces provided or consumed, prerequisites
+  and acceptance check. Disjoint write sets, settled interfaces and separate
+  acceptance define independent units. Split for independent acceptance and
+  context isolation, not file count or volume.
+- **Parallelism.** Start every ready independent unit together in one dispatch:
+  one `task` batch or parallel calls in one response, not one after another.
+  When producer and consumer share only an interface, settle its names, shapes,
+  errors and owner first, then dispatch both sides together. Order only for a
+  real dependency, ownership or resource conflict, and only for the files it
+  touches. If part of a unit waits on a running baseline, shared runtime or
+  upstream result, start the rest now and hold just the affected files. Release
+  those files by messaging the running worker when free (when `write` is
+  available), or assign them as a later unit; never hold ready work behind them.
+  A global check is no reason to serialize workers: parallel workers run scoped
+  checks on their files, and the named owner runs the global suite once after
+  integration. When bundling independent units into one worker or serializing
+  them, state the reason in the plan. Orche-Advisor also reviews whether a whole
+  unit was held back when only some of its files depended on a prerequisite.
+  In Judgment, independent unknown areas or hypotheses likewise go to parallel
+  bounded investigations; the main keeps the judgment.
 
 #### The main's direct edits: a narrow exception
 
@@ -653,33 +671,48 @@ withheld.
 `review_findings` with an unknown `findingId` fails with the current ids
 (unresolved first, bounded) so a guessed id is corrected in one step.
 
-The bundled Verification Auditor runs through OMP's WATCHDOG roster only while
-advisors are enabled (OMP's `advisor.enabled`, default `false`). Its model is
-`@verification-auditor`, a custom role. The [OMP setup](#omp-setup) turns
-`advisor.enabled` on and fills that role with `@smol` once, if they are unset. If
-`smol` is unset, OMP resolves `@smol` to your default model. The auditor is a
-per-turn review, so enabling it costs a model call each turn. It does not use or
-change `modelRoles.advisor` (ADVISOR); set its role independently to choose a
-different model. A same-named `WATCHDOG.yml` entry overrides the bundled
-auditor. Its evidence-backed concern/blocker notes feed the next checkpoint
-review, not unrelated watchdog notes.
+The Verification Auditor is mandatory after every main-session turn end while
+the plugin is enabled, including text-only turns with no tool calls. It uses
+OMP's native WATCHDOG turn-end callback, not a second extension-triggered model
+request. The native transcript cursor suppresses repeated delivery of the same
+turn, and its single in-flight drain queues new turns; overlapping turns may be
+batched by the host rather than producing one separate provider request each.
+There are no plugin heuristics, tool-call filters or cooldowns.
 
-When no WATCHDOG roster is configured, the Verification Auditor is the only
-advisor; the plugin removes OMP's synthesized default advisor. Explicit
-`WATCHDOG.yml` entries are retained, including a general advisor if desired.
+Its model is `@verification-auditor`, a custom role. The [OMP setup](#omp-setup)
+still fills `advisor.enabled=true` and `modelRoles.verification-auditor=@smol`
+once, only when unset; persisted user settings remain untouched. If `smol` is
+unset, OMP resolves it to your default model. Independently of that fill-only
+setup, the plugin enables the live session's advisor switch and the owned
+auditor entry. A same-named `WATCHDOG.yml` entry can override the auditor's
+model and instructions, but `enabled:false` cannot suppress this mandatory
+audit. No `modelRoles.advisor` value is changed.
 
-With `enabled=false` the plugin installs no auditor and rewrites no advisor notes,
-so OMP's native advisor roster and cards are untouched (the manual `orche_advisor`
-and `review_findings` tools remain available). The setting is read at session
-start: an auditor installed earlier in the same session stays in OMP's live roster
-until the next session start, though its notes are no longer rewritten.
+When the master advisor switch was off, other WATCHDOG entries are paused in
+the live roster before it is enabled, so only the auditor starts; their files
+and settings are unchanged. Otherwise explicit advisors retain their own
+enabled flags. Without a WATCHDOG roster the auditor replaces OMP's synthesized
+default advisor. Evidence-backed auditor notes feed checkpoint reviews.
 
-`/advisor configure` replaces OMP's live advisor roster with the saved
-`WATCHDOG.yml` entries and gives extensions no hook for it, which drops the bundled
-auditor. The plugin notices at the next prompt (the live roster no longer names the
-Verification Auditor) and installs it again; a `WATCHDOG.yml` entry of the same
-name, even a disabled one, is never overridden. Until you send that prompt the
-auditor is not in the roster.
+With plugin `enabled=false`, no auditor is installed. Disabling after installation
+removes the owned auditor at the next prompt and restores a master switch that
+the plugin forced on; other WATCHDOG configurations are restored from discovery.
+Advisor-note rewriting also stops, and the manual `orche_advisor` and
+`review_findings` tools remain available. Subagent sessions are not modified.
+
+`/advisor configure` can replace the live roster; the plugin repairs a missing
+or paused auditor, or a disabled master switch, before the next main prompt.
+Hard host failures (no matching model, quota exhaustion or a halted/error
+runtime) can prevent an audit; each affected turn boundary logs a
+`Verification Auditor turn-end audit skipped: ...` warning rather than silently
+claiming verification. Host provider failures retain OMP's own visible notices.
+
+Verified on OMP 18.4.4 in isolated print mode with a local fake model and no
+paid calls: a text-only main answer made exactly one auditor request despite
+`advisor.enabled:false` and a disabled same-named WATCHDOG entry; an unrelated
+WATCHDOG entry remained inactive. Consecutive turns, duplicate boundaries,
+duplicate plugin registration and disable transitions are covered with OMP's
+real advisor delta/cursor/drain runtime in the scoped behavioral tests.
 
 Advice text returned to the model has terminal escapes, control characters and
 invisible format characters (zero-width, bidirectional, soft hyphen, word joiner,
@@ -1370,9 +1403,10 @@ not establish how a model behaves; policy prose is not snapshot-tested.
 The development-only evaluator runs real model conversations over inert fixtures
 with a main/worker tool adapter. It exercises analysis-only boundaries,
 delegation with an unresolved cause, refuted premises, viable/unavailable worker
-reuse, evidence acceptance (complete/missing/failed), assets, and shared-runtime
-ownership with publishing preflight. Scoring uses event-backed invariants, not
-prose matching or an LLM judge.
+reuse, evidence acceptance (complete/missing/failed), assets, shared-runtime
+ownership with publishing preflight, ready independent units dispatched together,
+and cohesive units kept with one worker. Scoring uses event-backed invariants,
+not prose matching or an LLM judge.
 Reports declare their scoring version/notes. Events cannot establish private
 reasoning or cause attribution: the unknown-cause case accepts a worker's fresh
 pre-mutation fixture inspection or failing reproduction, with its own actual
@@ -1405,8 +1439,10 @@ bun run eval:policy -- --case evidence-acceptance \
 `--case` is repeatable or comma-separated; without selection all cases run. IDs
 are `analysis-only`, `unknown-cause`, `refuted-premise`, `reuse-viable`,
 `reuse-unavailable`, `evidence-acceptance`, `evidence-missing`, `evidence-failed`,
-`assets`, and `shared-runtime-publishing`. Without `--model`, only the configured
-`modelRoles.default` is used, with no fallback. `--agent-dir` selects an existing
+`assets`, `shared-runtime-publishing`, `independent-units`, `partial-dependency`,
+and `cohesive-units`.
+Without `--model`, only the configured `modelRoles.default` is used, with no
+fallback. `--agent-dir` selects an existing
 OMP agent directory. `--check` validates selection/configuration without model
 calls. Importing the runner or running `bun test test/policy-behavior.test.ts`
 does not perform paid calls.
@@ -1416,9 +1452,9 @@ Default per-case bounds shared across main and workers are `--max-calls 48`
 `--max-tokens 1536` bounds each SDK completion, not the whole case. Internal
 transport retries are not counted as separate model calls; the wall-time bound
 still applies. Override these limits explicitly if needed. `--omit-component`
-accepts `selection`, `production`, `reuse`, `evidence`, or `assets`; omission
-compares one component at a time on fresh equivalent fixtures and does not
-presume that removal degrades behavior.
+accepts `selection`, `production`, `reuse`, `evidence`, `assets`, or
+`decomposition`; omission compares one component at a time on fresh equivalent
+fixtures and does not presume that removal degrades behavior.
 
 `--output` must name a nonexistent directory; otherwise a fresh retained
 OS-temp directory is used. `report.json` aggregates pass/fail/incomplete results,
@@ -1428,14 +1464,34 @@ the trace, final inert-file state/raw evidence, actual policy and result. The
 mutable fixture sandbox is removed. Reports contain synthetic fixture/model
 content, not real user sessions; review them before sharing.
 
-Aggregate and per-case results declare `schemaVersion: 5`, adapter revision
-`safe-fixture-tool-chat-v5`, and `scoringVersion: 3`. Aggregate reports
+Aggregate and per-case results declare `schemaVersion: 6`, adapter revision
+`safe-fixture-tool-chat-v5`, and `scoringVersion: 5`. Aggregate reports
 list supported `decisionLimitCodes`. The evaluator's `decision.limits` accepts unique
 machine-readable codes `no-engine-visual-verification` and
 `no-external-publishing`, not free-form prose.
 An empty array is valid when neither adapter limit applies. Human explanations
 remain in original tool evidence and the trace; the codes keep declaration and
 scoring on the same explicit contract.
+
+`partial-dependency` requests a recorded baseline zero-check before product
+changes, a zero-acceptance repair preserving positive counts, and three SVG
+tiles, without a parallelism hint. It fails when the first assets task attempt
+(including rejected paths) comes in a later Main response than baseline
+completion, or the first product write precedes the baseline evidence. It also
+requires current raw zero and all-tile acceptance evidence and sample-first
+asset checks, as in `independent-units`. Response IDs measure dispatch intent,
+not actual concurrent execution in this synchronous tool-chat adapter.
+
+The three paired pilots on `anthropic/claude-opus-5-5` retained at
+`/tmp/orche-pd-{1,2,3}` all completed: current and decomposition-omitted variants
+each failed only the ready-assets criterion. Trace inspection found baseline
+completion in Main response 1 and the first valid assets task in response 2,
+with no rejected calls; baseline-before-write and acceptance evidence passed.
+The case is retained because current policy still exhibits the gap, not because
+these runs demonstrate a causal improvement from the decomposition line.
+Those pilot reports carry scoring version 4; version 5 marks the retained
+partial-dependency scoring contract.
+
 
 `decision.status` is the **final outcome of the current user request**, not a
 Judgment/Production choice or an intermediate-stage marker:

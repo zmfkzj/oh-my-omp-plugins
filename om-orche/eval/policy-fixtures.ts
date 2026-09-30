@@ -6,6 +6,7 @@ import path from "node:path";
 export const CASE_IDS = [
   "analysis-only", "unknown-cause", "refuted-premise", "reuse-viable", "reuse-unavailable",
   "evidence-acceptance", "evidence-missing", "evidence-failed", "assets", "shared-runtime-publishing",
+  "independent-units", "partial-dependency", "cohesive-units",
 ] as const;
 export type CaseId = (typeof CASE_IDS)[number];
 export type Actor = "main" | "harness" | string;
@@ -265,7 +266,7 @@ function validateProduct(content: string): Product {
 }
 
 export interface Criterion { name: string; passed: boolean; eventIds: number[] }
-export const SCORING_VERSION = 3;
+export const SCORING_VERSION = 5;
 export interface Outcome { status: "pass" | "fail" | "incomplete"; scoringVersion: number; criteria: Criterion[]; observations: Record<string, unknown> }
 export type Termination = "complete" | "call_limit" | "tool_limit" | "timeout" | "provider_error" | "invalid_response";
 
@@ -338,13 +339,18 @@ export async function score(fixture: Fixture, termination: Termination, phases: 
   const accepted = select("decision", "main").filter(event => event.data.status === "accept");
   const acceptanceEvidence = accepted.map(acceptance => {
     if (fixture.caseId === "assets") return assetProof(ASSET_PATHS, { before: acceptance.id, actor: "main" });
-    const suite = fixture.caseId === "shared-runtime-publishing" ? "runtime-contract" : fixture.caseId.startsWith("reuse-") && acceptance.phase === 2 ? "boundary" : "zero";
+    const suite = fixture.caseId === "shared-runtime-publishing" ? "runtime-contract" : fixture.caseId === "cohesive-units" || (fixture.caseId.startsWith("reuse-") && acceptance.phase === 2) ? "boundary" : "zero";
     const observation = mainObservations.find(observation => {
       if (observation.data.suite !== suite || observation.data.passed !== true || observation.id >= acceptance.id) return false;
+      if ((fixture.caseId === "independent-units" || fixture.caseId === "partial-dependency" || fixture.caseId === "cohesive-units") && !current(observation)) return false;
       const versions = observation.data.versions as Record<string, number> | undefined;
       if (!versions) return false;
       return Object.entries(versions).every(([file, version]) => events.findLast(event => event.kind === "write" && event.data.path === file && event.id < acceptance.id)?.data.version === version);
     });
+    if (fixture.caseId === "independent-units" || fixture.caseId === "partial-dependency") {
+      const assets = assetProof(ASSET_PATHS, { before: acceptance.id, actor: "main", current: true });
+      return observation && assets ? [observation, ...assets] : undefined;
+    }
     return observation ? [observation] : undefined;
   });
   add("acceptance follows actual raw evidence at that fixture version", acceptanceEvidence.every(Boolean), [...accepted, ...acceptanceEvidence.flatMap(proof => proof ?? [])]);
@@ -421,7 +427,37 @@ export async function score(fixture: Fixture, termination: Termination, phases: 
       const failed = mainObservations.filter(event => event.data.passed === false && event.data.suite === "zero");
       add("actual failed evidence routed to worker repair", failed.some(event => workerWrites.some(write => write.id > event.id)) && checks.some(check => failed.some(event => check.id > event.id)) && !productWrites.some(event => event.actor === "main"), [...failed, ...workerWrites, ...checks]);
     }
-  } else if (fixture.caseId === "assets") {
+  } else if (fixture.caseId === "cohesive-units") {
+    const tasks = select("task", "main").filter(event => (event.data.files as string[]).includes("product.json"));
+    const conflicts = select("ownership-conflict");
+    add("cohesive change owned by one worker", tasks.length === 1 && conflicts.length === 0, [...tasks, ...conflicts]);
+    const checks = verified("boundary");
+    add("accepted only current verified boundary evidence", decision()?.status === "accept" && checks.length > 0, checks);
+  } else if (fixture.caseId === "assets" || fixture.caseId === "independent-units" || fixture.caseId === "partial-dependency") {
+    if (fixture.caseId === "independent-units") {
+      const attempts = events.filter(event => event.actor === "main" && (event.kind === "task" || event.kind === "task-rejected"));
+      const files = (event: Event): string[] => Array.isArray(event.data.files) ? event.data.files.filter((file): file is string => typeof file === "string") : [];
+      const productAttempts = attempts.filter(event => files(event).includes("product.json") && !files(event).some(file => file.startsWith("assets/")));
+      const assetAttempts = attempts.filter(event => files(event).length > 0 && files(event).every(file => file.startsWith("assets/")));
+      const productTasks = productAttempts.filter(event => event.kind === "task");
+      const assetTasks = assetAttempts.filter(event => event.kind === "task");
+      const separateOwners = productTasks.some(product => assetTasks.some(assets => product.data.worker !== assets.data.worker));
+      const batched = productAttempts.some(product => assetAttempts.some(assets => typeof product.data.mainResponse === "number" && product.data.mainResponse === assets.data.mainResponse));
+      add("independent units dispatched to separate workers in one main response", separateOwners && batched, [...productAttempts, ...assetAttempts]);
+    }
+    if (fixture.caseId === "partial-dependency") {
+      const baseline = select("check").find(event => event.actor !== "harness" && event.data.suite === "zero" && event.data.passed === false && (event.data.versions as Record<string, number> | undefined)?.["product.json"] === 1);
+      const baselineResponse = baseline && select("response", "main").findLast(event => event.id < baseline.id)?.data.mainResponse;
+      const assetAttempt = events.find(event => event.actor === "main" && ["task", "task-rejected"].includes(event.kind) && Array.isArray(event.data.files) && event.data.files.some(file => typeof file === "string" && file.startsWith("assets/")));
+      add("ready assets dispatched no later than baseline completion response", typeof baselineResponse === "number" && typeof assetAttempt?.data.mainResponse === "number" && assetAttempt.data.mainResponse <= baselineResponse, [...(baseline ? [baseline] : []), ...(assetAttempt ? [assetAttempt] : [])]);
+      add("first product write follows recorded baseline zero evidence", baseline !== undefined && productWrites[0] !== undefined && productWrites[0].id > baseline.id, [...(baseline ? [baseline] : []), ...productWrites.slice(0, 1)]);
+    }
+    if (fixture.caseId === "independent-units" || fixture.caseId === "partial-dependency") {
+      const decisionId = select("decision", "main").at(-1)?.id ?? 0;
+      const checks = verified("zero");
+      const assets = assetProof(ASSET_PATHS, { before: decisionId, actor: "main", current: true });
+      add("accepted only current verified zero and all tile evidence", decision()?.status === "accept" && checks.length > 0 && assets !== undefined, [...checks, ...(assets ?? [])]);
+    }
     const generations = select("generate").filter(event => event.actor !== "harness");
     const sample = generations[0];
     const samplePaths = (sample?.data.paths ?? []) as string[];

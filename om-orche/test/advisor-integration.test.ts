@@ -62,6 +62,7 @@ function plugin(store: HostSetupStore, settings = Settings.isolated()) {
       advisorLive = enabled;
       return false;
     },
+    getAdvisorStats: () => ({ advisors: roster.map(config => ({ name: config.name, status: "running" })) }),
     applyAdvisorConfigs: (configs: AdvisorConfig[]) => {
       timeline.push("roster");
       roster = configs;
@@ -112,13 +113,11 @@ test("the first main session start configures OMP and turns the live advisor on 
   expect(settings.getModelRole("orche-advisor")).toBe("@slow");
   expect(settings.getModelRole("advisor")).toBe("existing-advisor-model");
   expect(written).toEqual([2]);
-  // The live flag is switched on first, so the installer in the same start sees advisors enabled and installs.
-  expect(app.timeline).toEqual(["isAdvisorEnabled=false", "setAdvisorEnabled(true)", "isAdvisorEnabled=true", "roster"]);
   expect(app.roster).toEqual([AUDITOR_NAME]);
 });
 
-describe("the live advisor is only switched on for a value this run wrote", () => {
-  test("a user-configured advisor.enabled is left alone", async () => {
+describe("persisted advisor switches do not suppress the owned auditor", () => {
+  test("a user-configured advisor.enabled remains unchanged while the auditor is live", async () => {
     const settings = Settings.isolated();
     cfgAdvisorEnabled.set(settings, false);
     const app = plugin(markerStore().store, settings);
@@ -126,17 +125,15 @@ describe("the live advisor is only switched on for a value this run wrote", () =
     await app.start();
 
     expect(cfgAdvisorEnabled.get(settings)).toBe(false);
-    expect(app.timeline).toEqual(["isAdvisorEnabled=false"]);
-    expect(app.roster).toEqual([]);
+    expect(app.roster).toEqual([AUDITOR_NAME]);
   });
 
-  test("a session-scoped advisor.enabled stays pending and the live flag is untouched", async () => {
+  test("session-scoped setup remains pending while the auditor is live", async () => {
     const { store, written } = markerStore();
     const app = plugin(store, Settings.isolated({ "advisor.enabled": false }));
 
     await app.start();
 
-    expect(app.timeline).toEqual(["isAdvisorEnabled=false"]);
     expect(written).toEqual([]);
   });
 });
@@ -150,6 +147,7 @@ test("a disabled plugin leaves OMP's advisor roster and auditor notes untouched"
   Object.assign(session.settings, { getAgentDir: () => root });
   Object.assign(session, {
     isAdvisorEnabled: () => true,
+    getAdvisorStats: () => ({ advisors: (roster ?? []).map(config => ({ name: config.name, status: "running" })) }),
     applyAdvisorConfigs: (configs: AdvisorConfig[]) => { roster = configs; },
   });
   registerAsMain(session);
@@ -189,13 +187,12 @@ test("an auditor dropped by /advisor configure is restored before the next promp
   tempRoots.push(root);
   const { session, ctx } = makeSession();
   let roster: AdvisorConfig[] = [];
-  let applies = 0;
   Object.assign(session.sessionManager, { getCwd: () => root });
   Object.assign(session.settings, { getAgentDir: () => root });
   Object.assign(session, {
     isAdvisorEnabled: () => true,
-    getAdvisorStats: () => ({ advisors: roster.map(config => ({ name: config.name })) }),
-    applyAdvisorConfigs: (configs: AdvisorConfig[]) => { roster = configs; applies++; },
+    getAdvisorStats: () => ({ advisors: roster.map(config => ({ name: config.name, status: config.enabled === false ? "paused" : "running" })) }),
+    applyAdvisorConfigs: (configs: AdvisorConfig[]) => { roster = configs; },
   });
   registerAsMain(session);
   const handlers: Record<string, Handler[]> = {};
@@ -211,7 +208,6 @@ test("an auditor dropped by /advisor configure is restored before the next promp
   for (const handler of handlers.session_start ?? []) await handler({}, ctx);
   expect(roster.map(config => config.name)).toEqual([AUDITOR_NAME]);
   await prompt();
-  expect(applies).toBe(1);
 
   // `/advisor configure` saves a freshly discovered roster, which has no auditor.
   fs.writeFileSync(path.join(root, "WATCHDOG.yml"), 'advisors:\n  - name: Custom Advisor\n    model: "@advisor"\n');
@@ -223,15 +219,14 @@ test("an auditor dropped by /advisor configure is restored before the next promp
   await prompt();
   expect(roster.map(config => config.name)).toEqual(["Custom Advisor", AUDITOR_NAME]);
   await prompt();
-  expect(applies).toBe(2);
 
-  // A user-declared auditor, even a disabled one, is theirs to keep.
+  // A disabled same-named entry cannot suppress the mandatory auditor.
   roster = [{ name: AUDITOR_NAME, enabled: false }];
   await prompt();
-  expect(applies).toBe(2);
+  expect(roster.find(config => config.name === AUDITOR_NAME)?.enabled).toBe(true);
 });
 
-test("once the setup has run, a start registers no roles and enables nothing", async () => {
+test("once setup has run, a start registers no roles but still runs the auditor", async () => {
   const { store, written } = markerStore(2);
   const settings = Settings.isolated();
   const app = plugin(store, settings);
@@ -239,7 +234,6 @@ test("once the setup has run, a start registers no roles and enables nothing", a
   await app.start();
   await app.start();
 
-  expect(app.timeline).toEqual(["isAdvisorEnabled=false", "isAdvisorEnabled=false"]);
   expect(settings.getModelRole("verification-auditor")).toBeUndefined();
   expect(settings.getModelRole("orche-advisor")).toBeUndefined();
   expect(written).toEqual([]);
@@ -451,7 +445,18 @@ function registeredPlugin(options: { enabled?: boolean; branch?: SessionEntry[];
       return id;
     },
   });
-  Object.assign(session, { isAdvisorEnabled: () => false });
+  const rootForAuditor = fs.mkdtempSync(path.join(os.tmpdir(), "om-orche-auditor-"));
+  tempRoots.push(rootForAuditor);
+  let advisorEnabled = false;
+  let auditorRoster: AdvisorConfig[] = [];
+  Object.assign(session.sessionManager, { getCwd: () => rootForAuditor });
+  Object.assign(session.settings, { getAgentDir: () => rootForAuditor });
+  Object.assign(session, {
+    isAdvisorEnabled: () => advisorEnabled,
+    setAdvisorEnabled: (value: boolean) => { advisorEnabled = value; },
+    applyAdvisorConfigs: (configs: AdvisorConfig[]) => { auditorRoster = configs; },
+    getAdvisorStats: () => ({ advisors: auditorRoster.map(config => ({ name: config.name, status: "running" })) }),
+  });
   // The agent's live system prompt, which `ctx.getSystemPrompt()` reads.
   const system = [...BASE];
   Object.assign(ctx, { getSystemPrompt: () => system });

@@ -19,6 +19,7 @@ test("installing the auditor removes the default advisor and keeps explicit watc
     Object.assign(session.settings, { getAgentDir: () => root });
     Object.assign(session, {
       isAdvisorEnabled: () => true,
+      getAdvisorStats: () => ({ advisors: [] }),
       applyAdvisorConfigs: (configs: AdvisorConfig[]) => { roster = configs; },
     });
     registerAsMain(session);
