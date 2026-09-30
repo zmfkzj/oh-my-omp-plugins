@@ -18,8 +18,8 @@ Generic workers are OMP's native `task` agent; their model comes from your
 not classify, rewrite, alias or re-route task calls, and specialized (`scout`,
 `reviewer`, `sonic`, …) and custom agents keep their identity and tool
 permissions. This package also provides an explicit `orche_advisor` plan-advice
-tool and a passive Verification Auditor. Advice is requested explicitly on an
-established plan, never automatically.
+tool and a passive Verification Auditor. The primary must explicitly request a
+review once planning ends, before executing or delegating the formed plan.
 
 Advisor requests require a credential authorized by OMP's model registry. If
 the registry returns no credential (including for a disabled provider), the
@@ -136,8 +136,9 @@ re-verification scope. (Checks on a contract change are under
   invariant, a bounded feasibility check of an alternative). They analyze within
   their question; the main owns the overall judgment.
 - Zero workers is normal for small or well-evidenced questions: no worker, todo
-  list, task contract or advice call is required. One worker for one cohesive
-  extra investigation; several only for independently worthwhile scopes; no
+  list or task contract is required. A formed plan still requires advisor review.
+  One worker for one cohesive extra investigation; several only for independently
+  worthwhile scopes; no
   mandatory analyst/critic/judge roles. The main does not redo a worker's
   investigation wholesale but verifies itself the key evidence its conclusion
   rests on.
@@ -395,9 +396,10 @@ counterparts from the next request and the policy from the next prompt. Each of
 these toggles moves the request prefix once, where the system prompt gains or
 loses the policy.
 
-**Advice guidance.** The orche-advisor guidance is a further element of the system
-prompt, appended after the policy whenever the advice tool is active and never
-twice. It is not repeated in any message, and no advisor call is ever automatic.
+**Advice guidance.** The orche-advisor guidance is a stable further element of the
+system prompt, appended after the policy whenever the advice tool is active,
+including default turns, and never twice. It is not repeated in notices or messages,
+preserving prompt-cache stability. Hooks never invoke the review model themselves.
 
 ### Durable policy observations
 
@@ -497,11 +499,14 @@ an error rather than falling back. The [OMP setup](#omp-setup) fills it once wit
 `@slow`, your Thinking model. If `slow` is unset, OMP resolves `@slow` to your
 default model, so the advisor then runs on the same model as the main session.
 
-- Advice is optional in every policy mode. Lifecycle
-  hooks do not invoke the model. Do not request advice merely because a new
-  turn, phase completion, worker result or auditor note arrived.
-- Submit a formed plan when an independent assessment can help. Avoid repeating
-  a request for an unchanged plan; each explicit call is a fresh model request.
+- The primary **must call `orche_advisor` once planning ends**, before executing or
+  delegating the formed plan, in default, orchestrate and workflow turns alike.
+  Planning ends when the goal, scope and next actions are settled enough to execute
+  or delegate. The required call requests review; its verdict remains advisory,
+  not an execution gate, and no approval or KEEP verdict is needed to proceed.
+- Do not call for pure status answers or trivial read-only Q&A with no plan, merely
+  because a turn, phase completion, worker result or auditor note arrived, or again
+  on an unchanged plan. Lifecycle hooks provide guidance but do not invoke the model.
 - `KEEP`, `ADJUST`, `REPLAN` and `ESCALATE` are recommendations. None grants or
   withholds permission. The coordinator evaluates the advice, executes through
   OMP, and remains responsible for tests and acceptance.
@@ -1212,10 +1217,10 @@ want it. The plugin no longer depends on the `@typesafe-ai/sdk` package.
 preserved under `telemetry-history/`. See [Upgrading to v7](#upgrading-to-v7)
 and [Rolling back](#rolling-back).
 
-**Unchanged.** Orche-Advisor, the Verification Auditor and the findings ledger
-behave as before and are never invoked automatically. Native workflow mode keeps
-its execution method. Primary model, `@task`, agents and tool permissions are
-never changed.
+**Independent policies.** Mandatory post-planning Orche-Advisor review does not
+change the Verification Auditor or findings ledger. Hooks never request plan
+advice automatically. Native workflow mode keeps its execution method. Primary
+model, `@task`, agents and tool permissions are never changed.
 
 ### Migrating the plugin name
 
@@ -1268,8 +1273,8 @@ not cut over with live workers.
 - **Task contract:** put goal, scope, fixed/open decisions, inputs, acceptance
   and return format in the `task` text (see [Task body contract](#task-body-contract)).
   The plugin does not introduce or classify a `solutionSpace` field.
-- **Advice:** historical approvals have no effect; optional plan advice does
-  not authorize execution.
+- **Advice:** historical approvals have no effect; required post-planning review
+  is advisory and does not authorize or block execution.
 - **Telemetry:** the v4 tier-era counters were kept as historical data and are
   carried unchanged into v6.
 

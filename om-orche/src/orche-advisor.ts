@@ -27,17 +27,19 @@ import { collectFindings } from "./findings.ts";
 import { enforceAuditorContract } from "./auditor-contract.ts";
 
 /**
- * Advice guidance, appended to the system prompt after the execution policy whenever the advice tool is
- * active. Advice is optional and advisory; the auditor's findings are evidence, not authority.
+ * Plan-review guidance, appended as a stable system prompt element whenever the tool is active,
+ * including default turns. Calling after planning is required; acting on the review is advisory.
  */
-export const ADVISOR_GUIDANCE = `Orche-Advisor gives optional model advice on orchestration, not code; it is not a worker,
+export const ADVISOR_GUIDANCE = `Orche-Advisor reviews orchestration plans, not code; it is not a worker,
 a second orchestrator or an approval authority. You retain planning, delegation, implementation
-integration, verification and termination responsibility, and nothing waits on its verdict.
-Call orche_advisor only when a formed orchestration plan would benefit from a second opinion
-(for example before a costly fan-out or after a material replan). It is never mandatory: do not call
-it automatically per turn, phase or worker completion, because an auditor note arrived, or for status
-answers or read-only inspection, and do not call it again on an unchanged plan; every call is a new
-billed model request.
+integration, verification and termination responsibility.
+You MUST call orche_advisor once planning ends: when the goal, scope and next actions are settled
+enough to execute or delegate, submit that formed plan for review before executing or delegating it.
+This applies in default turns as well as orchestrate/workflow turns. The call is required, but its
+verdict is advisory, not an execution gate; no approval or KEEP verdict is required to proceed.
+Do not call for pure status answers or trivial read-only Q&A with no plan, automatically per turn,
+phase or worker completion, or merely because an auditor note arrived. Do not re-call on an unchanged
+plan. A material replan may be reviewed again before executing the changed work.
 Its verdict (KEEP/ADJUST/REPLAN/ESCALATE) is advice to weigh: it never grants or blocks execution, you
 decide whether and how to act on it, and user instructions and OMP's own permissions outrank it. For
 material suggestions, briefly state whether you accept, partially accept or reject them and why. Apply
@@ -141,7 +143,7 @@ export function registerOrcheAdvisor(pi: ExtensionAPI, reviewer: typeof runRevie
   pi.registerTool({
     name: TOOL,
     label: "Orche-Advisor",
-    description: `Request optional model advice on an already formed orchestration plan. Primary only. Advisory: every verdict (KEEP/ADJUST/REPLAN/ESCALATE) is a recommendation you weigh; it never grants or blocks execution, and nothing requires this call. Each call is a new model request; do not repeat it on an unchanged plan. Use the seven snapshot fields; ${AUDITOR_NAME} findings and resolution evidence attach automatically as the auditor's claims. An error result means no advice was produced.`,
+    description: `Review a formed orchestration plan. Primary only: you MUST call once planning ends, before executing or delegating the plan, including default turns. Every verdict (KEEP/ADJUST/REPLAN/ESCALATE) is advisory, never an execution gate; decide whether to accept, partially accept or reject suggestions and state why. No call for pure status answers or trivial read-only Q&A with no plan; do not re-call on an unchanged plan. A material replan may be reviewed again. Use the seven snapshot fields; ${AUDITOR_NAME} findings and resolution evidence attach automatically as the auditor's claims. An error result means no advice was produced, not a block on execution.`,
     loadMode: "essential",
     deferrable: false,
     parameters: z

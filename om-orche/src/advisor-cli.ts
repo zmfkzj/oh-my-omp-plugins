@@ -74,9 +74,9 @@ Install the OMP extension from this same package:
 Configure modelRoles.${ROLE}; examples/config.yml also shows the independent
 Verification Auditor role (default @smol, not ADVISOR).
 Reload OMP with /reload-plugins or start a new session after installing or updating.
-Orche-Advisor is optional advice on an already formed orchestration plan; it is never
-required and never gates execution. The orchestrator calls the tool with a compact
-snapshot; hooks never invoke a model directly.
+Orche-Advisor review is required once the primary orchestrator has a formed plan,
+before executing or delegating it, including default turns. Its verdict is advisory,
+never an execution gate. Hooks provide guidance but never invoke a model directly.
 `;
 
 interface CliOptions {

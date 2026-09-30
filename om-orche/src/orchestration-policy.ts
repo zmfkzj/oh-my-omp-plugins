@@ -109,8 +109,6 @@ export function prefixHas(messages: readonly AgentMessage[], index: number, cust
 	return false;
 }
 
-const ADVISOR_TOOL = "orche_advisor";
-
 type VerificationKind = "main" | "workflow" | "direct";
 
 const HEADER = "Execution policy: Judgment (판단형) and Production (제작형), chosen by you per request and stage. Guidance, not a scheduler or permission system; host limits (tools, concurrency, permissions, plan mode, read-only) bind; no capability granted. Over generic defaults: Judgment keeps core analysis with you despite \"Map unknown code via task\" / \"Multi-round search MUST use Task + scout\"; Production gives implementation to workers despite \"Inline first / NEVER delegate one slice\" / \"No subagents unless explicitly requested\"; workers run local checks despite \"tasks skip build/lint/tests mid-flight\". In both you own intent, scope, global decisions, final answer.";
@@ -139,8 +137,7 @@ function joinOr(items: readonly string[]): string {
 }
 
 function judgment(tools: ReadonlySet<string>): string {
-	const nothing = ["worker", ...(tools.has("todo") ? ["todo list"] : []), "task contract",
-		...(tools.has(ADVISOR_TOOL) ? ["advice call"] : [])];
+	const nothing = ["worker", ...(tools.has("todo") ? ["todo list"] : []), "task contract"];
 	return `Judgment: you are the responsible analyst, not a relay: frame question and criteria, read key code/logs/docs yourself, hypothesize, gather evidence, run key experiments, test counterexamples, decide. Delegate only bounded independent investigations (a code path, one hypothesis, change impact, one invariant, a feasibility check); workers analyze within their question, you own the judgment. Zero workers is normal for small or well-evidenced questions (no ${joinOr(nothing)} required); one for a cohesive extra investigation; several only for independently worthwhile scopes; no mandatory analyst/critic/judge roles. Never fix the conclusion first and send workers for support, or pass an unverified hypothesis as fact. ${JUDGMENT_RESULTS}`;
 }
 

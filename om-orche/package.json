@@ -1,7 +1,7 @@
 {
   "name": "om-orche",
   "version": "1.0.0",
-  "description": "Judgment/Production execution policy for OMP: the main model chooses per stage between analyzing itself (Judgment) and directing native task workers (Production), with optional plan advice and independent verification.",
+  "description": "Judgment/Production execution policy for OMP: the main model chooses per stage between analyzing itself (Judgment) and directing native task workers (Production), with required advisory plan review and independent verification.",
   "license": "UNLICENSED",
   "type": "module",
   "files": [

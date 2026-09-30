@@ -82,7 +82,7 @@ export function registerOmOrche(
 		stopUsageTracking();
 		await runtime.telemetry.flush();
 	});
-	// Optional plan-advice guidance, appended to the system prompt after the policy.
+	// Mandatory post-planning review guidance, appended as a stable system prompt element after the policy.
 	registerOrcheAdvisor(pi, undefined, () => runtime.config.enabled);
 
 	return runtime;

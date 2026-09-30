@@ -577,7 +577,8 @@ test("the system prompt is the base, then the execution policy, then the advice 
   expect(isPolicySection(system[1]!)).toBe(true);
   expect(system[2]).toBe(ADVISOR_GUIDANCE);
   // A user prompt, a synthetic one and a blank one all get exactly this system prompt.
-  for (const prompt of ["Next request", "<system-notice>background job finished</system-notice>", "   "]) {
+  for (const prompt of ["Next request", "orchestrate the refactor", "workflowz the refactor",
+    "<system-notice>background job finished</system-notice>", "   "]) {
     expect(await plugin.beginTurn(prompt)).toEqual(system);
   }
   // Nothing enters the transcript: the model's messages carry none of it.
