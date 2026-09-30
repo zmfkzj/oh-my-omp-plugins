@@ -72,7 +72,7 @@ export interface FindingTransition {
 /**
  * One independent verification finding forwarded alongside a snapshot.
  *
- * Source: OMP's batched `advisor` custom message (`AdvisorMessageDetails.notes`).
+ * Source: plugin `orche-verification-audit` custom messages (and older native `advisor` cards).
  * These are tool-backed observations this reviewer cannot make itself — it runs with
  * no tools and no conversation history — so they are the only channel able to
  * contradict the orchestrator's self-reported `completedWork`.
@@ -85,9 +85,9 @@ export interface VerificationFinding {
   severity?: FindingSeverity;
   /** Roster name of the producing advisor; omitted for OMP's default advisor. */
   advisor?: string;
-  /** Stable ledger id: `<advisor message entry id>:<note index>` of the first emission. */
+  /** Stable ledger id: `<audit message entry id>:<note index>` of the first emission. */
   id?: string;
-  /** Session entry id of the advisor message that first carried the note. */
+  /** Session entry id of the audit message that first carried the note. */
   sourceEntryId?: string;
   /** ISO receipt timestamp of that message, not an auditor observation boundary. */
   occurredAt?: string;
@@ -534,7 +534,7 @@ export function redactSecrets(text: string): string {
     .replace(/\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED]");
 }
 
-function sanitizeErrorMessage(value: unknown, apiKey: string | undefined): string | undefined {
+export function sanitizeErrorMessage(value: unknown, apiKey: string | undefined): string | undefined {
   const message = value instanceof Error ? value.message : typeof value === "string" ? value : "";
   const redacted = apiKey ? message.replaceAll(apiKey, "[redacted]") : message;
   return collapse(redactSecrets(redacted), 500) || undefined;

@@ -5,7 +5,6 @@
  * main-session `session_start` after install or link. There the plugin fills the
  * OMP settings its features need, once per installation:
  *
- *   - `advisor.enabled: true`                    runs the bundled Verification Auditor;
  *   - `modelRoles.verification-auditor: "@smol"` the auditor's model role;
  *   - `modelRoles.orche-advisor: "@slow"`        the plan advisor's model role;
  *   - `task.maxRecursionDepth: 1`                (since v2) the main session delegates, workers cannot.
@@ -31,7 +30,6 @@
  */
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
-import { cfgAdvisorEnabled } from "@oh-my-pi/pi-coding-agent/advisor/settings";
 import { PluginManager } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/manager";
 import { cfgTaskMaxRecursionDepth } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { HOST_SETUP_KEY, PLUGIN_NAME } from "./config.ts";
@@ -85,17 +83,9 @@ function roleItem(role: string, value: string): SetupItem {
 	};
 }
 
-const ADVISOR_ENABLED_KEY = "advisor.enabled";
 const RECURSION_DEPTH_KEY = "task.maxRecursionDepth";
 
 const SETUP_ITEMS: readonly SetupItem[] = [
-	{
-		key: ADVISOR_ENABLED_KEY,
-		value: "true",
-		since: 1,
-		provenance: settings => settings.getProvenance(cfgAdvisorEnabled),
-		write: settings => cfgAdvisorEnabled.set(settings, true),
-	},
 	roleItem(AUDITOR_ROLE, "@smol"),
 	roleItem("orche-advisor", "@slow"),
 	{
@@ -110,16 +100,8 @@ const SETUP_ITEMS: readonly SetupItem[] = [
 /** User-owned layers: a value here is kept. */
 const isUserLayer = (provenance: string): boolean => provenance === "global" || provenance === "project";
 
-/** The slice of the main session that switches its advisors on and off live. */
-export interface LiveAdvisorSession {
-	isAdvisorEnabled(): boolean;
-	setAdvisorEnabled(enabled: boolean): unknown;
-}
-
 export interface HostSetupOptions {
 	settings: Settings;
-	/** The running main session; its advisor flag is switched on when this run writes `advisor.enabled`. */
-	liveAdvisor?: LiveAdvisorSession;
 	store: HostSetupStore;
 	/** The plugin's state directory; concurrent sessions and processes share its `setup.lock`. */
 	stateDir: string;
@@ -130,26 +112,14 @@ export interface HostSetupOptions {
 	notify?: (message: string) => void;
 }
 
-function report(written: readonly SetupItem[], settings: Settings): string {
+function report(written: readonly SetupItem[]): string {
 	const lines = [
 		"om-orche configured OMP once, filling only what was unset (existing values were kept):",
 		...written.map(item => `  ${item.key}: ${item.value}`),
 	];
 	const wrote = (key: string) => written.some(item => item.key === key);
-	const advisorWritten = wrote(ADVISOR_ENABLED_KEY);
-	const rolesWritten = written.some(item => item.key.startsWith("modelRoles."));
-	const auditorRuns = cfgAdvisorEnabled.get(settings) && (advisorWritten || wrote(`modelRoles.${AUDITOR_ROLE}`));
-	if (auditorRuns) lines.push(`The Verification Auditor now reviews each turn with @${AUDITOR_ROLE}.`);
-	// `omp config set` reaches registered settings only; model roles are entries of a record setting.
-	const setAdvisor = "`omp config set advisor.enabled <true|false>`";
-	if (rolesWritten) {
-		lines.push(
-			advisorWritten
-				? `Edit roles in ~/.omp/agent/config.yml; \`advisor.enabled\` can also be changed with ${setAdvisor}.`
-				: "Edit roles in ~/.omp/agent/config.yml.",
-		);
-	} else if (advisorWritten) {
-		lines.push(`Change it with ${setAdvisor}.`);
+	if (written.some(item => item.key.startsWith("modelRoles."))) {
+		lines.push("Edit roles in ~/.omp/agent/config.yml.");
 	}
 	if (wrote(RECURSION_DEPTH_KEY)) {
 		lines.push(
@@ -159,11 +129,6 @@ function report(written: readonly SetupItem[], settings: Settings): string {
 	return lines.join("\n");
 }
 
-/** Turns the running session's advisors on unless they already are; the flag alone, no runtime is built. */
-function enableLiveAdvisor(session: LiveAdvisorSession): void {
-	if (typeof session.isAdvisorEnabled !== "function" || typeof session.setAdvisorEnabled !== "function") return;
-	if (!session.isAdvisorEnabled()) session.setAdvisorEnabled(true);
-}
 
 /** One attempt per state directory in this process; followers share its result, including a failure. */
 const setupRuns = new Map<string, Promise<void>>();
@@ -188,7 +153,7 @@ export async function applyOmpSetup(options: HostSetupOptions): Promise<void> {
 }
 
 async function applyLockedSetup(
-	{ settings, liveAdvisor, store, stateDir, lock: timing, logger, notify }: HostSetupOptions,
+	{ settings, store, stateDir, lock: timing, logger, notify }: HostSetupOptions,
 	lockPath: string,
 ): Promise<void> {
 	const written: SetupItem[] = [];
@@ -211,8 +176,6 @@ async function applyLockedSetup(
 				}
 			}
 			if (written.length > 0) await settings.flush();
-			// OMP's listener does not toggle an already-built session; enable only a value this run wrote.
-			if (liveAdvisor && written.some(item => item.key === ADVISOR_ENABLED_KEY)) enableLiveAdvisor(liveAdvisor);
 			if (pending === 0) {
 				if (!(await lock.holds())) throw new LockLostError(lockPath);
 				await store.markApplied(HOST_SETUP_VERSION);
@@ -224,7 +187,7 @@ async function applyLockedSetup(
 	if (written.length === 0) return;
 	try {
 		logger.info(`OMP setup wrote ${written.map(item => `${item.key}=${item.value}`).join(", ")}`);
-		notify?.(report(written, settings));
+		notify?.(report(written));
 	} catch (error) {
 		logger.warn(`OMP setup report failed: ${logger.describeError(error)}`);
 	}
@@ -242,7 +205,6 @@ export async function runOmpSetup(
 	if (!session || !options.enabled) return;
 	await applyOmpSetup({
 		settings: session.settings,
-		liveAdvisor: session,
 		store: options.store,
 		stateDir: options.stateDir,
 		lock: options.lock,

@@ -3,7 +3,7 @@
  *
  * Nothing is cached. Every read walks the branch it is given, so the ledger follows tree
  * navigation and survives plugin reloads without plugin state: findings come from persisted
- * `advisor` custom messages, lifecycle transitions from `custom` entries that `review_findings`
+ * `orche-verification-audit` custom messages (and older native `advisor` cards), lifecycle transitions from `custom` entries that `review_findings`
  * appends. A finding never expires and no review outcome changes it; only a recorded transition
  * does, and a transition is replayed only while its cited evidence still validates on the branch.
  * The ledger starts after the latest `/clear` (`reset_boundary`), as the model's context does.
@@ -24,7 +24,7 @@ import {
 import { type AuditorSeverity, admittedSeverity, isOwnedAuditor } from "./auditor-contract.ts";
 import { mainSessionOf } from "./host.ts";
 import { isTurnStartEntry } from "./orchestration-policy.ts";
-import { AUDITOR_NAME } from "./verification-auditor.ts";
+import { AUDIT_MESSAGE_TYPE, AUDITOR_NAME } from "./verification-auditor.ts";
 
 /** Text parts of a message's content, trimmed; anything non-textual is dropped. */
 function visibleText(content: unknown): string {
@@ -198,7 +198,7 @@ function trackedNote(
 
 /**
  * Advisor, scope and note folded as OMP's advisor emission guard folds notes (case, punctuation
- * and whitespace), so a watchdog re-raising the same note in the same scope lands on one key.
+ * and whitespace), so an auditor re-raising the same note in the same scope lands on one key.
  */
 function semanticKey(advisor: string, scopeEntryId: string | undefined, note: string): string {
   const folded = note
@@ -305,7 +305,7 @@ function buildLedger(branch: readonly SessionEntry[]): Ledger {
       scope = { id: entry.id, text: userText };
     } else if (entry.type === "custom" && entry.customType === FINDING_ENTRY_TYPE) {
       applyRecord(ledger, branch, entry, index);
-    } else if (entry.type === "custom_message" && entry.customType === "advisor") {
+    } else if (entry.type === "custom_message" && (entry.customType === AUDIT_MESSAGE_TYPE || entry.customType === "advisor")) {
       // Persisted session entries are not provider-facing CustomMessages.
       const notes = (entry.details as { notes?: unknown } | undefined)?.notes;
       if (!Array.isArray(notes)) return;

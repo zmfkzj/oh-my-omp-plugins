@@ -14,6 +14,7 @@
  * exactly as they are.
  */
 import { registerOrcheAdvisor } from "./orche-advisor.ts";
+import { registerVerificationAuditor } from "./auditor-runner.ts";
 import { type HostSetupStore, pluginSetupStore, runOmpSetup } from "./omp-setup.ts";
 import { registerCommands } from "./commands.ts";
 import { PLUGIN_NAME } from "./config.ts";
@@ -41,9 +42,7 @@ export function registerOmOrche(
 		// A subagent's start must not flip the main's setting or migrate and write a file the main left alone.
 		const main = mainSessionOf(ctx) !== undefined;
 		await runtime.reloadConfig(ctx);
-		// One-time OMP setup. It must finish before the auditor installer registered by
-		// `registerOrcheAdvisor` runs in this same session_start, so OMP's live
-		// `advisor.enabled` toggle can start the auditor in the first session.
+		// Fill unset host roles and recursion settings once per installation.
 		await runOmpSetup(ctx, {
 			enabled: runtime.config.enabled,
 			store: setupStore,
@@ -84,6 +83,7 @@ export function registerOmOrche(
 	});
 	// Mandatory post-planning review guidance, appended as a stable system prompt element after the policy.
 	registerOrcheAdvisor(pi, undefined, () => runtime.config.enabled);
+	registerVerificationAuditor(pi, () => runtime.config.enabled);
 
 	return runtime;
 }

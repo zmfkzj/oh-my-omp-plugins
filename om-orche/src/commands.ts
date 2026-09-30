@@ -19,7 +19,7 @@ import {
 	type TelemetrySnapshot,
 	type TelemetryState,
 } from "./telemetry.ts";
-import type { AgentSession, ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import type { OrcheRuntime } from "./runtime.ts";
 
 export const COMMAND_NAME = PLUGIN_NAME;
@@ -45,32 +45,6 @@ async function ompSetupStatus(enabled: boolean, store: HostSetupStore): Promise<
 /** Model roles the retired tier router created; user-owned, never deleted or read. */
 const RETIRED_TIER_ROLES = ["task_easy", "task_hard", "task_challenge"] as const;
 
-/**
- * The Verification Auditor's usage in this session so far, from the host's own advisor accounting
- * (`getAdvisorStats`): its token counts come from the advisor's current transcript, its cost is cumulative.
- * Nothing when the session has no such advisor.
- */
-function auditorLines(session: AgentSession | undefined): string[] {
-	if (typeof session?.getAdvisorStats !== "function") return [];
-	try {
-		const auditor = session.getAdvisorStats().advisors.find(advisor => advisor.name === AUDITOR_NAME);
-		if (!auditor) return [];
-		const { tokens } = auditor;
-		const ratio = cacheHitRatio({ inputTokens: tokens.input, cacheReadTokens: tokens.cacheRead, cacheWriteTokens: tokens.cacheWrite });
-		return [
-			"",
-			row(AUDITOR_NAME, auditor.status),
-			row(
-				"  tokens",
-				`input ${grouped(tokens.input)} / output ${grouped(tokens.output)} / cache read ${grouped(tokens.cacheRead)} / cache write ${grouped(tokens.cacheWrite)}`,
-			),
-			row("  cache hit ratio", percent(ratio)),
-			row("  cost", `$${auditor.cost.toFixed(4)}`),
-		];
-	} catch (error) {
-		return ["", row(AUDITOR_NAME, `usage unavailable: ${(error instanceof Error ? error.message : String(error)).slice(0, 200)}`)];
-	}
-}
 
 export async function renderStatus(
 	pi: ExtensionAPI,
@@ -101,7 +75,7 @@ export async function renderStatus(
 			`  @${GENERIC_TASK_AGENT} does not resolve in this session; task workers use the main session's active model.`,
 		);
 	}
-	lines.push(...auditorLines(session));
+	lines.push("", row(AUDITOR_NAME, config.enabled ? "once per final answer (plugin-run)" : "disabled"));
 
 	if (runtime.configError !== undefined) {
 		lines.push(

@@ -1,6 +1,8 @@
 # om-orche fills these roles automatically once, at the first main-session start after install,
-# and only if they are unset: advisor.enabled: true, verification-auditor: "@smol",
-# orche-advisor: "@slow". This file is for customizing them; nothing here is required.
+# and only if unset: verification-auditor: "@smol", orche-advisor: "@slow".
+# The auditor runs once per final answer, not through OMP's native advisor runtime.
+# Admitted concerns/blockers start one automatic follow-up; its audit cannot trigger another.
+# This file is for customization; nothing here is required.
 # Merge the roles you want into the active OMP config.yml; do not overwrite other settings.
 # om-orche's Judgment/Production execution policies need no model role, credential or setting
 # here; they never change the primary model, `@default`, `@task` or task inputs.

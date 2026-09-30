@@ -4,7 +4,7 @@ import type { AgentSession, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-
 import type { AdvisorNote } from "@oh-my-pi/pi-coding-agent/advisor/advise-tool";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { collectFindings, registerFindingTools } from "../src/findings.ts";
-import { AUDITOR_NAME } from "../src/verification-auditor.ts";
+import { AUDIT_MESSAGE_TYPE, AUDITOR_NAME } from "../src/verification-auditor.ts";
 import { clearRegistry, registerAsMain } from "./harness.ts";
 
 afterEach(clearRegistry);
@@ -42,7 +42,7 @@ function primarySession(ui: { hasUI: boolean; confirm?: Confirm } = { hasUI: fal
     user: (text: string) =>
       manager.appendMessage({ role: "user", content: text, attribution: "user", timestamp: Date.now() }),
     audit: (note: AdvisorNote) =>
-      manager.appendCustomMessageEntry("advisor", "Advisor notes", true, { notes: [note] }),
+      manager.appendCustomMessageEntry(AUDIT_MESSAGE_TYPE, "Audit notes", true, { notes: [note] }),
     result: (text: string, isError = false) =>
       manager.appendMessage({
         role: "toolResult",

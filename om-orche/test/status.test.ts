@@ -1,4 +1,3 @@
-import { AUDITOR_NAME } from "../src/verification-auditor.ts";
 import { afterEach, describe, expect, test } from "bun:test";
 import { registerCommands, renderStatus } from "../src/commands.ts";
 import { normalizeConfig } from "../src/config.ts";
@@ -163,48 +162,3 @@ test("the removed setup and test subcommands are rejected before anything runs",
 	expect(reloads).toBe(0);
 });
 
-describe("Verification Auditor usage", () => {
-	const auditor = {
-		name: AUDITOR_NAME,
-		status: "running",
-		tokens: { input: 1200, output: 340, reasoning: 0, cacheRead: 3600, cacheWrite: 0, total: 5140 },
-		cost: 0.0123,
-	};
-
-	/** The status of a main session whose host reports `extras`, such as its advisor statistics. */
-	async function statusWith(extras: Record<string, unknown>): Promise<string> {
-		const { pi } = makeApi();
-		const fake = makeSession();
-		Object.assign(fake.session, extras);
-		registerAsMain(fake.session);
-		const ctx = { ...fake.ctx, models: { resolve: () => undefined } } as unknown as ExtensionCommandContext;
-		return renderStatus(pi, fakeRuntime(), ctx, setupStore());
-	}
-
-	test("shows the auditor's tokens, cache hit ratio and cost from the host's advisor statistics", async () => {
-		const status = await statusWith({ getAdvisorStats: () => ({ advisors: [auditor] }) });
-
-		expect(status).toContain(AUDITOR_NAME);
-		for (const tokens of [1200, 340, 3600]) expect(status).toContain(tokens.toLocaleString());
-		// 3,600 cache reads of 4,800 prompt tokens.
-		expect(status).toMatch(/cache hit ratio\s+75\.0%/);
-		expect(status).toContain("$0.0123");
-	});
-
-	test("shows nothing without advisors, without this advisor, or on a host that reports none", async () => {
-		expect(await statusWith({ getAdvisorStats: () => ({ advisors: [] }) })).not.toContain(AUDITOR_NAME);
-		expect(await statusWith({ getAdvisorStats: () => ({ advisors: [{ ...auditor, name: "Another Advisor" }] }) })).not.toContain(AUDITOR_NAME);
-		expect(await statusWith({})).not.toContain(AUDITOR_NAME);
-	});
-
-	test("a failing statistics call degrades to a note and does not fail the status", async () => {
-		const status = await statusWith({
-			getAdvisorStats: () => {
-				throw new Error("advisor runtime gone");
-			},
-		});
-
-		expect(status).toContain("advisor runtime gone");
-		expect(status).toMatch(/OMP setup/);
-	});
-});

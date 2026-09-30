@@ -1,31 +1,10 @@
-import type { AdvisorConfig } from "@oh-my-pi/pi-tui/overlays/advisor-config";
-
-/**
- * Roster name of the advisor this plugin owns. Also the override hook: a `WATCHDOG.yml`
- * entry that slugifies to the same value replaces this one instead of running beside it.
- */
 export const AUDITOR_NAME = "Verification Auditor";
 
 export const AUDITOR_ROLE = "verification-auditor";
+export const AUDIT_MESSAGE_TYPE = "orche-verification-audit";
 
-/**
- * The advisor that produces the evidence `orche_advisor` forwards.
- *
- * Shipped with the plugin rather than documented as a `WATCHDOG.yml` the user must write:
- * the findings channel is worthless without a tool-backed auditor on the other end, and a
- * review that silently degrades to rubber-stamping self-reports is worse than no review.
- *
- * The dedicated `verification-auditor` model role defaults to `@smol`, independently
- * of OMP's ADVISOR role. An explicit model-role selection or a same-named
- * `WATCHDOG.yml` entry may override it without changing other advisors.
- */
-export const VERIFICATION_AUDITOR: AdvisorConfig = {
-  name: AUDITOR_NAME,
-  model: `@${AUDITOR_ROLE}`,
-  tools: ["read", "grep", "glob"],
-  // One non-blocker per update: a backlog of withheld notes otherwise floods the next turn.
-  maxNotesPerUpdate: 1,
-  instructions: `Act as Verification Auditor. Own the gap between what the primary claims
+/** Evidence-only rubric for a finished primary run. */
+export const AUDITOR_INSTRUCTIONS = `Act as Verification Auditor. Own the gap between what the primary claims
 and what the evidence shows. Do not review code quality or design.
 
 Audit the primary's own claims against files and tool results:
@@ -40,14 +19,10 @@ Audit the primary's own claims against files and tool results:
   in the change itself
 
 Quote the exact file:line or tool output you checked. Recheck the latest state
-available to you before raising: the primary may have fixed it later in the delta.
-Your observation and delivery times can differ; identify the claim and result you
-actually inspected, not an assumed current state. A growing transcript's last
-observed entry is a snapshot boundary, not proof that the session ended there.
-
-Timing: an update ending in \`[in progress — more steps follow]\` is unfinished work: emit nothing and
-call no tools for it, unless the delta already shows evidence of an irreversible-operation risk. Judge
-claims when the turn ends, against the final state; a note queued mid-turn arrives after later fixes.
+available to you before raising: the primary may have fixed it later in the transcript.
+You always receive a finished run, its user request, transcript, and final answer.
+Bounded-input omission markers are not evidence that a requested item or tool run
+never happened. Do not raise a finding based only on missing truncated context.
 
 Emit a concern or blocker only for a specific, still-unanswered contradiction or
 an evidenced irreversible-operation risk. Otherwise emit no note. Never emit a
@@ -87,6 +62,5 @@ grant or withhold execution permission, require a review receipt, or halt tool u
 Write each note so it stands alone: name the claim, the evidence that contradicts
 it, and where you checked. Keep it to a few sentences.
 
-Follow any shared watchdog baseline for evidence, investigation budget, timing,
-and silence.`,
-};
+Return only JSON: {"notes":[{"note":"specific cited finding","severity":"concern|blocker"}]}.
+Return {"notes":[]} when there is no admitted finding.`;

@@ -18,7 +18,7 @@ Generic workers are OMP's native `task` agent; their model comes from your
 not classify, rewrite, alias or re-route task calls, and specialized (`scout`,
 `reviewer`, `sonic`, …) and custom agents keep their identity and tool
 permissions. This package also provides an explicit `orche_advisor` plan-advice
-tool and a passive Verification Auditor. The primary must explicitly request a
+tool and a plugin-run Verification Auditor that checks completed primary runs. The primary must explicitly request a
 review once planning ends, before executing or delegating the formed plan.
 
 Advisor requests require a credential authorized by OMP's model registry. If
@@ -630,26 +630,17 @@ The bundled auditor is instructed to stay silent on confirmations, praise,
 progress commentary and checks that already passed, and never to emit `nit`
 notes. It reports concrete remaining contradictions or evidenced
 irreversible-operation risks, not unfinished tasks that have not been called
-complete. Updates OMP marks `[in progress — more steps follow]` get no note and no
-tool calls, unless the update itself already shows an irreversible-operation risk;
-claims are judged on the turn's final state, because OMP holds mid-turn
-non-blockers and releases them together at the
-turn boundary. It never directs the primary's pace or method ("stop", "wrap
-up", "answer now"). A `blocker` must quote the completion claim it contradicts.
+complete. Claims are judged against the finished run's final state, not against
+individual mid-run updates. It never directs the primary's pace or method
+("stop", "wrap up", "answer now"). A `blocker` quotes the completion claim it contradicts.
 Screenshots reach the auditor only as placeholders, so a placeholder is not
 counter-evidence; a screenshot-only claim should be labeled as visual
-observation or backed by extracted state. The bundled entry also sets
-`maxNotesPerUpdate: 1` (blockers are exempt in OMP). It must identify the
-snapshot or result it actually checked; a growing transcript's last observed
-entry is not proof that the session ended. Findings are never automatically
-marked resolved. The reviewer likewise assesses evidence against the claim and
-revision, not against the note's delivery time.
+observation or backed by extracted state. Findings are never automatically marked
+resolved. The reviewer likewise assesses evidence against the claim and revision,
+not against the note's delivery time.
 
-Instructions alone did not hold on a small watchdog model (one session: 105
-`nit` notes and 17 "stop and answer now" blockers), and OMP offers plugins no hook
-on the advisor's `advise` call. The plugin therefore enforces the note contract
-mechanically on the bundled auditor's notes, in the primary's provider context
-and in the findings ledger:
+The plugin enforces the evidence admission contract before showing or persisting
+new notes, and applies the same contract when reading older cards in the ledger:
 
 - `nit` notes are withheld.
 - A concern or blocker with no quotation (`"…"`, `“…”`, `‘…’`, `「…」`), no
@@ -658,61 +649,42 @@ and in the findings ledger:
   two short quotes, not one quotation spanning the words between them.
 - A blocker without a quotation is treated as a concern.
 
-Other advisors' notes and the persisted transcript are untouched; the TUI still
-shows every card OMP delivered, and OMP's own delivery (steering, deferred
-flushes, idle wake-ups) is unchanged. A card left empty is dropped, except when
-it woke an idle primary after its answer: then a one-line withheld notice keeps
-the request well formed. Replayed on two recorded sessions, the primary would
-have read 12 of 121 and 42 of 160 cards. The rules are string checks, not a
-semantic judgment: a process directive that happens to cite a backticked value
-still arrives, as a concern, and a well-founded concern with no citation is
-withheld.
+Other advisors' notes and old persisted cards are untouched. New withheld notes
+are never delivered. These are string checks, not a semantic judgment: a process
+directive that happens to cite a backticked value can still arrive as a concern,
+and a well-founded concern with no citation is withheld.
 
 `review_findings` with an unknown `findingId` fails with the current ids
 (unresolved first, bounded) so a guessed id is corrected in one step.
 
-The Verification Auditor is mandatory after every main-session turn end while
-the plugin is enabled, including text-only turns with no tool calls. It uses
-OMP's native WATCHDOG turn-end callback, not a second extension-triggered model
-request. The native transcript cursor suppresses repeated delivery of the same
-turn, and its single in-flight drain queues new turns; overlapping turns may be
-batched by the host rather than producing one separate provider request each.
-There are no plugin heuristics, tool-call filters or cooldowns.
+The plugin-run Verification Auditor audits **once per completed primary run**, after
+the final answer, including text-only answers. Mid-run turns and tool batches do
+not trigger audits. Workers, disabled-plugin runs, and aborted/error runs without
+a final answer are excluded. Auditing runs in the background: a new primary run
+aborts an in-flight audit and discards its stale result.
 
-Its model is `@verification-auditor`, a custom role. The [OMP setup](#omp-setup)
-still fills `advisor.enabled=true` and `modelRoles.verification-auditor=@smol`
-once, only when unset; persisted user settings remain untouched. If `smol` is
-unset, OMP resolves it to your default model. Independently of that fill-only
-setup, the plugin enables the live session's advisor switch and the owned
-auditor entry. A same-named `WATCHDOG.yml` entry can override the auditor's
-model and instructions, but `enabled:false` cannot suppress this mandatory
-audit. No `modelRoles.advisor` value is changed.
+Its model is the `verification-auditor` role, resolved through OMP's model registry
+without a plugin DEFAULT fallback. The [OMP setup](#omp-setup) fills
+`modelRoles.verification-auditor=@smol` only when unset. Tools are read-only
+`read`, `grep` (literal search), and `glob`, confined to the session cwd including
+symlink targets. The input contains the request, a bounded primary transcript
+(tool calls/results included), and the final answer.
 
-When the master advisor switch was off, other WATCHDOG entries are paused in
-the live roster before it is enabled, so only the auditor starts; their files
-and settings are unchanged. Otherwise explicit advisors retain their own
-enabled flags. Without a WATCHDOG roster the auditor replaces OMP's synthesized
-default advisor. Evidence-backed auditor notes feed checkpoint reviews.
+Admitted concern and blocker notes are shown in the transcript and persisted in
+the finding ledger for `review_findings` and `orche_advisor`. Both severities
+automatically start one primary follow-up carrying the notes. That follow-up is
+also audited, but its findings never start another automatic follow-up: at most
+one consecutive automatic follow-up. A new user request resets the cap. No admitted
+notes means silence and no follow-up. Provider/model errors or invalid output
+produce one visible `Verification audit failed: ...` line, never a clean audit;
+there is at most one provider retry.
 
-With plugin `enabled=false`, no auditor is installed. Disabling after installation
-removes the owned auditor at the next prompt and restores a master switch that
-the plugin forced on; other WATCHDOG configurations are restored from discovery.
-Advisor-note rewriting also stops, and the manual `orche_advisor` and
-`review_findings` tools remain available. Subagent sessions are not modified.
+OMP's native advisor runtime is **not used, installed, enabled, or reconfigured**
+by the plugin. Disable the native advisor separately to avoid unrelated native
+per-turn audits. Plugin `enabled=false` disables automatic audits; manual
+`orche_advisor` and `review_findings` remain available. Old native auditor cards
+remain readable by the finding ledger.
 
-`/advisor configure` can replace the live roster; the plugin repairs a missing
-or paused auditor, or a disabled master switch, before the next main prompt.
-Hard host failures (no matching model, quota exhaustion or a halted/error
-runtime) can prevent an audit; each affected turn boundary logs a
-`Verification Auditor turn-end audit skipped: ...` warning rather than silently
-claiming verification. Host provider failures retain OMP's own visible notices.
-
-Verified on OMP 18.4.4 in isolated print mode with a local fake model and no
-paid calls: a text-only main answer made exactly one auditor request despite
-`advisor.enabled:false` and a disabled same-named WATCHDOG entry; an unrelated
-WATCHDOG entry remained inactive. Consecutive turns, duplicate boundaries,
-duplicate plugin registration and disable transitions are covered with OMP's
-real advisor delta/cursor/drain runtime in the scoped behavioral tests.
 
 Advice text returned to the model has terminal escapes, control characters and
 invisible format characters (zero-width, bidirectional, soft hyphen, word joiner,
@@ -871,28 +843,23 @@ its value currently comes from:
 - set only for this session (CLI flag, `--config`, protocol pin) → nothing is
   written and that item stays pending, so a later session start tries again.
 
-The four items:
+The three items:
 
 | OMP key | value | why |
 | --- | --- | --- |
-| `advisor.enabled` | `true` | starts the bundled Verification Auditor. This is OMP's own advisor switch (default `false`), so it also applies to any advisors you declare in `WATCHDOG.yml` |
 | `modelRoles.verification-auditor` | `"@smol"` | the auditor's model. With `smol` unset, OMP resolves `@smol` to your default model |
 | `modelRoles.orche-advisor` | `"@slow"` | the plan advisor uses your Thinking model. With `slow` unset, OMP resolves `@slow` to your default model, so the advisor runs on the main model |
 | `task.maxRecursionDepth` | `1` | om-orche's main session owns all worker distribution, so workers must not spawn sub-workers. At depth `1` the main session (depth 0) can still delegate through `task`, while a worker (depth 1) runs its task directly. OMP's default is `2`. Do not set `0`: it removes `task` from the main session and disables Production delegation |
 
-**Cost.** With the auditor on, every turn adds a model call on
-`@verification-auditor`. In OMP 18.4.x, writing `advisor.enabled` during startup
-does not switch an already running session on by itself, so when the setup wrote
-that value it also switches the running session's advisor on through OMP's public
-session API; the auditor then runs in that same first session. To opt out or
-change it, set explicit values yourself: `omp config set advisor.enabled false`
-(the `omp config` CLI supports `list`, `get`, `set` and `reset`), or edit
-`~/.omp/agent/config.yml`. Individual `modelRoles` entries cannot be set with
-`omp config set`; edit them in `config.yml`. Values you set before the first
-start are kept; values you change afterwards stick, because the setup never
-re-enables or rewrites anything once it has finished. To allow deeper delegation
-again, set `omp config set task.maxRecursionDepth 2` (or any other value); a value
-in your global or project config is never overwritten.
+**Cost.** Each completed primary run starts an audit on `@verification-auditor`;
+tool investigation and the single allowed provider retry may add model calls.
+An admitted finding can start one automatic primary follow-up and its audit.
+To disable automatic auditing, disable the plugin with
+`omp plugin config set om-orche enabled false`. Individual `modelRoles` entries
+are edited in `~/.omp/agent/config.yml`, not with `omp config set`.
+Values set before the first start are kept; changes afterwards stick because
+setup never rewrites resolved items. To allow deeper delegation again, set
+`omp config set task.maxRecursionDepth 2`; user-owned values are never overwritten.
 
 **Not set, on purpose:**
 
@@ -924,24 +891,19 @@ interactive UI, a notification lists just the keys it wrote:
 
 ```text
 om-orche configured OMP once, filling only what was unset (existing values were kept):
-  advisor.enabled: true
   modelRoles.verification-auditor: "@smol"
   modelRoles.orche-advisor: "@slow"
   task.maxRecursionDepth: 1
-The Verification Auditor now reviews each turn with @verification-auditor.
-Edit roles in ~/.omp/agent/config.yml; `advisor.enabled` can also be changed with `omp config set advisor.enabled <true|false>`.
+Edit roles in ~/.omp/agent/config.yml.
 The main session delegates through `task`; workers run their task directly. Allow deeper delegation with `omp config set task.maxRecursionDepth 2`.
 ```
 
-The middle lines vary with what was written: the auditor line appears only when the
-auditor now runs; the roles line is ``Edit roles in ~/.omp/agent/config.yml.`` when
-only roles were written, and ``Change it with `omp config set advisor.enabled
-<true|false>`.`` when only `advisor.enabled` was written; the last line appears
-only when `task.maxRecursionDepth` was written. In every mode an info line goes to
-the OMP log, again listing only what was written:
+The roles line appears only when roles were written; the delegation line appears
+only when `task.maxRecursionDepth` was written. In every mode an info line goes
+to the OMP log, listing only what was written:
 
 ```text
-om-orche OMP setup wrote advisor.enabled=true, modelRoles.verification-auditor="@smol", modelRoles.orche-advisor="@slow", task.maxRecursionDepth=1
+om-orche OMP setup wrote modelRoles.verification-auditor="@smol", modelRoles.orche-advisor="@slow", task.maxRecursionDepth=1
 ```
 
 **Re-running.** Remove the marker, then start a new main session; the setup runs
@@ -958,7 +920,7 @@ setup runs once at the next main-session start after you upgrade (fill-only).
 it, and a run applies only items newer than the stored marker. An install with
 `hostSetupVersion: 1` therefore gets only `task.maxRecursionDepth` at its next
 main-session start (fill-only, so an existing value is kept), and the marker
-becomes `2`. `advisor.enabled` and the two roles are not touched again, so keys
+becomes `2`. The two roles are not touched again, so keys
 you deleted after the first setup stay deleted. Until that start, `/om-orche
 status` shows the setup as pending.
 
@@ -1334,7 +1296,7 @@ a user's.
 | the request prefix moved once | expected when the plugin was toggled or plan mode entered or left (the system prompt gains or loses the policy), when a tool the policy names (`todo`, `write`, `bash`, the advice tool) or `task.enableEffort` changed, or at the first request after upgrading a session an earlier build had persisted a notice into |
 | a worker cannot be messaged | the host reported it isolated or hard-aborted, or delivery failed; a new worker with the contract, changes and artifact references is the correct path. A missing "now idle" hint alone does not mean it cannot be continued |
 | `OMP setup` is not `applied (v2)` in status | `skipped — plugin disabled`: om-orche is disabled (`enabled=false`). `pending — applies at the next main session start`: no main session has started since install or since upgrading from setup v1; an item is set only for the current session (CLI flag, `--config`, protocol pin; RPC and ACP sessions pin `task.maxRecursionDepth` themselves), which leaves it pending until a session start without it; or a write failed, in which case the OMP log has the `om-orche OMP setup failed and will be retried at the next session start` warning and the next start retries |
-| the Verification Auditor does not run | `advisor.enabled` is off (the setup only fills it once; if you turned it off, it stays off), or `modelRoles.verification-auditor` is unset, or the plugin is disabled |
+| the Verification Auditor does not run | the primary has not produced a final answer, `modelRoles.verification-auditor` is missing/unresolvable, or the plugin is disabled. Errors appear as `Verification audit failed: ...`; silence otherwise means no admitted notes |
 | workers can spawn sub-workers, or `task` is missing in the main session | `task.maxRecursionDepth` is not `1`. The setup fills it once with `1`; a value you had set (`2` or more lets workers delegate, `0` removes `task` from the main session) is kept. Set `omp config set task.maxRecursionDepth 1` to restore the intended setup |
 | `orche_advisor` returns an error about a missing role | `modelRoles.orche-advisor` is unset. The setup fills it once with `@slow`; if the role was removed since, set it again under `modelRoles` in `~/.omp/agent/config.yml` |
 | `@task does not resolve in this session` in status | expected when `modelRoles.task` is unset: task workers use the main session's active model. Assign `modelRoles.task` in `config.yml` only if you want a different worker model |
@@ -1354,11 +1316,13 @@ guidance; OMP's native `task` behavior and orchestrate notice return unchanged.
 Notices an earlier build persisted stay in those sessions' transcripts as hidden
 messages: while the plugin is installed they are withheld from the provider, but
 once it is uninstalled nothing withholds them, so a resumed session keeps sending
-them until a compaction summarizes them away. The current build persists nothing.
+them until a compaction summarizes them away. The current policy persists no notices;
+auditor findings and lifecycle records remain in session history.
 The OMP settings the [OMP setup](#omp-setup) wrote stay in your config:
-`advisor.enabled: true`, `modelRoles.verification-auditor: "@smol"` and
-`modelRoles.orche-advisor: "@slow"`. Remove or change them yourself (for example
-`omp config set advisor.enabled false`). Other OMP model-role assignments
+`modelRoles.verification-auditor: "@smol"`, `modelRoles.orche-advisor: "@slow"`,
+and `task.maxRecursionDepth: 1`. Remove or change them yourself. Older releases
+also enabled OMP's native advisor; this release never manages that switch.
+Other OMP model-role assignments
 (including any leftover `task_easy`/`task_hard`/`task_challenge`) also remain
 until removed explicitly, as do any `typesafe` credential in OMP's store and the
 `<omp agent dir>/jev-router/` telemetry files; use `/om-orche reset` before
@@ -1643,32 +1607,15 @@ bullet checks the system-prompt design.
   `jevRouting`, the tier era carried over, an empty live epoch, and an idempotent
   reload.
 
-**OMP setup (2026-09-29).** `bun run check` clean; `bun run lint` 0 errors (2
-existing `no-control-regex` warnings); `bun test` 240 pass, 0 fail across 15
-files. The full suite also passes with a temporary HOME and the real config roots
-sandbox-denied. Host scenarios, on the real OMP 18.4.3 CLI (and the pinned 18.4.1
-CLI for the fresh case), with an isolated HOME and agent directory,
-`omp plugin link`, print-mode sessions, a local fake model and no paid calls:
+**Plugin-run Verification Auditor (2026-09-30).** `bun run check` passed;
+`bun test` passed with 451 tests, 0 failures across 20 files. A throwaway
+fake-model smoke exercised the pi-ai tool loop with a real read of `package.json`:
+two model calls (read request, then structured response), one admitted cited
+concern, and one uncited note withheld. Terminal-run triggering, disabled/worker
+exclusion, both-severity follow-ups and their cap, stale-result cancellation,
+failure warnings, and cwd/symlink confinement have behavioral coverage. Interactive
+host delivery is a separate smoke check; these local checks do not prove that UI.
 
-- Fresh install, first session: `config.yml` received the three items, the plugin
-  lock received `hostSetupVersion: 1`, the info line reached the OMP log, and the
-  Verification Auditor ran in that same first session (one auditor model request
-  after the main turn).
-- Explicit user values (`advisor.enabled: false`, a concrete `orche-advisor`)
-  were kept; only the missing auditor role was filled, and no auditor ran.
-- With the marker present, keys the user deleted afterwards were not re-added.
-- After `omp plugin config delete om-orche hostSetupVersion`, the next session
-  re-applied the missing items (fill-only) and the auditor ran in that session.
-- With the plugin disabled (project override `enabled: false`), nothing was
-  written and no marker was set.
-- `omp plugin uninstall om-orche` removed the plugin's settings including the
-  marker; the written OMP keys stayed in `config.yml`.
-
-Not verified on a live host: the interactive notification display (print mode has
-no UI; the log line is verified); the `/om-orche status` row (unit-tested only);
-`omp plugin install` from npm (only `link` was exercised; OMP's install path calls
-no plugin code either way); and the pending path for session-scoped values such
-as RPC/ACP protocol pins (unit-tested only).
 
 **Real-model smoke.** Setup: the OMP 18.4.2 CLI with the user's model roles (main
 `anthropic/claude-opus-5-5`, `task` worker `anthropic/claude-sonnet-5-5:medium`);

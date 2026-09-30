@@ -10,7 +10,6 @@ import {
 	applyOmpSetup,
 	type HostSetupOptions,
 	type HostSetupStore,
-	type LiveAdvisorSession,
 	runOmpSetup,
 } from "../src/omp-setup.ts";
 import { withStateLock } from "../src/state-lock.ts";
@@ -83,13 +82,13 @@ const warnings = (logs: string[]) => logs.filter(line => line.startsWith("warn "
 const infos = (logs: string[]) => logs.filter(line => line.startsWith("info "));
 
 describe("fresh install", () => {
-	test("fills the four unset items in the global layer, flushes, then marks, and reports once", async () => {
+	test("fills the three unset items in the global layer, flushes, then marks, and reports once", async () => {
 		const h = harness();
 		await h.run();
 
 		const { settings } = h;
-		expect(settings.getProvenance(cfgAdvisorEnabled)).toBe("global");
-		expect(cfgAdvisorEnabled.get(settings)).toBe(true);
+		expect(settings.getProvenance(cfgAdvisorEnabled)).toBe("default");
+		expect(cfgAdvisorEnabled.get(settings)).toBe(false);
 		expect(settings.getModelRole(AUDITOR)).toBe("@smol");
 		expect(settings.getModelRoleProvenance(AUDITOR)).toBe("global");
 		expect(settings.getModelRole(ADVISOR)).toBe("@slow");
@@ -99,9 +98,6 @@ describe("fresh install", () => {
 		expect(h.events).toEqual(["flush", "marker"]);
 		expect(h.written).toEqual([2]);
 		expect(h.notes).toHaveLength(1);
-		for (const key of ["advisor.enabled", `modelRoles.${AUDITOR}`, `modelRoles.${ADVISOR}`, "task.maxRecursionDepth: 1"]) {
-			expect(h.notes[0]).toContain(key);
-		}
 		expect(infos(h.logs)).toHaveLength(1);
 		expect(warnings(h.logs)).toEqual([]);
 	});
@@ -140,7 +136,7 @@ describe("fresh install", () => {
 		release.resolve();
 		await Promise.all([firstRun, secondRun]);
 
-		expect(cfgAdvisorEnabled.get(h.settings)).toBe(true);
+		expect(cfgAdvisorEnabled.get(h.settings)).toBe(false);
 		expect(h.settings.getModelRole(AUDITOR)).toBe("@smol");
 		expect(h.settings.getModelRole(ADVISOR)).toBe("@slow");
 		expect(cfgTaskMaxRecursionDepth.get(h.settings)).toBe(1);
@@ -207,30 +203,6 @@ describe("user values", () => {
 });
 
 describe("session-scoped values", () => {
-	test("a runtime override leaves its item pending with no marker, and a later start finishes it", async () => {
-		const h = harness(undefined, { "advisor.enabled": false });
-		expect(h.settings.getProvenance(cfgAdvisorEnabled)).toBe("runtime");
-		await h.run();
-
-		expect(cfgAdvisorEnabled.get(h.settings)).toBe(false);
-		expect(h.settings.getProvenance(cfgAdvisorEnabled)).toBe("runtime");
-		expect(h.settings.getModelRole(AUDITOR)).toBe("@smol");
-		expect(h.settings.getModelRole(ADVISOR)).toBe("@slow");
-		expect(h.written).toEqual([]);
-		expect(h.notes).toHaveLength(1);
-		expect(h.notes[0]).not.toContain("advisor.enabled");
-
-		cfgAdvisorEnabled.clearOverride(h.settings);
-		expect(h.settings.getProvenance(cfgAdvisorEnabled)).toBe("default");
-		await h.run();
-
-		expect(h.settings.getProvenance(cfgAdvisorEnabled)).toBe("global");
-		expect(cfgAdvisorEnabled.get(h.settings)).toBe(true);
-		expect(h.written).toEqual([2]);
-		expect(h.notes).toHaveLength(2);
-		expect(h.notes[1]).toContain("advisor.enabled");
-		expect(h.notes[1]).not.toContain("modelRoles");
-	});
 
 	test("a runtime model-role override is never replaced", async () => {
 		const h = harness();
@@ -501,111 +473,3 @@ describe("gates", () => {
 	});
 });
 
-describe("live advisor flag", () => {
-	function live(enabled = false) {
-		const calls: boolean[] = [];
-		let current = enabled;
-		return {
-			calls,
-			session: {
-				isAdvisorEnabled: () => current,
-				setAdvisorEnabled: (next: boolean) => {
-					calls.push(next);
-					current = next;
-					return false;
-				},
-			},
-		};
-	}
-
-	test("is switched on once, after the flush, when this run wrote advisor.enabled", async () => {
-		const h = harness();
-		const advisor = live();
-		const setAdvisorEnabled = advisor.session.setAdvisorEnabled;
-		advisor.session.setAdvisorEnabled = next => {
-			h.events.push("live");
-			return setAdvisorEnabled(next);
-		};
-		h.options.liveAdvisor = advisor.session;
-		await h.run();
-
-		expect(advisor.calls).toEqual([true]);
-		expect(h.events).toEqual(["flush", "live", "marker"]);
-	});
-
-	test("is not touched when the session already has advisors on", async () => {
-		const h = harness();
-		const advisor = live(true);
-		h.options.liveAdvisor = advisor.session;
-		await h.run();
-		expect(advisor.calls).toEqual([]);
-	});
-
-	test("is not touched when advisor.enabled is a user value, whatever it says", async () => {
-		for (const userValue of [true, false]) {
-			const h = harness();
-			const advisor = live();
-			cfgAdvisorEnabled.set(h.settings, userValue);
-			h.options.liveAdvisor = advisor.session;
-			await h.run();
-			expect(advisor.calls).toEqual([]);
-		}
-	});
-
-	test("is not touched while advisor.enabled is pending behind a session-scoped value", async () => {
-		const h = harness(undefined, { "advisor.enabled": false });
-		const advisor = live();
-		h.options.liveAdvisor = advisor.session;
-		await h.run();
-		expect(advisor.calls).toEqual([]);
-	});
-
-	test("a session without the live API is skipped without a warning", async () => {
-		const h = harness();
-		h.options.liveAdvisor = {} as unknown as LiveAdvisorSession;
-		await h.run();
-		expect(warnings(h.logs)).toEqual([]);
-		expect(h.written).toEqual([2]);
-	});
-
-	test("a throwing toggle warns once and leaves no marker", async () => {
-		const h = harness();
-		h.options.liveAdvisor = {
-			isAdvisorEnabled: () => false,
-			setAdvisorEnabled: () => {
-				throw new Error("no runtime");
-			},
-		};
-		await h.run();
-		expect(warnings(h.logs)).toHaveLength(1);
-		expect(h.written).toEqual([]);
-	});
-});
-
-describe("the report's change instructions", () => {
-	test("point to `omp config set` for advisor.enabled and the recursion depth only, never for model roles", async () => {
-		const h = harness();
-		await h.run();
-		expect(h.notes[0]).toContain("omp config set advisor.enabled");
-		expect(h.notes[0]).toContain("omp config set task.maxRecursionDepth 2");
-		expect(h.notes[0]).not.toMatch(/omp config set (?!advisor\.enabled|task\.maxRecursionDepth)/);
-		expect(h.notes[0]).toContain("~/.omp/agent/config.yml");
-	});
-
-	test("omit the advisor.enabled instruction when it was not written", async () => {
-		const h = harness();
-		cfgAdvisorEnabled.set(h.settings, false);
-		await h.run();
-		expect(h.notes[0]).toContain("~/.omp/agent/config.yml");
-		expect(h.notes[0]).not.toContain("omp config set advisor.enabled");
-	});
-
-	test("omit every `omp config set` when only roles were written", async () => {
-		const h = harness();
-		cfgAdvisorEnabled.set(h.settings, false);
-		cfgTaskMaxRecursionDepth.set(h.settings, 2);
-		await h.run();
-		expect(h.notes[0]).toContain("~/.omp/agent/config.yml");
-		expect(h.notes[0]).not.toContain("omp config set");
-	});
-});
