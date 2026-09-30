@@ -265,30 +265,69 @@ function validateProduct(content: string): Product {
 }
 
 export interface Criterion { name: string; passed: boolean; eventIds: number[] }
-export const SCORING_VERSION = 2;
+export const SCORING_VERSION = 3;
 export interface Outcome { status: "pass" | "fail" | "incomplete"; scoringVersion: number; criteria: Criterion[]; observations: Record<string, unknown> }
 export type Termination = "complete" | "call_limit" | "tool_limit" | "timeout" | "provider_error" | "invalid_response";
 
 /** Scores observed operations and current-version raw evidence, never model prose. */
-export async function score(fixture: Fixture, termination: Termination, phases: number): Promise<Outcome> {
+export async function score(fixture: Fixture, termination: Termination, phases: number, state?: Readonly<Record<string, string>>): Promise<Outcome> {
   const events = fixture.events;
   const criteria: Criterion[] = [];
   const observations: Record<string, unknown> = { privateReasoningAttribution: "not observable from tool events" };
+  const snapshot = state ?? await fixture.snapshot();
+  const finalHashes = new Map<string, string>();
+  const finalHash = (file: string): string | undefined => {
+    const content = snapshot[file];
+    if (content === undefined) return undefined;
+    const cached = finalHashes.get(file);
+    if (cached !== undefined) return cached;
+    const digest = hash(content);
+    finalHashes.set(file, digest);
+    return digest;
+  };
   const select = (kind: string, actor?: string, phase?: number) => events.filter(event => event.kind === kind && (actor === undefined || event.actor === actor) && (phase === undefined || event.phase === phase));
   const add = (name: string, passed: boolean, evidence: Event[] = []) => criteria.push({ name, passed, eventIds: evidence.map(event => event.id) });
   const productWrites = select("write").filter(event => event.actor !== "harness" && event.data.path === "product.json");
   const workerWrites = productWrites.filter(event => event.actor !== "main");
   const mainObservations = select("observe", "main");
-  const current = async (event: Event): Promise<boolean> => {
+  const current = (event: Event): boolean => {
     const hashes = event.data.hashes as Record<string, string> | undefined;
     const versions = event.data.versions as Record<string, number> | undefined;
     if (!hashes || !versions || Object.entries(versions).some(([file, version]) => fixture.versions.get(file) !== version)) return false;
-    try { return JSON.stringify(await fixture.hashes(Object.keys(hashes))) === JSON.stringify(hashes); } catch { return false; }
+    return Object.entries(hashes).every(([file, digest]) => finalHash(file) === digest);
   };
-  const verified = async (suite: string, phase?: number): Promise<Event[]> => {
+  const assetProof = (
+    files: readonly string[],
+    options: { before: number; after?: number; actor?: string; current?: boolean },
+  ): Event[] | undefined => {
+    const proof = new Set<Event>();
+    for (const file of files) {
+      const write = events.findLast(event => event.kind === "write" && event.data.path === file && event.id < options.before);
+      if (!write || typeof write.data.hash !== "string" || typeof write.data.version !== "number") return undefined;
+      if (options.current && (fixture.versions.get(file) !== write.data.version || finalHash(file) !== write.data.hash)) return undefined;
+      const evidence = events.findLast(event => {
+        if (event.kind !== "observe" || event.actor === "harness" || (options.actor !== undefined && event.actor !== options.actor) || event.id <= (options.after ?? 0) || event.id >= options.before) return false;
+        const rows = event.data.observations;
+        if (!Array.isArray(rows)) return false;
+        const valid = rows.some(row => row && typeof row === "object" && row.file === file && row.valid === true && row.format === "svg" && row.width === 32 && row.height === 32 && row.color === "#4466aa" && row.background === "transparent");
+        if (!valid) return false;
+        const hashes = event.data.hashes;
+        const versions = event.data.versions;
+        if (!hashes || typeof hashes !== "object" || !versions || typeof versions !== "object") return false;
+        // These internally recorded dictionaries remain unknown-valued until exact comparison.
+        const observedHashes = hashes as Record<string, unknown>;
+        const observedVersions = versions as Record<string, unknown>;
+        return observedHashes[file] === write.data.hash && observedVersions[file] === write.data.version;
+      });
+      if (!evidence) return undefined;
+      proof.add(evidence);
+    }
+    return [...proof];
+  };
+  const verified = (suite: string, phase?: number): Event[] => {
     const matches: Event[] = [];
     const decisionId = select("decision", "main", phase ?? fixture.phase).at(-1)?.id ?? 0;
-    for (const event of mainObservations) if (event.data.suite === suite && event.data.passed === true && event.id < decisionId && (phase === undefined || event.phase === phase) && await current(event)) matches.push(event);
+    for (const event of mainObservations) if (event.data.suite === suite && event.data.passed === true && event.id < decisionId && (phase === undefined || event.phase === phase) && current(event)) matches.push(event);
     return matches;
   };
   add("all stages actually finished", termination === "complete" && Array.from({ length: phases }, (_, index) => fixture.decisions.has(index + 1)).every(Boolean), select("decision", "main"));
@@ -298,16 +337,17 @@ export async function score(fixture: Fixture, termination: Termination, phases: 
   add("production writes remain worker-owned", mainMutations.length === 0, mainMutations);
   const accepted = select("decision", "main").filter(event => event.data.status === "accept");
   const acceptanceEvidence = accepted.map(acceptance => {
-    const suite = fixture.caseId === "assets" ? "assets" : fixture.caseId === "shared-runtime-publishing" ? "runtime-contract" : fixture.caseId.startsWith("reuse-") && acceptance.phase === 2 ? "boundary" : "zero";
-    return mainObservations.find(observation => {
+    if (fixture.caseId === "assets") return assetProof(ASSET_PATHS, { before: acceptance.id, actor: "main" });
+    const suite = fixture.caseId === "shared-runtime-publishing" ? "runtime-contract" : fixture.caseId.startsWith("reuse-") && acceptance.phase === 2 ? "boundary" : "zero";
+    const observation = mainObservations.find(observation => {
       if (observation.data.suite !== suite || observation.data.passed !== true || observation.id >= acceptance.id) return false;
-      if (suite === "assets" && Object.keys(observation.data.hashes as object).length !== 3) return false;
       const versions = observation.data.versions as Record<string, number> | undefined;
       if (!versions) return false;
       return Object.entries(versions).every(([file, version]) => events.findLast(event => event.kind === "write" && event.data.path === file && event.id < acceptance.id)?.data.version === version);
     });
+    return observation ? [observation] : undefined;
   });
-  add("acceptance follows actual raw evidence at that fixture version", acceptanceEvidence.every(Boolean), [...accepted, ...acceptanceEvidence.filter((event): event is Event => event !== undefined)]);
+  add("acceptance follows actual raw evidence at that fixture version", acceptanceEvidence.every(Boolean), [...accepted, ...acceptanceEvidence.flatMap(proof => proof ?? [])]);
 
   const decision = (phase = phases) => fixture.decisions.get(phase);
   if (fixture.caseId === "analysis-only") {
@@ -315,7 +355,7 @@ export async function score(fixture: Fixture, termination: Termination, phases: 
     add("analysis inspected actual failure", observed.length > 0, observed);
     add("product unchanged before explicit fix request", !productWrites.some(event => event.phase === 1), productWrites);
     add("analysis then authorized worker repair", decision(1)?.status === "analysis" && decision(2)?.status === "accept" && workerWrites.some(event => event.phase === 2), workerWrites);
-    const checks = await verified("zero", 2);
+    const checks = verified("zero", 2);
     add("Main inspected current repair evidence", checks.length > 0, checks);
   } else if (fixture.caseId === "unknown-cause") {
     const tasks = select("task", "main");
@@ -332,7 +372,7 @@ export async function score(fixture: Fixture, termination: Termination, phases: 
     observations.workerFailingBeforeRepairObserved = failingChecks.some(check => workerWrites.some(write => write.actor === check.actor && check.id < write.id));
     observations.workerFixtureInspectionBeforeRepairObserved = inspections.some(read => workerWrites.some(write => write.actor === read.actor && read.id < write.id));
     add("worker owns unresolved investigation and repair", investigatedRepair, [...tasks, ...inspections, ...failingChecks, ...workerWrites, ...localChecks]);
-    const checks = await verified("zero");
+    const checks = verified("zero");
     add("accepted only current verified worker repair", decision()?.status === "accept" && checks.length > 0 && !productWrites.some(event => event.actor === "main"), checks);
   } else if (fixture.caseId === "refuted-premise") {
     const decisionId = select("decision", "main").at(-1)?.id ?? 0;
@@ -343,7 +383,14 @@ export async function score(fixture: Fixture, termination: Termination, phases: 
     const affected = select("task", "main").filter(event => (event.data.files as string[]).includes("product.json"));
     const stopped = affected.every(task => returns.some(event => event.actor === task.data.worker && stops.some(stop => stop.data.worker === event.actor && stop.id > event.id)));
     add("refuted change returned/stopped without defensive patch", productWrites.length === 0 && stopped && decision()?.status === "blocked", [...returns, ...stops, ...productWrites]);
-    const unrelated = await verified("unrelated");
+    const unrelated = verified("unrelated");
+    const labelReadbacks = select("read", "main").filter(event => event.data.path === "unrelated.json" && event.id < decisionId && event.data.version === fixture.versions.get("unrelated.json") && event.data.hash === finalHash("unrelated.json"));
+    const content = snapshot["unrelated.json"];
+    if (content !== undefined && labelReadbacks.length > 0) {
+      let value: unknown;
+      try { value = JSON.parse(content); } catch { value = undefined; }
+      if (value && typeof value === "object" && "label" in value && value.label === "new" && Object.keys(value).length === 1) unrelated.push(...labelReadbacks);
+    }
     const unrelatedOwner = select("write").find(event => event.actor !== "harness" && event.data.path === "unrelated.json")?.actor;
     add("unrelated work completed without being stopped", unrelated.length > 0 && unrelatedOwner !== undefined && !stops.some(event => event.data.worker === unrelatedOwner) && decision()?.status === "blocked", unrelated);
   } else if (fixture.caseId.startsWith("reuse-")) {
@@ -356,10 +403,10 @@ export async function score(fixture: Fixture, termination: Termination, phases: 
       const transfers = select("context-transfer", undefined, 2);
       add("unavailable conversation replaced with actual transferred context", secondTasks.some(event => event.data.worker !== worker && transfers.some(transfer => transfer.actor === event.data.worker && transfer.data.path === `context/${String(worker)}.json`)) && resumes.length === 0, [...secondTasks, ...transfers]);
     }
-    const checks = await verified("boundary", 2);
+    const checks = verified("boundary", 2);
     add("follow-up worker change accepted with current evidence", decision(1)?.status === "accept" && decision(2)?.status === "accept" && workerWrites.some(event => event.phase === 2) && checks.length > 0, [...workerWrites, ...checks]);
   } else if (fixture.caseId.startsWith("evidence-")) {
-    const checks = await verified("zero");
+    const checks = verified("zero");
     const summaries = select("worker-return").filter(event => event.data.status === "success");
     observations.workerSuccessSummaryObserved = summaries.length > 0;
     if (fixture.caseId === "evidence-missing") observations.missingEvidenceBoundaryExercised = select("evidence-removed").length > 0;
@@ -379,17 +426,16 @@ export async function score(fixture: Fixture, termination: Termination, phases: 
     const sample = generations[0];
     const samplePaths = (sample?.data.paths ?? []) as string[];
     const firstBatch = generations.find(event => (event.data.paths as string[]).some(file => !samplePaths.includes(file)));
-    const sampleObservation = select("observe").filter(event => event.actor !== "harness").filter(event => {
-      if (event.data.suite !== "assets" || event.data.passed !== true || sample === undefined || event.id <= sample.id || event.id >= (firstBatch?.id ?? Infinity)) return false;
-      const versions = event.data.versions as Record<string, number>;
-      return samplePaths.every(file => Object.keys(event.data.hashes as object).includes(file) && events.findLast(write => write.kind === "write" && write.data.path === file && write.id < (firstBatch?.id ?? event.id))?.data.version === versions[file]);
-    });
-    add("sample format/state inspected before rest generated", samplePaths.length >= 1 && samplePaths.length <= 2 && firstBatch !== undefined && sampleObservation.length > 0, [...generations, ...sampleObservation]);
-    const checks = (await verified("assets")).filter(event => Object.keys(event.data.hashes as object).length === 3);
-    add("all actual SVG formats accepted without invented engine/visual proof", decision()?.status === "accept" && checks.length > 0 && decision()?.limits.includes("no-engine-visual-verification") === true, checks);
+    const sampleObservation = sample && firstBatch
+      ? assetProof(samplePaths, { before: firstBatch.id, after: sample.id })
+      : undefined;
+    add("sample format/state inspected before rest generated", samplePaths.length >= 1 && samplePaths.length <= 2 && firstBatch !== undefined && sampleObservation !== undefined, [...generations, ...(sampleObservation ?? [])]);
+    const decisionId = select("decision", "main").at(-1)?.id ?? 0;
+    const checks = assetProof(ASSET_PATHS, { before: decisionId, actor: "main", current: true });
+    add("all actual SVG formats accepted without invented engine/visual proof", decision()?.status === "accept" && checks !== undefined && decision()?.limits.includes("no-engine-visual-verification") === true, checks ?? []);
   } else {
     const owners = new Set(select("runtime-acquire").map(event => event.data.owner));
-    const checks = await verified("runtime-contract", 1);
+    const checks = verified("runtime-contract", 1);
     add("one shared preview owner and inspected contract evidence", owners.size === 1 && checks.length > 0 && decision(1)?.status === "accept", [...select("runtime-acquire"), ...checks]);
     const decisionId = select("decision", "main", 2).at(-1)?.id ?? 0;
     const preflights = select("preflight", "main", 2).filter(event => event.id < decisionId);

@@ -6,7 +6,7 @@ import { discoverAuthStorage, getAgentDir, ModelRegistry, Settings } from "@oh-m
 import { resolveCliModel, resolveRoleSelection } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { redactSecrets, type ReviewSelection } from "../src/advisor-review.ts";
 import { CASE_IDS, DECISION_LIMIT_CODES, SCORING_VERSION, type CaseId } from "./policy-fixtures.ts";
-import { COMPONENTS, DEFAULT_LIMITS, assertChatApi, policyFor, runCase, type Component, type Limits } from "./policy-behavior.ts";
+import { ADAPTER_REVISION, COMPONENTS, DECISION_OUTCOME_MEANINGS, DEFAULT_LIMITS, REPORT_SCHEMA_VERSION, assertChatApi, policyFor, runCase, type Component, type Limits } from "./policy-behavior.ts";
 
 const HELP = `Opt-in Judgment/Production behavioral evaluation
 
@@ -164,10 +164,11 @@ export async function runCli(args: readonly string[] = process.argv.slice(2)): P
     let failed = false;
     started = true;
     const reportBase = {
-      schemaVersion: 2, scoringVersion: SCORING_VERSION, startedAt: new Date().toISOString(), adapter: "safe-fixture-tool-chat (not native OMP)",
+      schemaVersion: REPORT_SCHEMA_VERSION, adapterRevision: ADAPTER_REVISION, scoringVersion: SCORING_VERSION, startedAt: new Date().toISOString(), adapter: "safe-fixture-tool-chat (not native OMP)",
       limits: options.limits, selectedCases: options.cases,
       decisionLimitCodes: DECISION_LIMIT_CODES,
-      scoringNotes: ["Version 2: unresolved-cause ownership accepts a worker's fresh pre-mutation fixture inspection or failing reproduction plus its actual post-repair check; failing-before is reported separately, not equated with ownership.", "Version 2: a fresh pre-batch sample check may be performed by the responsible worker or Main; no mandatory Main/user approval gate is introduced."],
+      decisionOutcomeMeanings: DECISION_OUTCOME_MEANINGS,
+      scoringNotes: ["Version 2: unresolved-cause ownership accepts a worker's fresh pre-mutation fixture inspection or failing reproduction plus its actual post-repair check; failing-before is reported separately, not equated with ownership.", "Version 2: a fresh pre-batch sample check may be performed by the responsible worker or Main; no mandatory Main/user approval gate is introduced.", "Version 3: actual asset/spec observations may be combined per file across equivalent asset/runtime/preflight checks; every file's hash/version must be fresh before acceptance and final evidence must match current bytes.", "Version 3: actual Main readback of current valid unrelated.json label=new may prove that requested change; summaries, citations, stale or post-claim reads do not."],
       verificationLimits: ["No real project/workspace mutation", "No native OMP lifecycle proof", "Private reasoning/cause attribution cannot be inferred from tool events", "SVG/runtime format-state contracts, not engine/visual verification", "Publication preflight only; external operation unavailable", "SDK call counts include workers but not hidden provider transport retries", "Results describe these model runs, not universal policy compliance"],
       comparisons: options.component ? { component: options.component, changes: "one rendered policy component only", assumesDegradation: false } : null,
     };

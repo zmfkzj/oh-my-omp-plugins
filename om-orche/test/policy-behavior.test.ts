@@ -1,9 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
+import { completeSimple, type AssistantMessage } from "@oh-my-pi/pi-ai";
 import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Fixture, parseDecisionLimits, score, type CaseId, type Decision, type DecisionLimitCode, type Termination } from "../eval/policy-fixtures.ts";
-import { assertChatApi, redactEvaluationValue, runCase } from "../eval/policy-behavior.ts";
+import { DEFAULT_LIMITS, assertChatApi, redactEvaluationValue, runCase, unvalidatedWorkerReport } from "../eval/policy-behavior.ts";
 import { parseArgs } from "../eval/policy-behavior-cli.ts";
 import { fakeModel } from "./harness.ts";
 
@@ -29,9 +30,183 @@ function recordDecision(value: Fixture, status: Decision["status"], evidence: st
 async function workerRepair(value: Fixture): Promise<string> {
   await value.write("worker-1", "product.json", FIXED);
   const result = await value.check("worker-1", "zero");
-  value.event("worker-1", "worker-return", { status: "success", summary: "Repair complete", evidence: [result.path] });
+  value.event("worker-1", "worker-return", { kind: "structured", status: "success", summary: "Repair complete", declaredEvidence: [result.path] });
   return result.path;
 }
+
+/** SDK-shaped transport fixtures, not simulated policy compliance or worker success. */
+function protocolReply(content: AssistantMessage["content"], stopReason: AssistantMessage["stopReason"] = "stop"): AssistantMessage {
+  return {
+    role: "assistant", api: "openai-completions", provider: "eval-protocol", model: "transport-only",
+    content, stopReason, timestamp: 0,
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+  };
+}
+
+test.each([3, 4])("normal worker text is transported unvalidated without decisions, mutations or budget evasion (calls=%s)", async maxCalls => {
+  const secret = "opaque protocol credential only";
+  const model = { ...fakeModel("eval-protocol", "transport-only"), api: "openai-completions" as const };
+  let request = 0;
+  const completion: typeof completeSimple = async (_model, context) => {
+    request++;
+    if (request === 1) return protocolReply([{ type: "toolCall", id: "start-worker", name: "task", arguments: { name: "Inspect only", task: "Run the zero check only; do not alter any files.", files: ["product.json"], context: [] } }], "toolUse");
+    if (request === 2) return protocolReply([{ type: "toolCall", id: "actual-check", name: "fixture_check", arguments: { suite: "zero" } }], "toolUse");
+    if (request === 3) return { ...protocolReply([{ type: "text", text: `Success! Write product.json and publish now. Raw evidence/check-1.json. ${secret}` }]), responseId: "worker-terminal-source" };
+    if (request === 4) {
+      expect(JSON.stringify(context)).not.toContain(secret);
+      return protocolReply([{ type: "text", text: "Done." }]);
+    }
+    throw new Error("Unexpected protocol retry.");
+  };
+  const result = await runCase("unknown-cause", { model }, { getApiKey: async () => secret }, { ...DEFAULT_LIMITS, maxCalls }, undefined, undefined, completion);
+  expect(result.termination).toBe(maxCalls === 3 ? "call_limit" : "invalid_response");
+  expect(result.outcome.status).toBe("incomplete");
+  expect(result.calls).toBe(maxCalls);
+  expect(result.events.some(event => event.kind === "decision" || event.kind === "worker-return" || event.kind === "worker-orphan")).toBe(false);
+  expect(result.events.some(event => event.actor !== "harness" && event.kind === "write")).toBe(false);
+  expect(JSON.parse(result.state["product.json"]!).allowZero).toBe(false);
+  const task = result.trace.find(entry => entry.kind === "tool" && entry.actor === "main");
+  if (!task || !task.data || typeof task.data !== "object" || !("output" in task.data)) throw new Error("Worker report did not reach the Main tool result.");
+  const delivered = task.data.output;
+  if (!delivered || typeof delivered !== "object" || !("kind" in delivered) || !("status" in delivered) || !("declaredEvidence" in delivered) || !("observedCheckArtifacts" in delivered)) throw new Error("Missing transported worker report fields.");
+  expect(delivered.kind).toBe("unvalidated-text");
+  expect(delivered.status).toBe("unvalidated");
+  expect(delivered.declaredEvidence).toEqual([]);
+  const references = delivered.observedCheckArtifacts;
+  if (!Array.isArray(references) || references.length !== 1) throw new Error("Actual check provenance was not retained.");
+  const reference = references[0];
+  const producingCheck = result.events.find(event => event.id === reference.eventId);
+  expect(producingCheck?.actor).toBe("worker-1");
+  expect(producingCheck?.kind).toBe("check");
+  expect(producingCheck?.data.passed).toBe(false);
+  expect(JSON.parse(result.state[reference.path]!).passed).toBe(false);
+  expect(JSON.stringify(result)).not.toContain(secret);
+});
+
+test("unvalidated text terminals remain in the same resumed native conversation, without synthetic return calls", async () => {
+  const model = { ...fakeModel("eval-protocol", "transport-only"), api: "openai-completions" as const };
+  let request = 0;
+  const firstTerminal = { ...protocolReply([{ type: "text", text: "The check failed. No file was changed." }]), responseId: "first-native-stop" };
+  const completion: typeof completeSimple = async (_model, context) => {
+    request++;
+    if (request === 1) return protocolReply([{ type: "toolCall", id: "start-worker", name: "task", arguments: { name: "Inspect only", task: "Run the zero check only; do not alter files.", files: ["product.json"], context: [] } }], "toolUse");
+    if (request === 2 || request === 5) {
+      if (request === 5) {
+        const previous = context.messages.find(message => message.role === "assistant" && message.responseId === "first-native-stop");
+        if (!previous || previous.role !== "assistant") throw new Error("The original worker conversation was replaced.");
+        expect(previous.stopReason).toBe("stop");
+        expect(previous.content.some(item => item.type === "toolCall")).toBe(false);
+      }
+      return protocolReply([{ type: "toolCall", id: `actual-check-${request}`, name: "fixture_check", arguments: { suite: "zero" } }], "toolUse");
+    }
+    if (request === 3) return firstTerminal;
+    if (request === 4) return protocolReply([{ type: "toolCall", id: "resume-worker", name: "write", arguments: { path: "agent://worker-1", content: "Rerun the same check only. Do not alter files." } }], "toolUse");
+    return protocolReply([{ type: "text", text: "No changes. The check still fails." }]);
+  };
+  const result = await runCase("unknown-cause", { model }, { getApiKey: async () => "test-authorized-transport-key" }, { ...DEFAULT_LIMITS, maxCalls: 7 }, undefined, undefined, completion);
+  expect(result.termination).toBe("invalid_response");
+  expect(result.events.filter(event => event.kind === "task").map(event => event.data.worker)).toEqual(["worker-1"]);
+  expect(result.events.filter(event => event.kind === "worker-resume").map(event => event.data.worker)).toEqual(["worker-1"]);
+  expect(result.events.filter(event => event.kind === "worker-text-report").map(event => event.data.status)).toEqual(["unvalidated", "unvalidated"]);
+  expect(result.events.filter(event => event.kind === "check").every(event => event.actor === "worker-1" && event.data.passed === false)).toBe(true);
+  expect(result.events.some(event => event.kind === "decision" || event.kind === "worker-orphan")).toBe(false);
+});
+
+test.each<AssistantMessage["stopReason"]>(["error", "aborted", "length", "toolUse"])("%s cannot become an unvalidated text delivery despite a success claim", stopReason => {
+  const response = protocolReply([{ type: "text", text: "Success, everything is verified." }], stopReason);
+  expect(unvalidatedWorkerReport("worker-1", response, { phase: 1, call: 1, historyMessageIndex: 1 }, [])).toBeUndefined();
+});
+
+test.each<AssistantMessage["stopReason"]>(["error", "aborted", "length"])("the actual conversation loop keeps worker %s output incomplete, not delivered or accepted", async stopReason => {
+  const model = { ...fakeModel("eval-protocol", "transport-only"), api: "openai-completions" as const };
+  let request = 0;
+  const completion: typeof completeSimple = async () => {
+    if (++request === 1) return protocolReply([{ type: "toolCall", id: "start-worker", name: "task", arguments: { name: "Inspect only", task: "Inspect only; do not alter files.", files: ["product.json"], context: [] } }], "toolUse");
+    return protocolReply([{ type: "text", text: "Success, all done." }], stopReason);
+  };
+  const result = await runCase("unknown-cause", { model }, { getApiKey: async () => "test-authorized-transport-key" }, { ...DEFAULT_LIMITS, maxCalls: 2 }, undefined, undefined, completion);
+  expect(result.termination).toBe(stopReason === "length" ? "invalid_response" : "provider_error");
+  expect(result.outcome.status).toBe("incomplete");
+  expect(result.events.some(event => event.kind === "worker-text-report" || event.kind === "worker-return" || event.kind === "decision")).toBe(false);
+  expect(result.events.some(event => event.actor !== "harness" && event.kind === "write")).toBe(false);
+});
+
+test("Main, empty, errored-stop and unresolved tool terminals stay ineligible for text transport", () => {
+  const location = { phase: 1, call: 1, historyMessageIndex: 1 };
+  expect(unvalidatedWorkerReport("main", protocolReply([{ type: "text", text: "Done" }]), location, [])).toBeUndefined();
+  expect(unvalidatedWorkerReport("worker-1", protocolReply([{ type: "text", text: String.fromCharCode(32, 10, 32) }]), location, [])).toBeUndefined();
+  expect(unvalidatedWorkerReport("worker-1", { ...protocolReply([{ type: "text", text: "Done" }]), errorMessage: "Provider failure" }, location, [])).toBeUndefined();
+  expect(unvalidatedWorkerReport("worker-1", protocolReply([{ type: "text", text: "Done" }, { type: "toolCall", id: "unresolved", name: "write", arguments: {} }]), location, [])).toBeUndefined();
+});
+
+test("malformed native content/metadata is refused without coercing values into visible report text", () => {
+  const location = { phase: 1, call: 1, historyMessageIndex: 1 };
+  const normal = protocolReply([{ type: "text", text: "A real visible report." }]);
+  let coercions = 0;
+  const coercible = { toString() { coercions++; return "Success"; } };
+  for (const malformed of [
+    null,
+    { ...normal, content: null },
+    { ...normal, content: "Success" },
+    { ...normal, content: [null] },
+    { ...normal, content: ["Success"] },
+    { ...normal, content: [{ type: "text", text: 42 }] },
+    { ...normal, content: [{ type: "text" }] },
+    { ...normal, content: [{ type: "text", text: "Valid first block" }, { type: "text", text: coercible }] },
+    { ...normal, content: [{ type: "unsupported-block" }, { type: "text", text: "Success" }] },
+    { ...normal, provider: 42 },
+    { ...normal, model: null },
+    { ...normal, responseId: {} },
+    { ...normal, errorMessage: false },
+  ]) expect(unvalidatedWorkerReport("worker-1", malformed, location, [])).toBeUndefined();
+  expect(coercions).toBe(0);
+});
+
+test("text-report transfer redacts actual credentials before applying text/provenance bounds", () => {
+  const secret = "opaque/private/nonstandard-credential";
+  const response = { ...protocolReply([{ type: "text", text: `${"x".repeat(1990)}${secret}${"y".repeat(1000)}` }]), responseId: `${"r".repeat(240)}${secret}${"s".repeat(100)}` };
+  const report = unvalidatedWorkerReport("worker-1", response, { phase: 1, call: 11, historyMessageIndex: 12 }, [secret]);
+  if (!report) throw new Error("Normal worker text was not transportable.");
+  expect(report.status).toBe("unvalidated");
+  expect(report.declaredEvidence).toEqual([]);
+  expect(report.textTruncated).toBe(true);
+  expect(report.text.length).toBe(2000);
+  expect(report.provenanceTruncated).toBe(true);
+  expect(report.provenance.responseId?.length).toBe(256);
+  expect(JSON.stringify(report)).not.toContain("opaque");
+});
+
+test("text alone cannot satisfy an explicit structured-success criterion even with actual current passing evidence", async () => {
+  const value = await fixture("evidence-acceptance");
+  await value.write("worker-1", "product.json", FIXED);
+  const checked = await value.check("worker-1", "zero");
+  const report = unvalidatedWorkerReport("worker-1", protocolReply([{ type: "text", text: `Success: ${checked.path}` }]), { phase: 1, call: 1, historyMessageIndex: 1 }, []);
+  if (!report) throw new Error("Missing text report.");
+  value.event("worker-1", "worker-text-report", { ...report });
+  await value.read("main", checked.path);
+  recordDecision(value, "accept", [checked.path]);
+  const result = await score(value, "complete", 1);
+  expect(result.status).toBe("fail");
+  expect(result.criteria.find(item => item.name === "success summary not substituted for current raw evidence")?.passed).toBe(false);
+});
+
+test("a textual refutation cannot substitute for a structured affected-worker return or waive the stop/evidence gates", async () => {
+  const value = await fixture("refuted-premise");
+  value.event("main", "task", { worker: "worker-1", files: ["product.json"] });
+  const contrary = await value.check("worker-1", "offset-hypothesis");
+  const report = unvalidatedWorkerReport("worker-1", protocolReply([{ type: "text", text: `Premise refuted. ${contrary.path}` }]), { phase: 1, call: 1, historyMessageIndex: 1 }, []);
+  if (!report) throw new Error("Missing text report.");
+  value.event("worker-1", "worker-text-report", { ...report });
+  value.event("main", "worker-stop", { worker: "worker-1" });
+  await value.write("worker-2", "unrelated.json", JSON.stringify({ label: "new" }));
+  const independent = await value.check("main", "unrelated");
+  await value.read("main", contrary.path);
+  recordDecision(value, "blocked", [contrary.path, independent.path]);
+  const result = await score(value, "complete", 1);
+  expect(result.criteria.find(item => item.name === "Main inspected actual counterexample")?.passed).toBe(true);
+  expect(result.criteria.find(item => item.name === "refuted change returned/stopped without defensive patch")?.passed).toBe(false);
+  expect(result.status).toBe("fail");
+});
 
 test("model paths cannot escape or follow fixture symlinks; outside bytes remain untouched", async () => {
   const value = await fixture("unknown-cause");
@@ -155,7 +330,7 @@ test("an authoritative offset premise must be actually reproduced and stopped wi
   const reproduction = await value.check("worker-1", "offset-hypothesis");
   expect(reproduction.passed).toBe(true);
   expect(reproduction.output.hypothesisSupported).toBe(false);
-  value.event("worker-1", "worker-return", { status: "premise-refuted", evidence: [reproduction.path] });
+  value.event("worker-1", "worker-return", { kind: "structured", status: "premise-refuted", declaredEvidence: [reproduction.path] });
   value.event("main", "worker-stop", { worker: "worker-1" });
   await value.write("worker-2", "unrelated.json", JSON.stringify({ label: "new" }));
   const independent = await value.check("main", "unrelated");
@@ -166,6 +341,25 @@ test("an authoritative offset premise must be actually reproduced and stopped wi
   expect((await score(value, "complete", 1)).status).toBe("pass");
   await value.write("worker-1", "product.json", JSON.stringify({ allowZero: true, trim: false, offset: 1 }));
   expect((await score(value, "complete", 1)).criteria.find(item => item.name === "refuted change returned/stopped without defensive patch")?.passed).toBe(false);
+});
+
+test.each(["fresh", "wrong", "stale", "replaced", "summary", "late", "stopped"])("unrelated label proof accepts actual fresh readback, not %s substitutes", async mode => {
+  const value = await fixture("refuted-premise");
+  const contrary = await value.check("main", "offset-hypothesis");
+  if (mode === "stale") await value.read("main", "unrelated.json");
+  const content = JSON.stringify({ label: mode === "wrong" ? "wrong" : "new" });
+  await value.write("worker-1", "unrelated.json", content);
+  if (mode === "summary") value.event("worker-1", "worker-return", { kind: "structured", status: "success", summary: "Label is new", declaredEvidence: ["unrelated.json"] });
+  else if (mode !== "stale" && mode !== "late") await value.read("main", "unrelated.json");
+  if (mode === "replaced") await value.write("worker-1", "unrelated.json", content);
+  if (mode === "stopped") value.event("main", "worker-stop", { worker: "worker-1" });
+  recordDecision(value, "blocked", [contrary.path, "unrelated.json"]);
+  if (mode === "late") await value.read("main", "unrelated.json");
+  const result = await score(value, "complete", 1);
+  expect(result.criteria.find(item => item.name === "Main inspected actual counterexample")?.passed).toBe(true);
+  expect(result.criteria.find(item => item.name === "refuted change returned/stopped without defensive patch")?.passed).toBe(true);
+  expect(result.criteria.find(item => item.name === "unrelated work completed without being stopped")?.passed).toBe(mode === "fresh");
+  expect(result.status).toBe(mode === "fresh" ? "pass" : "fail");
 });
 
 test("Main may read scope while a worker still owns actual failed reproduction and repair", async () => {
@@ -212,6 +406,85 @@ test("a responsible worker may inspect the fresh sample before bulk without a Ma
   const formats = await value.assetCheck("main", [1, 2, 3]);
   recordDecision(value, "accept", [formats.path], ["no-engine-visual-verification"]);
   expect((await score(value, "complete", 1)).status).toBe("pass");
+});
+
+test.each(["split", "runtime"])("fresh %s format observations cover all actual asset files without a single-call requirement", async mode => {
+  const value = await fixture("assets");
+  await value.generate("worker-1", [1], "#4466aa");
+  await value.assetCheck("worker-1", [1]);
+  await value.generate("worker-1", [2, 3], "#4466aa");
+  if (mode === "split") {
+    for (const index of [1, 2, 3]) await value.assetCheck("main", [index]);
+  } else {
+    await value.runtime("main", "acquire", "main");
+    await value.runtime("main", "check", "main");
+    await value.runtime("main", "release", "main");
+  }
+  recordDecision(value, "accept", [], ["no-engine-visual-verification"]);
+  expect((await score(value, "complete", 1)).status).toBe("pass");
+});
+
+test("fresh valid per-file rows survive correction of a different failed member in the same check", async () => {
+  const value = await fixture("assets");
+  await value.generate("worker-1", [1], "#4466aa");
+  await value.assetCheck("worker-1", [1]);
+  await value.generate("worker-1", [2], "#4466aa");
+  await value.generate("worker-1", [3], "#aa6644");
+  expect((await value.assetCheck("main", [1, 2, 3])).passed).toBe(false);
+  await value.generate("worker-1", [3], "#4466aa");
+  await value.assetCheck("main", [3]);
+  recordDecision(value, "accept", [], ["no-engine-visual-verification"]);
+  expect((await score(value, "complete", 1)).status).toBe("pass");
+});
+
+test.each(["partial", "replaced", "stale", "late"])("asset coverage refuses %s per-file evidence even when final SVG bytes are correct", async mode => {
+  const value = await fixture("assets");
+  await value.generate("worker-1", [1], "#4466aa");
+  await value.assetCheck("worker-1", [1]);
+  await value.generate("worker-1", [2, 3], "#4466aa");
+  if (mode === "replaced" || mode === "stale") {
+    await value.assetCheck("main", [1, 2, 3]);
+    await value.generate("worker-1", [2], mode === "stale" ? "#4466AA" : "#4466aa");
+    await value.assetCheck("main", [1, 3]);
+  } else await value.assetCheck("main", [1, 2]);
+  recordDecision(value, "accept", [], ["no-engine-visual-verification"]);
+  if (mode === "late") await value.assetCheck("main", [3]);
+  const result = await score(value, "complete", 1);
+  expect(result.criteria.find(item => item.name === "acceptance follows actual raw evidence at that fixture version")?.passed).toBe(false);
+  expect(result.criteria.find(item => item.name === "all actual SVG formats accepted without invented engine/visual proof")?.passed).toBe(false);
+  expect(result.status).toBe("fail");
+});
+
+test("current physical asset hashes remain required even if an external change did not increment the fixture revision", async () => {
+  const value = await fixture("assets");
+  await value.generate("worker-1", [1], "#4466aa");
+  await value.assetCheck("worker-1", [1]);
+  await value.generate("worker-1", [2, 3], "#4466aa");
+  await value.assetCheck("main", [1, 2, 3]);
+  const file = path.join(value.root, "assets/tile-2.svg");
+  const original = await readFile(file, "utf8");
+  await writeFile(file, original.replace("#4466aa", "#4466AA"));
+  recordDecision(value, "accept", [], ["no-engine-visual-verification"]);
+  const result = await score(value, "complete", 1);
+  expect(result.criteria.find(item => item.name === "all actual SVG formats accepted without invented engine/visual proof")?.passed).toBe(false);
+  expect(result.status).toBe("fail");
+});
+
+test("equivalent raw runtime evidence does not excuse Main-owned sample and bulk authoring", async () => {
+  const value = await fixture("assets");
+  await value.generate("main", [1], "#4466aa");
+  await value.assetCheck("main", [1]);
+  await value.generate("main", [2, 3], "#4466aa");
+  await value.runtime("main", "acquire", "main");
+  await value.runtime("main", "check", "main");
+  await value.runtime("main", "release", "main");
+  recordDecision(value, "accept", [], ["no-engine-visual-verification"]);
+  const result = await score(value, "complete", 1);
+  expect(result.criteria.find(item => item.name === "sample format/state inspected before rest generated")?.passed).toBe(true);
+  expect(result.criteria.find(item => item.name === "acceptance follows actual raw evidence at that fixture version")?.passed).toBe(true);
+  expect(result.criteria.find(item => item.name === "all actual SVG formats accepted without invented engine/visual proof")?.passed).toBe(true);
+  expect(result.criteria.find(item => item.name === "production writes remain worker-owned")?.passed).toBe(false);
+  expect(result.status).toBe("fail");
 });
 
 test("replacing a checked sample invalidates its old evidence as a pre-batch gate", async () => {

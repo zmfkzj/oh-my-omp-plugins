@@ -5,7 +5,7 @@ import { isPolicySection, policyModeOf } from "./orchestration-policy.ts";
 
 /** Durable state, never a context/custom_message entry. */
 export const POLICY_EXPOSURE_ENTRY_TYPE = "om-orche-policy-exposure";
-export const POLICY_REVISION = "judgment-production-2026-09-30-r2";
+export const POLICY_REVISION = "judgment-production-2026-09-30-r4";
 export type PolicyGovernance = "governed" | "plan-mode" | "task-tool-unavailable";
 
 export interface PolicyExposure {

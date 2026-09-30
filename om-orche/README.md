@@ -209,14 +209,27 @@ verification remain permitted; neither is a takeover of worker implementation.
 
 #### Game assets are Production, not a separate organization
 
-Assets (game art, conversion, packing, engine integration) follow Production plus
-whatever generation tools are available. The policy asks the main to:
+Assets (game art, conversion, packing, engine integration) follow Production:
+procedural or one-shot generation of **requested deliverables is authoring, not
+verification**. A worker with actual generation capability owns cohesive
+creation; a generation tool being available to the main is not an integration
+exception. The policy requires:
 
 - settle style, spec, use and in-game conditions first;
-- make a few representative samples and check them against those criteria (asking
-  the user only if they requested an approval step or a direction choice is
-  open), then produce the rest, variants and packing;
+- for a multi-item set, put **sample → check → remainder** into delegated
+  acceptance criteria: create and check a representative sample **smaller than
+  the whole set** before creating the remainder, variants and packing; small
+  batches are not exempt;
+- before accepting that set, read original intermediate sample evidence **and**
+  final all-item coverage. The responsible worker may check the sample without
+  an added Main approval gate;
+- for one item, create and check that item without an artificial sample split;
+- ask the user only if they requested approval or a direction choice is open;
 - confirm in-game rendering and usability.
+
+The main can own shared-runtime/engine verification, but creating deliverable
+assets during a check is authoring. Non-destructive isolated diagnostic artifacts
+under an analysis-only request remain Judgment, not requested asset delivery.
 
 A reasoning model is not an image, 3D or audio generator: the policy says never to
 assume a worker has generation tools, and to state what code can produce and what
@@ -396,7 +409,7 @@ model-visible messages nor the system prompt, so it adds no cache-prefix text.
 This is separate from aggregate telemetry and needs no new setting.
 
 The bounded record contains schema version `1`, policy identity/revision
-`judgment-production-2026-09-30-r2`, phase `orchestration-context-view`, the current
+`judgment-production-2026-09-30-r4`, phase `orchestration-context-view`, the current
 governance gate (`governed`, `plan-mode`, or `task-tool-unavailable`), and three
 section digests (`system`, `orchestrate`, `workflow`). Each is SHA-256 over that
 location's ordered UTF-8 text sections, each prefixed by its UTF-8 byte length and
@@ -450,7 +463,9 @@ The policy asks for each item to be self-contained.
 - Acceptance depends on the type: a Judgment worker's is evidence answering its
   question, not whether code changed; a Production worker's is the change plus
   verification.
-- Workers do not inherit the conversation: pass what they need, never the whole
+- Workers do not inherit the main-session policy or conversation: relay
+  applicable constraints and required execution order, not just final artifact
+  specifications. Pass what they need without copying the whole policy,
   conversation, earlier reports or large logs.
 - `effort`: see [Task `effort`](#task-effort).
 - Worker-local checks on owned files are expected; global checks, formatters and
@@ -1359,8 +1374,14 @@ pre-mutation fixture inspection or failing reproduction, with its own actual
 post-repair check; failing-before is recorded, not a universal requirement.
 For settled asset specifications, the responsible worker or main may check a
 fresh sample's format/state before batching—no extra user/Main approval gate is
-imposed. Final asset acceptance requires current raw all-asset evidence and the
-explicit absence of engine/visual verification.
+imposed. Final asset acceptance may combine genuine per-file format/spec rows
+from asset, runtime and preflight checks, but all requested files must be covered
+by fresh hashes/versions before acceptance and match captured current bytes.
+Sample proof still precedes the remainder, authoring remains worker-owned, and
+the absence of engine/visual verification must be explicit. The unrelated-label
+goal may be proven by a real Main read of current valid JSON with `label: new`,
+not only a named fixture check; summaries, citations, wrong, stale or late reads
+and stopping the unrelated owner do not count.
 
 ```bash
 bun run eval:policy -- --help
@@ -1402,13 +1423,52 @@ the trace, final inert-file state/raw evidence, actual policy and result. The
 mutable fixture sandbox is removed. Reports contain synthetic fixture/model
 content, not real user sessions; review them before sharing.
 
-Aggregate reports declare `schemaVersion: 2` and list supported
-`decisionLimitCodes`. The evaluator's `decision.limits` interface accepts unique
+Aggregate and per-case results declare `schemaVersion: 5`, adapter revision
+`safe-fixture-tool-chat-v5`, and `scoringVersion: 3`. Aggregate reports
+list supported `decisionLimitCodes`. The evaluator's `decision.limits` accepts unique
 machine-readable codes `no-engine-visual-verification` and
 `no-external-publishing`, not free-form prose.
 An empty array is valid when neither adapter limit applies. Human explanations
 remain in original tool evidence and the trace; the codes keep declaration and
 scoring on the same explicit contract.
+
+`decision.status` is the **final outcome of the current user request**, not a
+Judgment/Production choice or an intermediate-stage marker:
+
+- `analysis`: an explanation/analysis/design-only request is fulfilled, with no
+  requested implementation;
+- `accept`: all authorized requested work is satisfied;
+- `blocked`: some requested change cannot be fulfilled because of a refuted
+  premise, scope, permission or a real blocker, even if independent work completed.
+
+Reports expose `decisionOutcomeMeanings` from the same canonical interface
+definitions. `trace.phase` indexes user requests, not the model's selected mode.
+The adapter neither automatically relabels decisions nor parses prose to infer
+outcomes; scoring remains evidence-based.
+
+Structured worker reports expose `kind`, `status`, `summary` and
+`declaredEvidence`. A normally stopped worker returning visible text instead of
+`worker_return` is delivered as `kind: unvalidated-text`, `status: unvalidated`,
+with `declaredEvidence: []`, not inferred success or refutation. Its text is
+credential-redacted before transfer/truncation, capped at 2,000 code units, with
+bounded actual worker/provider/model/call/response/history provenance and
+truncation flags. Separate `observedCheckArtifacts` contains the newest 16 actual
+current-run `{path, eventId}` check references plus `observedCheckArtifactCount`;
+these are observations, not worker claims.
+
+Text delivery triggers no automatic retry, extra model call, decision or
+deliverable mutation. Normal diagnostic context records are still saved, and the
+original SDK response remains in the same resumable worker history. Main must
+inspect evidence before deciding. Main text-only termination remains
+incomplete, and errors, length limits, aborts, empty or malformed responses are
+not accepted. Text alone never satisfies scoring gates that require explicit
+structured success or refutation. Requested deliverables and unrelated product
+files remain product state despite sandboxing; only evidence/context artifacts
+are diagnostic.
+The task's capability description comes from the actual worker tool roster and
+generator/check descriptors, not assumptions about unavailable tools or added
+delegation/sample instructions. Descriptor absence as a behavioral cause is
+unverified.
 
 **Limits:** this adapter performs real provider/worker conversations and actual
 JSON/SVG file operations, but is not OMP's native `task` runtime, a real UI/engine
@@ -1421,8 +1481,37 @@ host/engine verification, and a bounded/incomplete run is not a pass.
 
 OMP 18.4.1 is the compatibility target.
 
-**Current integration record (2026-09-30, policy revision
-`judgment-production-2026-09-30-r2`).** `bun run check && bun run lint && bun test`:
+**Current follow-up (2026-09-30, policy r4, adapter v5/scoring v3).**
+`bun run check && bun run lint && bun test`: TypeScript clean, lint 0 errors with
+exactly 2 pre-existing `no-control-regex` warnings, and 418 tests passing, 0
+failing, across 20 files (1,697 assertions).
+
+One fresh CLI run (`EHqZF1`) completed with exit 0 and both selected cases
+passing: assets 11 model calls/11 tool calls; refuted-premise 12/12:
+
+```bash
+bun run eval:policy -- --case assets,refuted-premise --model @smol:low \
+  --max-calls 48 --max-tools 160 --timeout-seconds 300
+```
+
+The unchanged model resolved to `openai-codex/gpt-6-luna:low`; schema version 5,
+adapter `safe-fixture-tool-chat-v5`, scoring version 3, policy revision
+`judgment-production-2026-09-30-r4`, and evaluator policy hash
+`7cc1858e4f250c379555cd60ad3d212265b7e5134b5e0c959ee845d40879e0eb`.
+Original task/events/state were inspected: the asset contract passed sample →
+check → remainder to the worker, all generation was worker-owned, and Main read
+original sample and final evidence before accepting. The refuted case inspected
+the actual counterexample, left the product unchanged, verified completed
+independent work, and reported the unsupported requested remedy as `blocked`.
+
+Only these two cases were freshly rerun on this revision—not all ten, a
+statistical compliance rate or a general guarantee. Diagnostic regrading is not
+counted as a new model run; all older failure reports remain preserved. These
+adapter results do not establish native OMP task behavior or real engine/visual
+verification.
+
+**Recorded integration (2026-09-30, policy revision
+`judgment-production-2026-09-30-r2`, before the r3 asset clarification).** `bun run check && bun run lint && bun test`:
 TypeScript clean, lint 0 errors with exactly 2 pre-existing `no-control-regex`
 warnings, and 387 tests passing, 0 failing, across 20 files (1,563 assertions).
 A real isolated OMP SessionManager smoke confirmed durable non-message policy
@@ -1441,7 +1530,8 @@ the corrected schema and reran affected cases after connectivity recovered.
 The assets case still failed: the main generated all three assets directly and
 skipped sample-first sequencing. The refuted-premise case remained incomplete
 because a worker returned plain text instead of the adapter's required
-`worker_return`; this is not evidence of a native OMP policy failure. Original
+`worker_return` under the pre-v3 adapter; this is not evidence of a native OMP
+policy failure. Original
 failure reports are preserved for comparison, not replaced by prompting or
 scoring until green. The adapter still does not establish native OMP task
 behavior, engine/visual verification or real publishing.
